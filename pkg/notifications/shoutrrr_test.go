@@ -242,7 +242,7 @@ updt1 (mock/updt1:latest): Updated
 	ginkgo.When("using report templates", func() {
 		ginkgo.When("no custom template is provided", func() {
 			ginkgo.It("should format the messages using the default template", func() {
-				expected := `4 Scanned, 2 Updated, 0 Restarted, 1 Failed
+				expected := `4 Scanned, 2 Updated, 0 Restarted, 1 Failed, 1 Fresh, 1 Skipped
 - updt1 (mock/updt1:latest): 01d110000000 updated to d0a110000000
 - updt2 (mock/updt2:latest): 01d120000000 updated to d0a120000000
 - frsh1 (mock/frsh1:latest): Fresh
@@ -291,7 +291,7 @@ updt1 (mock/updt1:latest): Updated
 		ginkgo.Describe("the default template", func() {
 			ginkgo.When("all containers are fresh", func() {
 				ginkgo.It("should return the summary", func() {
-					expected := `1 Scanned, 0 Updated, 0 Restarted, 0 Failed
+					expected := `1 Scanned, 0 Updated, 0 Restarted, 0 Failed, 1 Fresh, 0 Skipped
 - frsh1 (mock/frsh1:latest): Fresh`
 					gomega.Expect(getTemplatedResult(``, false, mockDataAllFresh)).
 						To(gomega.Equal(expected))
@@ -299,7 +299,7 @@ updt1 (mock/updt1:latest): Updated
 			})
 			ginkgo.When("at least one container was updated", func() {
 				ginkgo.It("should send a report", func() {
-					expected := `1 Scanned, 1 Updated, 0 Restarted, 0 Failed
+					expected := `1 Scanned, 1 Updated, 0 Restarted, 0 Failed, 0 Fresh, 0 Skipped
 - updt1 (mock/updt1:latest): 01d110000000 updated to d0a110000000`
 					data := mockDataFromStates(session.UpdatedState)
 					gomega.Expect(getTemplatedResult(``, false, data)).To(gomega.Equal(expected))
@@ -307,7 +307,7 @@ updt1 (mock/updt1:latest): Updated
 			})
 			ginkgo.When("at least one container failed to update", func() {
 				ginkgo.It("should send a report", func() {
-					expected := `1 Scanned, 0 Updated, 0 Restarted, 1 Failed
+					expected := `1 Scanned, 0 Updated, 0 Restarted, 1 Failed, 0 Fresh, 0 Skipped
 - fail1 (mock/fail1:latest): Failed: accidentally the whole container`
 					data := mockDataFromStates(session.FailedState)
 					gomega.Expect(getTemplatedResult(``, false, data)).To(gomega.Equal(expected))
@@ -315,7 +315,7 @@ updt1 (mock/updt1:latest): Updated
 			})
 			ginkgo.When("containers are restarted due to dependencies", func() {
 				ginkgo.It("should send a report with restarted containers", func() {
-					expected := `2 Scanned, 1 Updated, 1 Restarted, 0 Failed
+					expected := `2 Scanned, 1 Updated, 1 Restarted, 0 Failed, 0 Fresh, 0 Skipped
 - updt1 (mock/updt1:latest): 01d110000000 updated to d0a110000000
 - rstr1 (mock/rstr1:latest): Restarted`
 					data := mockDataFromStates(session.UpdatedState, session.RestartedState)
@@ -324,7 +324,7 @@ updt1 (mock/updt1:latest): Updated
 			})
 			ginkgo.When("mixing updated and restarted containers", func() {
 				ginkgo.It("should show different states for updated vs restarted", func() {
-					expected := `3 Scanned, 2 Updated, 1 Restarted, 0 Failed
+					expected := `3 Scanned, 2 Updated, 1 Restarted, 0 Failed, 0 Fresh, 0 Skipped
 - updt1 (mock/updt1:latest): 01d110000000 updated to d0a110000000
 - updt2 (mock/updt2:latest): 01d120000000 updated to d0a120000000
 - rstr1 (mock/rstr1:latest): Restarted`
@@ -804,6 +804,85 @@ Turns out everything is on fire
 				result := shoutrrr.ShouldSendNotification(nil)
 				gomega.Expect(result).To(gomega.BeTrue())
 			})
+		})
+	})
+
+	ginkgo.When("deduplicating entries for grouped notifications", func() {
+		ginkgo.It("should return empty slice for empty input", func() {
+			result := deduplicateEntries([]*logrus.Entry{})
+			gomega.Expect(result).To(gomega.BeEmpty())
+		})
+
+		ginkgo.It("should return single entry unchanged", func() {
+			entries := []*logrus.Entry{
+				{Message: "Found new image", Data: logrus.Fields{"image": "nginx:latest", "new_id": "abc123"}},
+			}
+			result := deduplicateEntries(entries)
+			gomega.Expect(result).To(gomega.HaveLen(1))
+		})
+
+		ginkgo.It("should deduplicate 'Found new image' entries with same image and new ID", func() {
+			entries := []*logrus.Entry{
+				{Message: "Found new image", Data: logrus.Fields{"container": "app-a", "image": "nginx:latest", "new_id": "abc123"}},
+				{Message: "Found new image", Data: logrus.Fields{"container": "app-b", "image": "nginx:latest", "new_id": "abc123"}},
+			}
+			result := deduplicateEntries(entries)
+			gomega.Expect(result).To(gomega.HaveLen(1))
+			gomega.Expect(result[0].Data["container"]).To(gomega.Equal("app-a"))
+		})
+
+		ginkgo.It("should keep 'Found new image' entries with different images", func() {
+			entries := []*logrus.Entry{
+				{Message: "Found new image", Data: logrus.Fields{"image": "nginx:latest", "new_id": "abc123"}},
+				{Message: "Found new image", Data: logrus.Fields{"image": "redis:latest", "new_id": "def456"}},
+			}
+			result := deduplicateEntries(entries)
+			gomega.Expect(result).To(gomega.HaveLen(2))
+		})
+
+		ginkgo.It("should keep 'Found new image' entries with same image but different new IDs", func() {
+			entries := []*logrus.Entry{
+				{Message: "Found new image", Data: logrus.Fields{"image": "nginx:latest", "new_id": "abc123"}},
+				{Message: "Found new image", Data: logrus.Fields{"image": "nginx:latest", "new_id": "def456"}},
+			}
+			result := deduplicateEntries(entries)
+			gomega.Expect(result).To(gomega.HaveLen(2))
+		})
+
+		ginkgo.It("should deduplicate 'Removing image' entries with same image ID", func() {
+			entries := []*logrus.Entry{
+				{Message: "Removing image", Data: logrus.Fields{"container_name": "app-a", "image_id": "sha256:abc"}},
+				{Message: "Removing image", Data: logrus.Fields{"container_name": "app-b", "image_id": "sha256:abc"}},
+			}
+			result := deduplicateEntries(entries)
+			gomega.Expect(result).To(gomega.HaveLen(1))
+			gomega.Expect(result[0].Data["container_name"]).To(gomega.Equal("app-a"))
+		})
+
+		ginkgo.It("should not deduplicate other message types", func() {
+			entries := []*logrus.Entry{
+				{Message: "Stopping container", Data: logrus.Fields{"container": "app-a"}},
+				{Message: "Stopping container", Data: logrus.Fields{"container": "app-b"}},
+			}
+			result := deduplicateEntries(entries)
+			gomega.Expect(result).To(gomega.HaveLen(2))
+		})
+
+		ginkgo.It("should handle mixed entry types correctly", func() {
+			entries := []*logrus.Entry{
+				{Message: "Found new image", Data: logrus.Fields{"image": "nginx:latest", "new_id": "abc123"}},
+				{Message: "Stopping container", Data: logrus.Fields{"container": "app-a"}},
+				{Message: "Found new image", Data: logrus.Fields{"image": "nginx:latest", "new_id": "abc123"}},
+				{Message: "Removing image", Data: logrus.Fields{"image_id": "sha256:old"}},
+				{Message: "Started new container", Data: logrus.Fields{"container": "app-a"}},
+				{Message: "Removing image", Data: logrus.Fields{"image_id": "sha256:old"}},
+			}
+			result := deduplicateEntries(entries)
+			gomega.Expect(result).To(gomega.HaveLen(4))
+			gomega.Expect(result[0].Message).To(gomega.Equal("Found new image"))
+			gomega.Expect(result[1].Message).To(gomega.Equal("Stopping container"))
+			gomega.Expect(result[2].Message).To(gomega.Equal("Removing image"))
+			gomega.Expect(result[3].Message).To(gomega.Equal("Started new container"))
 		})
 	})
 })

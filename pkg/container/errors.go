@@ -66,12 +66,18 @@ var (
 
 // Errors for image operations in image.go.
 var (
+	// ErrImageInUse indicates that the image is actively used by a container and cannot be removed.
+	ErrImageInUse = errors.New("image is actively used by a container")
 	// errPinnedImage indicates an attempt to pull an immutable (sha256-pinned) image.
 	errPinnedImage = errors.New("image is pinned with sha256, skipping pull")
 	// errInspectImageFailed indicates a failure to inspect an image from the Docker daemon.
 	errInspectImageFailed = errors.New("failed to inspect image")
 	// errPullImageFailed indicates a failure to pull an image from the registry.
 	errPullImageFailed = errors.New("failed to pull image")
+	// ErrPullImageUnauthorized indicates an authentication failure during image pull.
+	ErrPullImageUnauthorized = errors.New("failed to pull image: authentication required")
+	// ErrPullImageNotFound indicates the image was not found in the registry.
+	ErrPullImageNotFound = errors.New("failed to pull image: image not found")
 	// errReadPullResponseFailed indicates a failure to read the pull response stream.
 	errReadPullResponseFailed = errors.New("failed to read pull response")
 	// errRemoveImageFailed indicates a failure to remove an image from the Docker host.
@@ -100,4 +106,12 @@ var (
 	ErrContainerIDNotFound = errors.New("HOSTNAME environment variable is not set")
 	// errNoContainerWithHostname indicates no container was found with the matching hostname.
 	errNoContainerWithHostname = errors.New("no container found with matching hostname")
+)
+
+// Errors for ephemeral orchestrator operations in ephemeral.go.
+var (
+	// ErrEphemeralCreateFailed indicates a failure to create the ephemeral orchestrator container.
+	ErrEphemeralCreateFailed = errors.New("failed to create ephemeral orchestrator container")
+	// ErrEphemeralStartFailed indicates a failure to start the ephemeral orchestrator container.
+	ErrEphemeralStartFailed = errors.New("failed to start ephemeral orchestrator container")
 )

@@ -26,6 +26,7 @@ import (
 	dockerContainer "github.com/docker/docker/api/types/container"
 	dockerImage "github.com/docker/docker/api/types/image"
 
+	"github.com/nicholas-fedor/watchtower/internal/meta"
 	"github.com/nicholas-fedor/watchtower/pkg/registry/auth"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
@@ -180,7 +181,7 @@ func (m mockContainer) Scope() (string, bool) {
 // Links returns a slice of container links. This method satisfies the types.Container
 // interface, returning an empty slice as a minimal stub since the auth package does not
 // use this data in these authentication-focused tests.
-func (m mockContainer) Links() []string {
+func (m mockContainer) Links(useComposeDependsOn bool) []string {
 	return []string{} // Minimal stub, not used in these tests
 }
 
@@ -195,6 +196,13 @@ func (m mockContainer) ToRestart() bool {
 // satisfies the types.Container interface, returning false as a minimal stub since
 // the auth package does not use this check in these authentication-focused tests.
 func (m mockContainer) IsWatchtower() bool {
+	return false // Minimal stub, not used in these tests
+}
+
+// HasExposedPorts indicates whether the container has exposed ports configured.
+// This method satisfies the types.Container interface, returning false as a minimal stub
+// since the auth package does not use this data in these authentication-focused tests.
+func (m mockContainer) HasExposedPorts() bool {
 	return false // Minimal stub, not used in these tests
 }
 
@@ -252,6 +260,13 @@ func (m mockContainer) IsStale() bool {
 // since the auth package does not use this logic in these authentication-focused tests.
 func (m mockContainer) IsNoPull(_ types.UpdateParams) bool {
 	return false // Minimal stub, not used in these tests
+}
+
+// CooldownDelay returns the cooldown delay duration for the container. This method
+// satisfies the types.Container interface, returning 0 as a minimal stub since the
+// auth package does not use this value in these authentication-focused tests.
+func (m mockContainer) CooldownDelay(_ types.UpdateParams) time.Duration {
+	return 0 // Minimal stub, not used in these tests
 }
 
 // SetLinkedToRestarting sets the container's linked-to-restarting status. This method
@@ -413,7 +428,12 @@ var _ = ginkgo.Describe("the auth module", func() {
 		defer viper.Set("WATCHTOWER_REGISTRY_TLS_SKIP", originalTLSSkip)
 
 		// Execute GetToken and verify the result.
-		token, _, _, err := auth.GetToken(context.Background(), containerInstance, creds, client)
+		token, _, _, _, err := auth.GetToken(
+			context.Background(),
+			containerInstance,
+			creds,
+			client,
+		)
 
 		gomega.Expect(server.ReceivedRequests()).To(gomega.HaveLen(1))
 
@@ -489,7 +509,7 @@ var _ = ginkgo.Describe("the auth module", func() {
 			SkipIfCredentialsEmpty(GHCRCredentials, func() {
 				creds := fmt.Sprintf("%s:%s", GHCRCredentials.Username, GHCRCredentials.Password)
 				client := auth.NewAuthClient()
-				token, _, _, err := auth.GetToken(
+				token, _, _, _, err := auth.GetToken(
 					context.Background(),
 					mockContainerInstance,
 					creds,
@@ -544,7 +564,7 @@ var _ = ginkgo.Describe("the auth module", func() {
 			}
 
 			client := auth.NewAuthClient()
-			token, _, _, err := auth.GetToken(
+			token, _, _, _, err := auth.GetToken(
 				context.Background(),
 				containerInstance,
 				"user:pass",
@@ -593,7 +613,7 @@ var _ = ginkgo.Describe("the auth module", func() {
 				}
 
 				// Execute GetToken and verify the result.
-				token, _, _, err := auth.GetToken(
+				token, _, _, _, err := auth.GetToken(
 					context.Background(),
 					containerInstance,
 					"",
@@ -636,7 +656,12 @@ var _ = ginkgo.Describe("the auth module", func() {
 			client := auth.NewAuthClient()
 
 			// Execute GetToken and verify the expected failure.
-			token, _, _, err := auth.GetToken(context.Background(), containerInstance, "", client)
+			token, _, _, _, err := auth.GetToken(
+				context.Background(),
+				containerInstance,
+				"",
+				client,
+			)
 
 			gomega.Expect(server.ReceivedRequests()).To(gomega.BeEmpty())
 			gomega.Expect(err).To(gomega.HaveOccurred())
@@ -683,7 +708,12 @@ var _ = ginkgo.Describe("the auth module", func() {
 			defer viper.Set("WATCHTOWER_REGISTRY_TLS_SKIP", false)
 
 			// Execute GetToken and verify the result.
-			token, _, _, err := auth.GetToken(context.Background(), containerInstance, "", client)
+			token, _, _, _, err := auth.GetToken(
+				context.Background(),
+				containerInstance,
+				"",
+				client,
+			)
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
 			gomega.Expect(token).To(gomega.Equal(""))
 		})
@@ -725,7 +755,7 @@ var _ = ginkgo.Describe("the auth module", func() {
 			viper.Set("WATCHTOWER_REGISTRY_TLS_SKIP", false)
 
 			// Execute GetToken and verify the result.
-			token, _, _, err := auth.GetToken(context.Background(), containerInstance, "", client)
+			token, _, _, _, err := auth.GetToken(context.Background(), containerInstance, "", client)
 
 			gomega.Expect(server.ReceivedRequests()).To(gomega.HaveLen(1))
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
@@ -771,7 +801,12 @@ var _ = ginkgo.Describe("the auth module", func() {
 			}
 
 			// Execute GetToken and verify the result.
-			token, _, _, err := auth.GetToken(context.Background(), containerInstance, "", client)
+			token, _, _, _, err := auth.GetToken(
+				context.Background(),
+				containerInstance,
+				"",
+				client,
+			)
 
 			gomega.Expect(server.ReceivedRequests()).To(gomega.HaveLen(1))
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
@@ -808,7 +843,12 @@ var _ = ginkgo.Describe("the auth module", func() {
 			client := auth.NewAuthClient()
 
 			// Execute GetToken and verify the expected failure.
-			token, _, _, err := auth.GetToken(context.Background(), containerInstance, "", client)
+			token, _, _, _, err := auth.GetToken(
+				context.Background(),
+				containerInstance,
+				"",
+				client,
+			)
 			gomega.Expect(err).To(gomega.HaveOccurred())
 			gomega.Expect(err.Error()).
 				To(gomega.ContainSubstring("failed to execute challenge request"))
@@ -868,7 +908,7 @@ var _ = ginkgo.Describe("the auth module", func() {
 			viper.Set("WATCHTOWER_REGISTRY_TLS_SKIP", false)
 			defer viper.Set("WATCHTOWER_REGISTRY_TLS_SKIP", false)
 
-			token, challengeHost, redirected, err := auth.GetToken(
+			token, challengeHost, redirected, redirectHost, err := auth.GetToken(
 				context.Background(),
 				containerInstance,
 				"",
@@ -877,7 +917,8 @@ var _ = ginkgo.Describe("the auth module", func() {
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
 			gomega.Expect(token).To(gomega.Equal("Bearer mock-token"))
 			gomega.Expect(challengeHost).To(gomega.Equal(redirectAddr))
-			gomega.Expect(redirected).To(gomega.BeFalse()) // No HTTP redirect occurred
+			gomega.Expect(redirected).To(gomega.BeFalse())   // No HTTP redirect occurred
+			gomega.Expect(redirectHost).To(gomega.Equal("")) // No redirect, so redirectHost is empty
 			gomega.Expect(server.ReceivedRequests()).To(gomega.HaveLen(1))
 			gomega.Expect(redirectServer.ReceivedRequests()).To(gomega.HaveLen(1))
 		})
@@ -926,7 +967,7 @@ var _ = ginkgo.Describe("the auth module", func() {
 			viper.Set("WATCHTOWER_REGISTRY_TLS_SKIP", false)
 			defer viper.Set("WATCHTOWER_REGISTRY_TLS_SKIP", false)
 
-			token, challengeHost, redirected, err := auth.GetToken(
+			token, challengeHost, redirected, redirectHost, err := auth.GetToken(
 				context.Background(),
 				containerInstance,
 				"",
@@ -936,6 +977,7 @@ var _ = ginkgo.Describe("the auth module", func() {
 			gomega.Expect(token).To(gomega.Equal("Bearer mock-token"))
 			gomega.Expect(challengeHost).To(gomega.Equal(serverAddr))
 			gomega.Expect(redirected).To(gomega.BeFalse())
+			gomega.Expect(redirectHost).To(gomega.Equal("")) // No redirect, so redirectHost is empty
 			gomega.Expect(server.ReceivedRequests()).To(gomega.HaveLen(2))
 		})
 
@@ -1003,7 +1045,7 @@ var _ = ginkgo.Describe("the auth module", func() {
 			viper.Set("WATCHTOWER_REGISTRY_TLS_SKIP", false)
 			defer viper.Set("WATCHTOWER_REGISTRY_TLS_SKIP", false)
 
-			token, challengeHost, redirected, err := auth.GetToken(
+			token, challengeHost, redirected, redirectHost, err := auth.GetToken(
 				context.Background(),
 				containerInstance,
 				"",
@@ -1012,7 +1054,8 @@ var _ = ginkgo.Describe("the auth module", func() {
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
 			gomega.Expect(token).To(gomega.Equal("Bearer mock-token"))
 			gomega.Expect(challengeHost).To(gomega.Equal(redirectAddr))
-			gomega.Expect(redirected).To(gomega.BeTrue()) // HTTP redirect occurred
+			gomega.Expect(redirected).To(gomega.BeTrue())              // HTTP redirect occurred
+			gomega.Expect(redirectHost).To(gomega.Equal(redirectAddr)) // Redirect host matches the final destination
 			gomega.Expect(server.ReceivedRequests()).To(gomega.HaveLen(1))
 			gomega.Expect(redirectServer.ReceivedRequests()).To(gomega.HaveLen(2))
 		})
@@ -1087,7 +1130,12 @@ var _ = ginkgo.Describe("the auth module", func() {
 			defer viper.Set("WATCHTOWER_REGISTRY_TLS_SKIP", false)
 
 			// Execute GetToken and verify failure due to too many redirects
-			token, _, _, err := auth.GetToken(context.Background(), containerInstance, "", client)
+			token, _, _, _, err := auth.GetToken(
+				context.Background(),
+				containerInstance,
+				"",
+				client,
+			)
 			gomega.Expect(err).
 				To(gomega.HaveOccurred(), "Expected error due to exceeding redirect limit")
 			gomega.Expect(err.Error()).
@@ -1115,7 +1163,7 @@ var _ = ginkgo.Describe("the auth module", func() {
 			gomega.Expect(req.Method).To(gomega.Equal(http.MethodGet))
 			gomega.Expect(req.URL.String()).To(gomega.Equal("https://example.com/v2/"))
 			gomega.Expect(req.Header.Get("Accept")).To(gomega.Equal("*/*"))
-			gomega.Expect(req.Header.Get("User-Agent")).To(gomega.Equal("Watchtower (Docker)"))
+			gomega.Expect(req.Header.Get("User-Agent")).To(gomega.Equal(meta.UserAgent))
 			gomega.Expect(req.Context()).To(gomega.Equal(context.Background()))
 		})
 

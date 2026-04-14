@@ -98,6 +98,19 @@ func WithImageName(name string) MockContainerUpdate {
 	}
 }
 
+// WithRepoDigests sets the RepoDigests for the mock image.
+//
+// Parameters:
+//   - digests: List of repo digests (e.g., ["repo@sha256:abc"]).
+//
+// Returns:
+//   - MockContainerUpdate: Function to set RepoDigests on image metadata.
+func WithRepoDigests(digests []string) MockContainerUpdate {
+	return func(_ *dockerContainer.InspectResponse, i *dockerImage.InspectResponse) {
+		i.RepoDigests = digests
+	}
+}
+
 // WithLinks sets dependency links for the mock container.
 //
 // Parameters:
@@ -283,7 +296,7 @@ func WithHostname(hostname string) MockContainerUpdate {
 // WithAutoRemove sets the AutoRemove flag for the mock container.
 //
 // Parameters:
-//   - autoRemove: Whether the container should be automatically removed after stopping.
+//   - autoRemove: Whether to auto-remove the container on stop.
 //
 // Returns:
 //   - MockContainerUpdate: Function to set AutoRemove in container HostConfig.
@@ -294,6 +307,66 @@ func WithAutoRemove(autoRemove bool) MockContainerUpdate {
 		}
 
 		c.HostConfig.AutoRemove = autoRemove
+	}
+}
+
+// WithName sets the container name for the mock container.
+//
+// Parameters:
+//   - name: Container name to set (e.g., "my-app").
+//
+// Returns:
+//   - MockContainerUpdate: Function to set the container name in metadata.
+func WithName(name string) MockContainerUpdate {
+	return func(c *dockerContainer.InspectResponse, _ *dockerImage.InspectResponse) {
+		c.Name = name
+	}
+}
+
+// WithID sets the container ID for the mock container.
+//
+// Parameters:
+//   - id: Container ID to set (e.g., "abc123").
+//
+// Returns:
+//   - MockContainerUpdate: Function to set the container ID in metadata.
+func WithID(id string) MockContainerUpdate {
+	return func(c *dockerContainer.InspectResponse, _ *dockerImage.InspectResponse) {
+		c.ID = id
+	}
+}
+
+// WithEnv sets environment variables on the mock container's Config.
+//
+// Parameters:
+//   - env: Environment variables in "KEY=VALUE" format.
+//
+// Returns:
+//   - MockContainerUpdate: Function to set environment variables in container Config.
+func WithEnv(env []string) MockContainerUpdate {
+	return func(c *dockerContainer.InspectResponse, _ *dockerImage.InspectResponse) {
+		if c.Config == nil {
+			c.Config = &dockerContainer.Config{}
+		}
+
+		c.Config.Env = env
+	}
+}
+
+// WithBinds sets bind mounts on the mock container's HostConfig.
+//
+// Parameters:
+//   - binds: Bind mount strings in "host_path:container_path" format.
+//
+// Returns:
+//   - MockContainerUpdate: Function to set bind mounts in container HostConfig.
+func WithBinds(binds []string) MockContainerUpdate {
+	return func(c *dockerContainer.InspectResponse, _ *dockerImage.InspectResponse) {
+		if c.HostConfig == nil {
+			c.HostConfig = &dockerContainer.HostConfig{}
+		}
+
+		c.HostConfig.Binds = binds
 	}
 }
 

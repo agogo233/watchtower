@@ -2,7 +2,7 @@
 # Builder
 #
 
-FROM golang:alpine@sha256:2389ebfa5b7f43eeafbd6be0c3700cc46690ef842ad962f6c5bd6be49ed82039 AS builder
+FROM golang:alpine@sha256:c2a1f7b2095d046ae14b286b18413a05bb82c9bca9b25fe7ff5efef0f0826166 AS builder
 
 # use version (for example "v0.3.3") or "main"
 ARG WATCHTOWER_VERSION=main
@@ -23,7 +23,7 @@ RUN apk add --no-cache \
 COPY . /watchtower
 
 RUN cd /watchtower && \
-    GO111MODULE=on CGO_ENABLED=0 go build -a -ldflags "-extldflags '-static' -X github.com/nicholas-fedor/watchtower/internal/meta.Version=$(git describe --tags) -X github.com/nicholas-fedor/watchtower/pkg/registry/digest.UserAgent=Watchtower/v$(git describe --tags)" .
+    CGO_ENABLED=0 go build -a -ldflags "-extldflags '-static' -X github.com/nicholas-fedor/watchtower/internal/meta.Version=$(git describe --tags)" .
 
 
 #

@@ -75,6 +75,8 @@ func WaitForRunningUpdate(ctx context.Context, lock chan bool) {
 //   - updateOnStart: Boolean indicating whether to perform an update immediately on startup.
 //   - skipFirstRun: Boolean indicating whether to skip the first scheduled run.
 //   - currentWatchtowerContainer: The current Watchtower container for parent checking.
+//   - startupMessageSent: Whether the startup message was already sent (e.g., by the HTTP API in blocking mode).
+//   - ephemeralSelfUpdate: Whether the self-update uses ephemeral mode (removes old container before creating new one).
 //
 // Returns:
 //   - error: An error if scheduling fails (e.g., invalid cron spec), nil on successful shutdown.
@@ -96,6 +98,8 @@ func RunUpgradesOnSchedule(
 	updateOnStart bool,
 	skipFirstRun bool,
 	currentWatchtowerContainer types.Container,
+	startupMessageSent bool,
+	ephemeralSelfUpdate bool,
 ) error {
 	// Initialize lock if not provided, ensuring single-update concurrency.
 	if lock == nil {
@@ -117,10 +121,27 @@ func RunUpgradesOnSchedule(
 		),
 	)
 
+	// Determine if self-update should be skipped due to exposed port conflicts.
+	// When a port is configured (e.g., HTTP API), the old container holds the port
+	// while the new container tries to bind it, resulting in both containers being stopped.
+	// Ephemeral self-updates are exempt from this restriction because they remove
+	// the old container before creating the new one, avoiding port conflicts.
+	skipSelfUpdateForPorts := currentWatchtowerContainer != nil &&
+		currentWatchtowerContainer.HasExposedPorts() &&
+		!ephemeralSelfUpdate
+
 	// Define the update function to be used both for scheduled runs and immediate execution.
 	// skipWatchtowerSelfUpdate: whether to skip updating the Watchtower container itself
 	// blocking: whether to wait for the lock (true for scheduled runs, false for immediate runs)
 	updateFunc := func(skipWatchtowerSelfUpdate, blocking bool) {
+		// Skip self-update if the container has exposed ports to prevent port conflicts.
+		// This takes precedence over the skipWatchtowerSelfUpdate parameter.
+		if skipSelfUpdateForPorts {
+			skipWatchtowerSelfUpdate = true
+
+			logrus.Debug("Skipping self-update to prevent port conflict")
+		}
+
 		// Skip update if this is a Watchtower parent container (from self-update chain)
 		if currentWatchtowerContainer != nil {
 			chain, _ := currentWatchtowerContainer.GetContainerChain()
@@ -169,7 +190,7 @@ func RunUpgradesOnSchedule(
 			metrics.Default().RegisterScan(metric)
 		}
 
-		logrus.Debug("Update operation completed successfully")
+		logrus.Debug("Update operation completed")
 
 		nextRuns := scheduler.Entries()
 		if len(nextRuns) > 0 {
@@ -183,11 +204,11 @@ func RunUpgradesOnSchedule(
 	// If Watchtower has performed a self-cleanup, then prevent Watchtower
 	// from self-updating during the first update cycle.
 	if skipFirstRun {
-		var firstRun uint32 // atomic flag to track if this is the first run
+		var firstRun atomic.Uint32 // atomic flag to track if this is the first run
 
 		scheduledUpdateFunc = func() {
 			// Atomically check and set firstRun to ensure only the first execution skips self-update
-			skipWatchtowerSelfUpdate := atomic.CompareAndSwapUint32(&firstRun, 0, 1)
+			skipWatchtowerSelfUpdate := firstRun.CompareAndSwap(0, 1)
 			if skipWatchtowerSelfUpdate {
 				logrus.Debug(
 					"Skipping Watchtower self-update on first scheduled run due to cleanup",
@@ -211,12 +232,15 @@ func RunUpgradesOnSchedule(
 	}
 
 	// Log startup message with the first scheduled run time.
+	// Skip if the startup message was already sent (e.g., by the HTTP API in blocking mode).
 	var nextRun time.Time
 	if len(scheduler.Entries()) > 0 {
 		nextRun = scheduler.Entries()[0].Schedule.Next(time.Now())
 	}
 
-	writeStartupMessage(c, nextRun, filtering, scope, client, notifier, metaVersion, &updateOnStart)
+	if !startupMessageSent {
+		writeStartupMessage(c, nextRun, filtering, scope, client, notifier, metaVersion, &updateOnStart)
+	}
 
 	// Check if update-on-start is enabled and trigger immediate update if so.
 	if updateOnStart {

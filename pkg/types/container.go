@@ -3,6 +3,7 @@ package types
 import (
 	"context"
 	"strings"
+	"time"
 
 	dockerContainer "github.com/docker/docker/api/types/container"
 	dockerImage "github.com/docker/docker/api/types/image"
@@ -19,7 +20,7 @@ type Container interface {
 	Enabled() (bool, bool)                            // Enabled status and presence.
 	IsMonitorOnly(params UpdateParams) bool           // Monitor-only check.
 	Scope() (string, bool)                            // Scope value and presence.
-	Links() []string                                  // Dependency links.
+	Links(useComposeDependsOn bool) []string          // Dependency links.
 	ToRestart() bool                                  // Needs restart check.
 	IsWatchtower() bool                               // Watchtower instance check.
 	StopSignal() string                               // Custom stop signal.
@@ -36,6 +37,7 @@ type Container interface {
 	SetStale(status bool)                             // Set stale status.
 	IsStale() bool                                    // Stale status check.
 	IsNoPull(params UpdateParams) bool                // No-pull check.
+	CooldownDelay(params UpdateParams) time.Duration  // Effective cooldown delay.
 	SetLinkedToRestarting(status bool)                // Set linked-to-restarting status.
 	IsLinkedToRestarting() bool                       // Linked-to-restarting check.
 	PreUpdateTimeout() int                            // Pre-update timeout.
@@ -44,6 +46,7 @@ type Container interface {
 	GetCreateConfig() *dockerContainer.Config         // Creation config.
 	GetCreateHostConfig() *dockerContainer.HostConfig // Host creation config.
 	GetContainerChain() (string, bool)                // Container chain label value and presence.
+	HasExposedPorts() bool                            // Exposed ports presence check.
 }
 
 // ImageInspector defines the interface for inspecting Docker images.

@@ -320,61 +320,6 @@ var _ = ginkgo.Describe("Actions", func() {
 		})
 	})
 
-	ginkgo.Describe("buildCleanupEntriesForContainer", func() {
-		ginkgo.It("should return empty entries when no cleaned images match", func() {
-			cleanedImages := []types.RemovedImageInfo{
-				{
-					ContainerName: "other-container",
-					ImageName:     "image:v1.0",
-					ImageID:       types.ImageID("sha256:123"),
-				},
-			}
-
-			entries := buildCleanupEntriesForContainer(cleanedImages, "test-container")
-			gomega.Expect(entries).To(gomega.BeEmpty())
-		})
-
-		ginkgo.It("should return entries for matching container", func() {
-			cleanedImages := []types.RemovedImageInfo{
-				{
-					ContainerName: "test-container",
-					ImageName:     "image:v1.0",
-					ImageID:       types.ImageID("sha256:123"),
-				},
-			}
-
-			entries := buildCleanupEntriesForContainer(cleanedImages, "test-container")
-			gomega.Expect(entries).To(gomega.HaveLen(1))
-			gomega.Expect(entries[0].Message).To(gomega.Equal("Removing image"))
-			gomega.Expect(entries[0].Data["container_name"]).To(gomega.Equal("test-container"))
-		})
-
-		ginkgo.It("should return multiple entries for multiple matches", func() {
-			cleanedImages := []types.RemovedImageInfo{
-				{
-					ContainerName: "test-container",
-					ImageName:     "image:v1.0",
-					ImageID:       types.ImageID("sha256:123"),
-				},
-				{
-					ContainerName: "test-container",
-					ImageName:     "image:v2.0",
-					ImageID:       types.ImageID("sha256:456"),
-				},
-				{
-					ContainerName: "other-container",
-					ImageName:     "image:v3.0",
-					ImageID:       types.ImageID("sha256:789"),
-				},
-			}
-
-			entries := buildCleanupEntriesForContainer(cleanedImages, "test-container")
-			gomega.Expect(entries).To(gomega.HaveLen(2))
-			gomega.Expect(entries[0].Message).To(gomega.Equal("Removing image"))
-			gomega.Expect(entries[1].Message).To(gomega.Equal("Removing image"))
-		})
-	})
-
 	ginkgo.Describe("buildUpdateEntries", func() {
 		ginkgo.It("should create entries for regular container update", func() {
 			mockContainerReport := mockTypes.NewMockContainerReport(ginkgo.GinkgoT())
@@ -391,6 +336,9 @@ var _ = ginkgo.Describe("Actions", func() {
 				types.ContainerID("old-container-id"),
 				types.ContainerID("new-container-id"),
 				now,
+				"",
+				"",
+				false,
 			)
 
 			gomega.Expect(entries).To(gomega.HaveLen(3))
@@ -426,6 +374,9 @@ var _ = ginkgo.Describe("Actions", func() {
 				types.ContainerID("container-id"),
 				types.ContainerID("new-container-id"),
 				now,
+				"",
+				"",
+				false,
 			)
 
 			gomega.Expect(entries).To(gomega.HaveLen(3))
@@ -438,7 +389,7 @@ var _ = ginkgo.Describe("Actions", func() {
 			now := time.Now()
 			// This will panic with nil pointer dereference, so we expect it to panic
 			gomega.Expect(func() {
-				buildUpdateEntries(nil, types.ContainerID(""), types.ContainerID(""), now)
+				buildUpdateEntries(nil, types.ContainerID(""), types.ContainerID(""), now, "", "", false)
 			}).To(gomega.Panic())
 		})
 	})
@@ -912,6 +863,7 @@ var _ = ginkgo.Describe("Actions", func() {
 			mockReport.EXPECT().Updated().Return([]types.ContainerReport{mockContainer3})
 			mockReport.EXPECT().Failed().Return([]types.ContainerReport{mockContainer4})
 			mockReport.EXPECT().Restarted().Return([]types.ContainerReport{})
+			mockReport.EXPECT().Skipped().Return([]types.ContainerReport{})
 
 			metric := generateAndLogMetric(mockReport)
 
@@ -929,6 +881,7 @@ var _ = ginkgo.Describe("Actions", func() {
 			mockReport.EXPECT().Updated().Return([]types.ContainerReport{})
 			mockReport.EXPECT().Failed().Return([]types.ContainerReport{})
 			mockReport.EXPECT().Restarted().Return([]types.ContainerReport{})
+			mockReport.EXPECT().Skipped().Return([]types.ContainerReport{})
 
 			metric := generateAndLogMetric(mockReport)
 

@@ -57,30 +57,57 @@ var _ = ginkgo.Describe("SetupAndStartAPI", func() {
 		client = mockActions.CreateMockClient(&mockActions.TestData{}, false, false)
 	})
 
+	// defaultTestOptions returns a base api.Options with shared test defaults.
+	// Callers can override individual fields (e.g., EnableUpdateAPI) before passing
+	// the result to api.SetupAndStartAPI.
+	defaultTestOptions := func(
+		cmd *cobra.Command,
+		client container.Client,
+		notifier types.Notifier,
+	) api.Options {
+		return api.Options{
+			Host:             "",
+			Port:             "0",
+			Token:            "test-token",
+			RateLimit:        60,
+			EnableUpdateAPI:  false,
+			EnableMetricsAPI: false,
+			UnblockHTTPAPI:   false,
+			NoStartupMessage: false,
+			Filter:           filters.NoFilter,
+			Command:          cmd,
+			FilterDesc:       "test filter",
+			UpdateLock:       nil,
+			Cleanup:          false,
+			MonitorOnly:      false,
+			Client:           client,
+			Notifier:         notifier,
+			Scope:            "",
+			Version:          "v1.0.0",
+			RunUpdatesWithNotifications: func(_ context.Context, _ types.Filter, _ types.UpdateParams) *metrics.Metric {
+				return &metrics.Metric{Scanned: 0, Updated: 0, Failed: 0}
+			},
+			FilterByImage: func(_ []string, filter types.Filter) types.Filter {
+				return filter
+			},
+			DefaultMetrics: metrics.Default,
+			WriteStartupMessage: func(*cobra.Command, time.Time, string, string, container.Client, types.Notifier, string, *bool) {
+			},
+			SkipSelfUpdate: false,
+		}
+	}
+
 	ginkgo.When("update API is enabled", func() {
 		ginkgo.It("should start API server successfully", func() {
 			ctx, cancel := context.WithCancel(context.Background())
 
-			cmd.Flags().Bool("http-api-update", true, "")
-			cmd.Flags().Bool("http-api-metrics", false, "")
-			cmd.Flags().Bool("http-api-periodic-polls", false, "")
-			cmd.Flags().String("http-api-host", "", "")
-			cmd.Flags().String("http-api-port", "8080", "")
-			cmd.Flags().String("http-api-token", "test-token", "")
-
 			notifier := mockTypes.NewMockNotifier(ginkgo.GinkgoT())
 
-			// Mock the runUpdatesWithNotifications function
-			runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, _ types.UpdateParams) *metrics.Metric {
+			opts := defaultTestOptions(cmd, client, notifier)
+			opts.EnableUpdateAPI = true
+			opts.RunUpdatesWithNotifications = func(_ context.Context, _ types.Filter, _ types.UpdateParams) *metrics.Metric {
 				return &metrics.Metric{Scanned: 1, Updated: 1, Failed: 0}
 			}
-
-			// Mock other required functions
-			filterByImage := func(_ []string, filter types.Filter) types.Filter {
-				return filter
-			}
-			defaultMetrics := metrics.Default
-			writeStartupMessage := func(*cobra.Command, time.Time, string, string, container.Client, types.Notifier, string, *bool) {}
 
 			done := make(chan bool, 1)
 			errChan := make(chan error, 1)
@@ -97,26 +124,7 @@ var _ = ginkgo.Describe("SetupAndStartAPI", func() {
 			mockServer.EXPECT().Shutdown(mock.Anything).Return(nil)
 
 			go func() {
-				errChan <- api.SetupAndStartAPI(
-					ctx,
-					"", "0", "test-token",
-					true, false, false, false,
-					filters.NoFilter,
-					cmd,
-					"test filter",
-					nil,   // updateLock
-					false, // cleanup
-					false, // monitorOnly
-					client,
-					notifier,
-					"", // scope
-					"v1.0.0",
-					runUpdatesWithNotifications,
-					filterByImage,
-					defaultMetrics,
-					writeStartupMessage,
-					mockServer,
-				)
+				errChan <- api.SetupAndStartAPI(ctx, opts, mockServer)
 			}()
 
 			// Wait for the server to start
@@ -137,24 +145,11 @@ var _ = ginkgo.Describe("SetupAndStartAPI", func() {
 		ginkgo.It("should register metrics handler", func() {
 			ctx, cancel := context.WithCancel(context.Background())
 
-			cmd.Flags().Bool("http-api-update", true, "")
-			cmd.Flags().Bool("http-api-metrics", true, "")
-			cmd.Flags().Bool("http-api-periodic-polls", false, "")
-			cmd.Flags().String("http-api-host", "", "")
-			cmd.Flags().String("http-api-port", "8080", "")
-			cmd.Flags().String("http-api-token", "test-token", "")
-
 			notifier := mockTypes.NewMockNotifier(ginkgo.GinkgoT())
 
-			// Mock functions
-			runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, _ types.UpdateParams) *metrics.Metric {
-				return &metrics.Metric{Scanned: 0, Updated: 0, Failed: 0}
-			}
-			filterByImage := func(_ []string, filter types.Filter) types.Filter {
-				return filter
-			}
-			defaultMetrics := metrics.Default
-			writeStartupMessage := func(*cobra.Command, time.Time, string, string, container.Client, types.Notifier, string, *bool) {}
+			opts := defaultTestOptions(cmd, client, notifier)
+			opts.EnableUpdateAPI = true
+			opts.EnableMetricsAPI = true
 
 			done := make(chan bool, 1)
 			errChan := make(chan error, 1)
@@ -171,26 +166,7 @@ var _ = ginkgo.Describe("SetupAndStartAPI", func() {
 			mockServer.EXPECT().Shutdown(mock.Anything).Return(nil)
 
 			go func() {
-				errChan <- api.SetupAndStartAPI(
-					ctx,
-					"", "0", "test-token",
-					true, true, false, false,
-					filters.NoFilter,
-					cmd,
-					"test filter",
-					nil,
-					false, // cleanup
-					false, // monitorOnly
-					client,
-					notifier,
-					"",
-					"v1.0.0",
-					runUpdatesWithNotifications,
-					filterByImage,
-					defaultMetrics,
-					writeStartupMessage,
-					mockServer,
-				)
+				errChan <- api.SetupAndStartAPI(ctx, opts, mockServer)
 			}()
 
 			// Wait for the server to start
@@ -212,43 +188,11 @@ var _ = ginkgo.Describe("SetupAndStartAPI", func() {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 
-			cmd.Flags().Bool("http-api-update", false, "")
-			cmd.Flags().Bool("http-api-metrics", false, "")
-			cmd.Flags().Bool("http-api-periodic-polls", false, "")
-			cmd.Flags().String("http-api-host", "", "")
-			cmd.Flags().String("http-api-port", "8080", "")
-			cmd.Flags().String("http-api-token", "test-token", "")
-
 			notifier := mockTypes.NewMockNotifier(ginkgo.GinkgoT())
 
-			runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, _ types.UpdateParams) *metrics.Metric {
-				return &metrics.Metric{Scanned: 0, Updated: 0, Failed: 0}
-			}
-			filterByImage := func(_ []string, filter types.Filter) types.Filter {
-				return filter
-			}
-			defaultMetrics := metrics.Default
-			writeStartupMessage := func(*cobra.Command, time.Time, string, string, container.Client, types.Notifier, string, *bool) {}
+			opts := defaultTestOptions(cmd, client, notifier)
 
-			err := api.SetupAndStartAPI(
-				ctx,
-				"", "0", "test-token",
-				false, false, false, false,
-				filters.NoFilter,
-				cmd,
-				"test filter",
-				nil,
-				false, // cleanup
-				false, // monitorOnly
-				client,
-				notifier,
-				"",
-				"v1.0.0",
-				runUpdatesWithNotifications,
-				filterByImage,
-				defaultMetrics,
-				writeStartupMessage,
-			)
+			err := api.SetupAndStartAPI(ctx, opts)
 
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
 		})
@@ -275,7 +219,7 @@ var _ = ginkgo.Describe("SetupAndStartAPI", func() {
 				updateHandler := update.New(func(images []string) *metrics.Metric {
 					params := types.UpdateParams{
 						Cleanup:        false, // cleanup
-						RunOnce:        true,
+						RunOnce:        false,
 						MonitorOnly:    monitorOnly,
 						SkipSelfUpdate: false,
 					}
@@ -301,10 +245,66 @@ var _ = ginkgo.Describe("SetupAndStartAPI", func() {
 
 				// Verify the response
 				gomega.Expect(w.Code).To(gomega.Equal(http.StatusOK))
+				gomega.Expect(capturedParams.RunOnce).To(gomega.BeFalse())
 				gomega.Expect(capturedParams.MonitorOnly).To(gomega.Equal(expectMonitorOnly))
 			},
 			ginkgo.Entry("monitorOnly false", false, false),
 			ginkgo.Entry("monitorOnly true", true, true),
+		)
+	})
+
+	ginkgo.When("update API is enabled with skipSelfUpdate parameter", func() {
+		ginkgo.DescribeTable("should pass skipSelfUpdate parameter to update function",
+			func(skipSelfUpdate, expectSkipSelfUpdate bool) {
+				ctx := context.Background()
+
+				var capturedParams types.UpdateParams
+
+				runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, params types.UpdateParams) *metrics.Metric {
+					capturedParams = params
+
+					return &metrics.Metric{Scanned: 1, Updated: 0, Failed: 0}
+				}
+				filterByImage := func(_ []string, filter types.Filter) types.Filter {
+					return filter
+				}
+				defaultMetrics := metrics.Default
+
+				// Create the update handler directly to test the parameter passing
+				updateHandler := update.New(func(images []string) *metrics.Metric {
+					params := types.UpdateParams{
+						Cleanup:        false,
+						RunOnce:        false,
+						MonitorOnly:    false,
+						SkipSelfUpdate: skipSelfUpdate,
+					}
+					metric := runUpdatesWithNotifications(
+						ctx,
+						filterByImage(images, filters.NoFilter),
+						params,
+					)
+					defaultMetrics().RegisterScan(metric)
+
+					return metric
+				}, nil)
+
+				// Create a test HTTP request to trigger the update
+				req, err := http.NewRequest(http.MethodPost, "/v1/update", http.NoBody)
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+				// Create a response recorder
+				w := httptest.NewRecorder()
+
+				// Call the handler
+				updateHandler.Handle(w, req)
+
+				// Verify the response
+				gomega.Expect(w.Code).To(gomega.Equal(http.StatusOK))
+				gomega.Expect(capturedParams.RunOnce).To(gomega.BeFalse())
+				gomega.Expect(capturedParams.SkipSelfUpdate).To(gomega.Equal(expectSkipSelfUpdate))
+			},
+			ginkgo.Entry("skipSelfUpdate false", false, false),
+			ginkgo.Entry("skipSelfUpdate true", true, true),
 		)
 	})
 })

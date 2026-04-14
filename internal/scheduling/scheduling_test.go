@@ -10,8 +10,10 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	dockerContainer "github.com/docker/docker/api/types/container"
+	dockerNat "github.com/docker/go-connections/nat"
 
 	mockActions "github.com/nicholas-fedor/watchtower/internal/actions/mocks"
 	"github.com/nicholas-fedor/watchtower/internal/scheduling"
@@ -21,8 +23,23 @@ import (
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
+// testContainerOption configures optional fields on the InspectResponse for testing.
+type testContainerOption func(*dockerContainer.InspectResponse)
+
+// withPortBindings adds host-bound port bindings to the container, making
+// HasExposedPorts() return true.
+func withPortBindings() testContainerOption {
+	return func(ir *dockerContainer.InspectResponse) {
+		ir.HostConfig = &dockerContainer.HostConfig{
+			PortBindings: map[dockerNat.Port][]dockerNat.PortBinding{
+				dockerNat.Port("8080/tcp"): {{HostIP: "0.0.0.0", HostPort: "8080"}},
+			},
+		}
+	}
+}
+
 // createTestContainer creates a *container.Container with specified chain label for testing.
-func createTestContainer(chain string) *container.Container {
+func createTestContainer(chain string, opts ...testContainerOption) *container.Container {
 	labels := make(map[string]string)
 	if chain != "" {
 		labels[container.ContainerChainLabel] = chain
@@ -37,6 +54,10 @@ func createTestContainer(chain string) *container.Container {
 			Image:    "test-image",
 			Labels:   labels,
 		},
+	}
+
+	for _, opt := range opts {
+		opt(inspectResponse)
 	}
 
 	return container.NewContainer(inspectResponse, nil)
@@ -110,10 +131,66 @@ func TestRunUpgradesOnSchedule_EmptySchedule(t *testing.T) {
 		false, // updateOnStart
 		false, // skipFirstRun
 		nil,   // currentWatchtowerContainer
+		false, // startupMessageSent
+		false, // ephemeralSelfUpdate
 	)
 	// Should complete without error when context times out (clean cancellation)
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
+	}
+}
+
+func TestRunUpgradesOnSchedule_StartupMessageSuppressed(t *testing.T) {
+	cmd := &cobra.Command{}
+	client := mockActions.CreateMockClient(&mockActions.TestData{}, false, false)
+
+	ctx := t.Context()
+
+	cmd.Flags().Bool("update-on-start", false, "")
+
+	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, _ types.UpdateParams) *metrics.Metric {
+		return &metrics.Metric{Scanned: 1, Updated: 0, Failed: 0}
+	}
+
+	// Spy closure to detect if writeStartupMessage is called
+	startupMessageCalled := false
+	writeStartupMessage := func(*cobra.Command, time.Time, string, string, container.Client, types.Notifier, string, *bool) {
+		startupMessageCalled = true
+	}
+
+	// Use timeout to avoid hanging
+	timeoutCtx, timeoutCancel := context.WithTimeout(ctx, 10*time.Millisecond)
+	defer timeoutCancel()
+
+	err := scheduling.RunUpgradesOnSchedule(
+		timeoutCtx,
+		cmd,
+		filters.NoFilter,
+		"test filter",
+		nil,   // no lock
+		false, // cleanup
+		"",    // empty schedule
+		writeStartupMessage,
+		runUpdatesWithNotifications,
+		client,
+		"",  // scope
+		nil, // no notifier
+		"v1.0.0",
+		false, // monitorOnly
+		false, // updateOnStart
+		false, // skipFirstRun
+		nil,   // currentWatchtowerContainer
+		true,  // startupMessageSent - suppress the startup message
+		false, // ephemeralSelfUpdate
+	)
+	// Should complete without error when context times out (clean cancellation)
+	if err != nil {
+		t.Errorf("expected no error, got %v", err)
+	}
+
+	// Verify writeStartupMessage was NOT called when startupMessageSent=true
+	if startupMessageCalled {
+		t.Error("writeStartupMessage should not be called when startupMessageSent is true")
 	}
 }
 
@@ -156,6 +233,8 @@ func TestRunUpgradesOnSchedule_UpdateOnStart(t *testing.T) {
 		true,  // updateOnStart
 		false, // skipFirstRun
 		nil,   // currentWatchtowerContainer
+		false, // startupMessageSent
+		false, // ephemeralSelfUpdate
 	)
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
@@ -213,6 +292,8 @@ func TestRunUpgradesOnSchedule_InvalidCronSpec(t *testing.T) {
 		false, // updateOnStart
 		false, // skipFirstRun
 		nil,   // currentWatchtowerContainer
+		false, // startupMessageSent
+		false, // ephemeralSelfUpdate
 	)
 	if err == nil {
 		t.Error("expected error")
@@ -257,6 +338,8 @@ func TestRunUpgradesOnSchedule_ContextCancellation(t *testing.T) {
 		false, // updateOnStart
 		false, // skipFirstRun
 		nil,   // currentWatchtowerContainer
+		false, // startupMessageSent
+		false, // ephemeralSelfUpdate
 	)
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
@@ -320,6 +403,8 @@ func TestRunUpgradesOnSchedule_MonitorOnlyParameter(t *testing.T) {
 				true,           // updateOnStart - trigger immediate update
 				false,          // skipFirstRun
 				nil,            // currentWatchtowerContainer
+				false,          // startupMessageSent
+				false,          // ephemeralSelfUpdate
 			)
 			if err != nil {
 				t.Errorf("expected no error, got %v", err)
@@ -428,6 +513,8 @@ func TestRunUpgradesOnSchedule_CronWithSeconds(t *testing.T) {
 		false, // updateOnStart
 		false, // skipFirstRun
 		nil,   // currentWatchtowerContainer
+		false, // startupMessageSent
+		false, // ephemeralSelfUpdate
 	)
 	// Should complete without error when context times out (clean cancellation)
 	if err != nil {
@@ -481,6 +568,8 @@ func TestRunUpgradesOnSchedule_SkipFirstRun_True(t *testing.T) {
 		false, // updateOnStart
 		true,  // skipFirstRun - should skip Watchtower self-update on first run
 		nil,   // currentWatchtowerContainer
+		false, // startupMessageSent
+		false, // ephemeralSelfUpdate
 	)
 	// Should complete without error when context times out (clean cancellation)
 	if err != nil {
@@ -546,6 +635,8 @@ func TestRunUpgradesOnSchedule_WatchtowerParent_Skipping(t *testing.T) {
 		false,           // updateOnStart
 		false,           // skipFirstRun
 		parentContainer, // currentWatchtowerContainer - should skip updates
+		false,           // startupMessageSent
+		false,           // ephemeralSelfUpdate
 	)
 	// Should complete without error when context times out (clean cancellation)
 	if err != nil {
@@ -604,6 +695,8 @@ func TestRunUpgradesOnSchedule_ScheduledRuns_Execution(t *testing.T) {
 		false, // updateOnStart
 		false, // skipFirstRun
 		nil,   // currentWatchtowerContainer
+		false, // startupMessageSent
+		false, // ephemeralSelfUpdate
 	)
 	// Should complete without error when context times out (clean cancellation)
 	if err != nil {
@@ -628,5 +721,211 @@ func TestRunUpgradesOnSchedule_ScheduledRuns_Execution(t *testing.T) {
 		if execTime.Before(startTime) {
 			t.Errorf("execution time %v is before start time %v", execTime, startTime)
 		}
+	}
+}
+
+// TestRunUpgradesOnSchedule_EphemeralSelfUpdateWithExposedPorts verifies that when
+// ephemeralSelfUpdate=true, the port-conflict guard is bypassed even when the
+// Watchtower container has exposed ports. This allows ephemeral self-updates to
+// proceed because they remove the old container before creating the new one,
+// avoiding port conflicts.
+func TestRunUpgradesOnSchedule_EphemeralSelfUpdateWithExposedPorts(t *testing.T) {
+	cmd := &cobra.Command{}
+	client := mockActions.CreateMockClient(&mockActions.TestData{}, false, false)
+
+	ctx := t.Context()
+
+	var capturedParams types.UpdateParams
+
+	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, params types.UpdateParams) *metrics.Metric {
+		capturedParams = params
+
+		return &metrics.Metric{Scanned: 1, Updated: 0, Failed: 0}
+	}
+
+	writeStartupMessage := func(*cobra.Command, time.Time, string, string, container.Client, types.Notifier, string, *bool) {}
+
+	cmd.PersistentFlags().Bool("update-on-start", true, "")
+
+	// Create a Watchtower container with exposed ports (host-bound port mappings).
+	containerWithPorts := createTestContainer("", withPortBindings())
+
+	require.True(t, containerWithPorts.HasExposedPorts(),
+		"test container should have exposed ports",
+	)
+
+	timeoutCtx, timeoutCancel := context.WithTimeout(ctx, 10*time.Millisecond)
+	defer timeoutCancel()
+
+	err := scheduling.RunUpgradesOnSchedule(
+		timeoutCtx,
+		cmd,
+		filters.NoFilter,
+		"test filter",
+		nil,   // lock (auto-created)
+		false, // cleanup
+		"",    // empty schedule
+		writeStartupMessage,
+		runUpdatesWithNotifications,
+		client,
+		"",  // scope
+		nil, // no notifier
+		"v1.0.0",
+		false,              // monitorOnly
+		true,               // updateOnStart - triggers immediate update
+		false,              // skipFirstRun
+		containerWithPorts, // currentWatchtowerContainer with exposed ports
+		false,              // startupMessageSent
+		true,               // ephemeralSelfUpdate - bypasses port-conflict guard
+	)
+	require.NoError(t, err)
+
+	// With ephemeralSelfUpdate=true, the port-conflict guard should be bypassed,
+	// so SkipSelfUpdate should remain false (self-update is allowed).
+	assert.False(t, capturedParams.SkipSelfUpdate,
+		"self-update should NOT be skipped when ephemeralSelfUpdate=true, "+
+			"even with exposed ports",
+	)
+}
+
+// TestRunUpgradesOnSchedule_PortConflictGuard_SkipsSelfUpdate verifies that when
+// the Watchtower container has exposed ports and ephemeralSelfUpdate=false, the
+// port-conflict guard forces SkipSelfUpdate to true to prevent the old container
+// from holding the port while the new container tries to bind it.
+func TestRunUpgradesOnSchedule_PortConflictGuard_SkipsSelfUpdate(t *testing.T) {
+	cmd := &cobra.Command{}
+	client := mockActions.CreateMockClient(&mockActions.TestData{}, false, false)
+
+	ctx := t.Context()
+
+	var capturedParams types.UpdateParams
+
+	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, params types.UpdateParams) *metrics.Metric {
+		capturedParams = params
+
+		return &metrics.Metric{Scanned: 1, Updated: 0, Failed: 0}
+	}
+
+	writeStartupMessage := func(*cobra.Command, time.Time, string, string, container.Client, types.Notifier, string, *bool) {}
+
+	cmd.PersistentFlags().Bool("update-on-start", true, "")
+
+	// Create a Watchtower container with exposed ports (host-bound port mappings).
+	containerWithPorts := createTestContainer("", withPortBindings())
+
+	require.True(t, containerWithPorts.HasExposedPorts(),
+		"test container should have exposed ports",
+	)
+
+	timeoutCtx, timeoutCancel := context.WithTimeout(ctx, 10*time.Millisecond)
+	defer timeoutCancel()
+
+	err := scheduling.RunUpgradesOnSchedule(
+		timeoutCtx,
+		cmd,
+		filters.NoFilter,
+		"test filter",
+		nil,   // lock (auto-created)
+		false, // cleanup
+		"",    // empty schedule
+		writeStartupMessage,
+		runUpdatesWithNotifications,
+		client,
+		"",  // scope
+		nil, // no notifier
+		"v1.0.0",
+		false,              // monitorOnly
+		true,               // updateOnStart - triggers immediate update
+		false,              // skipFirstRun
+		containerWithPorts, // currentWatchtowerContainer with exposed ports
+		false,              // startupMessageSent
+		false,              // ephemeralSelfUpdate - port-conflict guard is active
+	)
+	require.NoError(t, err)
+
+	// With ephemeralSelfUpdate=false and exposed ports, the port-conflict guard
+	// should force SkipSelfUpdate to true to prevent port conflicts.
+	assert.True(t, capturedParams.SkipSelfUpdate,
+		"self-update should be skipped when container has exposed ports "+
+			"and ephemeralSelfUpdate=false",
+	)
+}
+
+// TestRunUpgradesOnSchedule_NoExposedPorts_AllowsSelfUpdate verifies that when
+// the Watchtower container has no exposed ports, the port-conflict guard does
+// not interfere regardless of the ephemeralSelfUpdate setting.
+func TestRunUpgradesOnSchedule_NoExposedPorts_AllowsSelfUpdate(t *testing.T) {
+	tests := []struct {
+		name                string
+		ephemeralSelfUpdate bool
+	}{
+		{
+			name:                "ephemeralSelfUpdate=true",
+			ephemeralSelfUpdate: true,
+		},
+		{
+			name:                "ephemeralSelfUpdate=false",
+			ephemeralSelfUpdate: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := &cobra.Command{}
+			client := mockActions.CreateMockClient(&mockActions.TestData{}, false, false)
+
+			ctx := t.Context()
+
+			var capturedParams types.UpdateParams
+
+			runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, params types.UpdateParams) *metrics.Metric {
+				capturedParams = params
+
+				return &metrics.Metric{Scanned: 1, Updated: 0, Failed: 0}
+			}
+
+			writeStartupMessage := func(*cobra.Command, time.Time, string, string, container.Client, types.Notifier, string, *bool) {}
+
+			cmd.PersistentFlags().Bool("update-on-start", true, "")
+
+			// Create a Watchtower container WITHOUT exposed ports.
+			containerNoPorts := createTestContainer("")
+
+			require.False(t, containerNoPorts.HasExposedPorts(),
+				"test container should not have exposed ports",
+			)
+
+			timeoutCtx, timeoutCancel := context.WithTimeout(ctx, 10*time.Millisecond)
+			defer timeoutCancel()
+
+			err := scheduling.RunUpgradesOnSchedule(
+				timeoutCtx,
+				cmd,
+				filters.NoFilter,
+				"test filter",
+				nil,   // lock (auto-created)
+				false, // cleanup
+				"",    // empty schedule
+				writeStartupMessage,
+				runUpdatesWithNotifications,
+				client,
+				"",  // scope
+				nil, // no notifier
+				"v1.0.0",
+				false,            // monitorOnly
+				true,             // updateOnStart - triggers immediate update
+				false,            // skipFirstRun
+				containerNoPorts, // currentWatchtowerContainer without exposed ports
+				false,            // startupMessageSent
+				tt.ephemeralSelfUpdate,
+			)
+			require.NoError(t, err)
+
+			// Without exposed ports, the port-conflict guard should not trigger,
+			// so SkipSelfUpdate should remain false regardless of ephemeralSelfUpdate.
+			assert.False(t, capturedParams.SkipSelfUpdate,
+				"self-update should NOT be skipped when container has no exposed ports",
+			)
+		})
 	}
 }

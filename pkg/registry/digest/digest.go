@@ -16,9 +16,11 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/distribution/reference"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 
+	"github.com/nicholas-fedor/watchtower/internal/meta"
 	"github.com/nicholas-fedor/watchtower/pkg/registry/auth"
 	"github.com/nicholas-fedor/watchtower/pkg/registry/manifest"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
@@ -29,14 +31,21 @@ import (
 // allowing Watchtower to compare or fetch it without downloading the full manifest body.
 const ContentDigestHeader = "Docker-Content-Digest"
 
-// UserAgent is the User-Agent header value used in HTTP requests to identify Watchtower as the client.
-// It can be customized at build time using linker flags (e.g., -ldflags "-X ...UserAgent=Watchtower/v1.0").
-// If not set during the build, it defaults to "Watchtower/unknown", providing a fallback identifier for registry requests.
-var UserAgent = "Watchtower/unknown"
+// imageLockEntry holds a per-image mutex along with a reference count and dead flag.
+// When refs drops to zero, the entry is marked dead so new callers will revive it
+// rather than creating a duplicate. This keeps the map bounded in practice while
+// avoiding races between deletion and concurrent revival.
+type imageLockEntry struct {
+	mu      sync.Mutex
+	inspect sync.Mutex
+	refs    int
+	dead    bool
+}
 
-// inspectMutex synchronizes access to ImageInspector operations to ensure thread safety
-// during concurrent digest fetching operations.
-var inspectMutex sync.Mutex
+// imageInspectLocks provides per-image-name mutex synchronization for ImageInspectWithRaw operations.
+// Keys are canonicalized image references (e.g., "docker.io/library/nginx:latest") so that
+// different representations of the same image share a single lock. Values are *imageLockEntry.
+var imageInspectLocks sync.Map
 
 // Errors for digest retrieval operations.
 var (
@@ -53,6 +62,134 @@ var (
 	// errFailedExecuteRequest indicates a failure to execute an HTTP request to the registry.
 	errFailedExecuteRequest = errors.New("failed to execute request")
 )
+
+// canonicalizeImageName resolves an image name to its fully-qualified canonical form
+// using the distribution/reference library. This ensures that different representations
+// of the same image (e.g., "nginx:latest" vs "docker.io/library/nginx:latest") resolve
+// to the same lock key. Tags and digests are preserved so that different references
+// to the same repository (e.g., repo:stable vs repo:canary) are serialized independently.
+//
+// Parameters:
+//   - imageName: Raw image name from container configuration.
+//
+// Returns:
+//   - string: Canonical image reference with tag/digest preserved, or the original name if parsing fails.
+func canonicalizeImageName(imageName string) string {
+	ref, err := reference.ParseNormalizedNamed(imageName)
+	if err != nil {
+		return imageName
+	}
+
+	return ref.String()
+}
+
+// getImageInspectLock retrieves or creates a reference-counted lock entry for the
+// given image name. The image name is canonicalized so that different representations
+// of the same image share a single mutex. The returned cleanup function must be called
+// after the caller is finished with the lock to decrement the reference count and
+// clean up the entry when no longer in use.
+//
+// The returned closure captures the exact *imageLockEntry pointer so that
+// releaseImageInspectLockEntry always decrements the correct entry even if a
+// concurrent caller has replaced the map entry in the interim.
+//
+// Parameters:
+//   - imageName: Raw image name (may be short or fully-qualified).
+//
+// Returns:
+//   - *sync.Mutex: The per-image mutex for serializing inspections.
+//   - func(): Cleanup function that decrements the reference count.
+func getImageInspectLock(imageName string) (*sync.Mutex, func()) {
+	key := canonicalizeImageName(imageName)
+
+	// Create a candidate entry optimistically. If another goroutine wins the
+	// LoadOrStore race we discard this one and use theirs instead.
+	newEntry := &imageLockEntry{refs: 1}
+
+	val, loaded := imageInspectLocks.LoadOrStore(key, newEntry)
+	if loaded {
+		// Another goroutine already stored an entry; discard ours and
+		// revive or increment the existing one.
+		existing, isEntry := val.(*imageLockEntry)
+		if isEntry {
+			existing.mu.Lock()
+
+			// Check dead before incrementing: if the entry was marked dead by a
+			// concurrent release that is about to remove it from the map, do not
+			// revive it — let it be deleted and create a fresh entry instead.
+			if existing.dead {
+				existing.mu.Unlock()
+
+				fresh := &imageLockEntry{refs: 1}
+				imageInspectLocks.Store(key, fresh)
+
+				return &fresh.inspect, func() { releaseImageInspectLockEntry(key, fresh) }
+			}
+
+			existing.refs++
+			existing.mu.Unlock()
+
+			return &existing.inspect, func() { releaseImageInspectLockEntry(key, existing) }
+		}
+
+		// Unexpected type in map; overwrite with our entry.
+		imageInspectLocks.Store(key, newEntry)
+	}
+
+	return &newEntry.inspect, func() { releaseImageInspectLockEntry(key, newEntry) }
+}
+
+// releaseImageInspectLockEntry decrements the reference count for the given lock
+// entry. When the count reaches zero the entry is conditionally removed from the
+// map (only if it is still the same entry) to avoid races with concurrent
+// getImageInspectLock calls that may have replaced it.
+//
+// Unlike releaseImageInspectLock (which loads the entry from the map by key),
+// this function operates on the exact pointer captured at acquisition time,
+// preventing the revive/delete race where a stale key-based lookup could
+// decrement the wrong entry's ref count.
+//
+// Parameters:
+//   - key: Canonical image reference key used for conditional map deletion.
+//   - entry: The specific lock entry to release.
+func releaseImageInspectLockEntry(key string, entry *imageLockEntry) {
+	entry.mu.Lock()
+	entry.refs--
+
+	if entry.refs == 0 {
+		entry.dead = true
+
+		// Hold entry.mu while removing from the map so a concurrent
+		// getImageInspectLock cannot revive the entry between the dead
+		// flag being set and the map entry being deleted.
+		imageInspectLocks.CompareAndDelete(key, entry)
+		entry.mu.Unlock()
+
+		return
+	}
+
+	entry.mu.Unlock()
+}
+
+// releaseImageInspectLock decrements the reference count for the lock entry
+// associated with the given canonical image key. This is the key-based variant;
+// prefer releaseImageInspectLockEntry when the exact entry pointer is available.
+//
+// Parameters:
+//   - key: Canonical image reference key.
+func releaseImageInspectLock(key string) {
+	val, loaded := imageInspectLocks.Load(key)
+	if !loaded {
+		return
+	}
+
+	entry, isEntry := val.(*imageLockEntry)
+	if !isEntry {
+		return
+	}
+
+	releaseImageInspectLockEntry(key, entry)
+}
 
 // NormalizeDigest standardizes a digest string for consistent comparison.
 //
@@ -85,6 +222,11 @@ func NormalizeDigest(digest string) string {
 
 // CompareDigest checks whether a container's current image digest matches the latest from its registry.
 //
+// It first inspects the image to check if it's locally built (empty RepoDigests).
+// For local images, digest comparison against a remote registry is not possible,
+// so it returns true to indicate the image should not be updated. This avoids
+// unnecessary HTTP requests and confusing error messages for locally built images.
+//
 // Parameters:
 //   - ctx: Context for request lifecycle control.
 //   - inspector: Image inspector for checking if image is locally built.
@@ -112,25 +254,60 @@ func CompareDigest(
 		return false, errMissingImageInfo
 	}
 
+	// Check if the container's image has no RepoDigests, which indicates a locally
+	// built image that has never been pushed or pulled. For such images, there is
+	// no remote digest to compare against, so we treat them as up-to-date to avoid
+	// unnecessary registry requests and confusing error messages.
+	//
+	// We check container.ImageInfo().RepoDigests rather than inspecting via the
+	// Docker daemon because:
+	// 1. The container was already populated with image info during initialization
+	// 2. For locally built images, RepoDigests is always empty
+	// 3. This avoids an extra Docker daemon call
+	if len(container.ImageInfo().RepoDigests) == 0 {
+		logrus.WithFields(fields).
+			Debug("Image with no registry reference detected (empty RepoDigests) - skipping digest comparison")
+
+		return true, nil
+	}
+
 	// Fetch the latest digest from the registry using a HEAD request for efficiency.
-	remoteDigest, err := fetchDigest(ctx, inspector, container, registryAuth, http.MethodHead)
+	remoteDigest, err := fetchDigest(
+		ctx,
+		inspector,
+		container,
+		registryAuth,
+		http.MethodHead,
+	)
 	if err != nil {
 		return false, err
 	}
 
-	// If HEAD request returned empty digest (due to 404), fall back to GET request.
+	// If HEAD request returned empty digest (due to missing Docker-Content-Digest header),
+	// fall back to GET request.
 	if remoteDigest == "" {
-		logrus.WithFields(fields).Debug("HEAD request returned empty digest, falling back to GET")
+		logrus.WithFields(fields).
+			Debug("HEAD request returned empty digest - falling back to GET")
 
-		remoteDigest, err = FetchDigest(ctx, inspector, container, registryAuth)
+		remoteDigest, err = FetchDigest(
+			ctx,
+			inspector,
+			container,
+			registryAuth,
+		)
 		if err != nil {
 			return false, err
 		}
 	}
 
 	// Compare the fetched remote digest with the container's local digests.
-	matches := DigestsMatch(container.ImageInfo().RepoDigests, remoteDigest)
-	logrus.WithFields(fields).WithField("matches", matches).Debug("Completed digest comparison")
+	matches := DigestsMatch(
+		container.ImageInfo().RepoDigests,
+		remoteDigest,
+	)
+	logrus.WithFields(fields).
+		WithField("matches", matches).
+		Debug("Completed digest comparison")
 
 	return matches, nil
 }
@@ -264,12 +441,23 @@ func fetchDigest(
 	}
 
 	// Inspect the image to check if it's locally built (no RepoDigests).
-	// Synchronize access to prevent race conditions in concurrent operations.
-	inspectMutex.Lock()
+	// Use a per-image-name mutex to serialize inspections of the same image
+	// while allowing concurrent inspections of different images. This prevents
+	// redundant concurrent requests to the Docker daemon for the same image
+	// without blocking unrelated image inspections.
+	//
+	// The lock is scoped to only the daemon call; network I/O below runs
+	// concurrently for different images.
+	imageName := container.ImageName()
 
-	inspect, _, err := inspector.ImageInspectWithRaw(ctx, container.ImageName())
+	lock, release := getImageInspectLock(imageName)
 
-	inspectMutex.Unlock()
+	lock.Lock()
+
+	inspect, _, err := inspector.ImageInspectWithRaw(ctx, imageName)
+
+	lock.Unlock()
+	release()
 
 	if err != nil {
 		logrus.WithError(err).WithFields(fields).Debug("Failed to inspect image")
@@ -303,7 +491,12 @@ func fetchDigest(
 		Debug("Extracted original host from manifest URL")
 
 	// Obtain an authentication token and challenge host for the registry.
-	token, challengeHost, redirected, err := auth.GetToken(ctx, container, registryAuth, client)
+	token, challengeHost, redirected, redirectHost, err := auth.GetToken(
+		ctx,
+		container,
+		registryAuth,
+		client,
+	)
 	if err != nil {
 		logrus.WithError(err).WithFields(fields).Debug("Failed to get token")
 
@@ -312,28 +505,38 @@ func fetchDigest(
 
 	// If no token is returned, authentication is not required.
 	if token == "" {
-		logrus.WithFields(fields).Debug("No authentication required, proceeding with request")
+		logrus.WithFields(fields).
+			Debug("No authentication required, proceeding with request")
 	} else {
 		logrus.WithFields(fields).
 			WithField("challenge_host", challengeHost).
 			WithField("redirected", redirected).
+			WithField("redirect_host", redirectHost).
 			Debug("Received challenge host and redirect flag from GetToken")
 	}
 
-	// Build the manifest URL, using challenge host when redirected
+	// Build the manifest URL, using redirect host when redirected
 	var (
 		manifestURL string
 		parsedURL   *url.URL
 	)
 
-	if challengeHost != "" && challengeHost != originalHost && redirected {
-		manifestURL, _, parsedURL, err = BuildManifestURL(container, challengeHost)
+	if redirectHost != "" && redirectHost != originalHost && redirected {
+		manifestURL, _, parsedURL, err = BuildManifestURL(
+			container,
+			redirectHost,
+		)
 	} else {
-		manifestURL, _, parsedURL, err = BuildManifestURL(container, "")
+		manifestURL, _, parsedURL, err = BuildManifestURL(
+			container,
+			"",
+		)
 	}
 
 	if err != nil {
-		logrus.WithError(err).WithFields(fields).Debug("Failed to build manifest URL")
+		logrus.WithError(err).
+			WithFields(fields).
+			Debug("Failed to build manifest URL")
 
 		return "", err
 	}
@@ -859,7 +1062,7 @@ func makeManifestRequest(
 		"Accept",
 		"application/vnd.docker.distribution.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json",
 	)
-	req.Header.Set("User-Agent", UserAgent)
+	req.Header.Set("User-Agent", meta.UserAgent)
 
 	return req, nil
 }

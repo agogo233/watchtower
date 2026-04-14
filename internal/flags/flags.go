@@ -28,6 +28,9 @@ const defaultStopTimeoutSeconds = 30
 // defaultEmailServerPort sets the default SMTP port (25).
 const defaultEmailServerPort = 25
 
+// defaultAPIRateLimitPerMinute sets the default HTTP API rate limit (60 requests per minute per IP).
+const defaultAPIRateLimitPerMinute = 60
+
 // Errors for flag and environment configuration.
 var (
 	// errInvalidLogFormat indicates an invalid log format was specified in configuration.
@@ -90,6 +93,12 @@ func RegisterSystemFlags(rootCmd *cobra.Command) {
 		"t",
 		envDuration("WATCHTOWER_TIMEOUT"),
 		"Timeout before a container is forcefully stopped")
+
+	flags.StringP(
+		"cooldown-delay",
+		"",
+		envString("WATCHTOWER_COOLDOWN_DELAY"),
+		"Minimum time since image creation before allowing updates. Supports h, m, s, d (days), w (weeks), M (months) (e.g., 24h, 3d, 1w, 1M)")
 
 	flags.BoolP(
 		"no-pull",
@@ -239,6 +248,13 @@ func RegisterSystemFlags(rootCmd *cobra.Command) {
 		"Also run periodic updates (specified with --interval and --schedule) if HTTP API is enabled",
 	)
 
+	flags.IntP(
+		"http-api-rate-limit",
+		"",
+		envInt("WATCHTOWER_HTTP_API_RATE_LIMIT"),
+		"Maximum authentication requests per minute per IP address for the HTTP API (default: 60)",
+	)
+
 	// https://no-color.org/
 	flags.BoolP(
 		"no-color",
@@ -277,6 +293,12 @@ func RegisterSystemFlags(rootCmd *cobra.Command) {
 		"Label applied to containers take precedence over arguments")
 
 	flags.BoolP(
+		"use-compose-depends-on",
+		"",
+		envBool("WATCHTOWER_USE_COMPOSE_DEPENDS_ON"),
+		"Include Docker Compose depends_on label when determining container update order")
+
+	flags.BoolP(
 		"disable-memory-swappiness",
 		"",
 		envBool("WATCHTOWER_DISABLE_MEMORY_SWAPPINESS"),
@@ -289,6 +311,24 @@ func RegisterSystemFlags(rootCmd *cobra.Command) {
 		envString("WATCHTOWER_CPU_COPY_MODE"),
 		"CPU copy mode for container recreation, used for compatibility with Podman. Options: auto, full, none",
 	)
+
+	flags.BoolP(
+		"ephemeral-self-update",
+		"",
+		envBool("WATCHTOWER_EPHEMERAL_SELF_UPDATE"),
+		"Use an ephemeral container to orchestrate Watchtower self-updates (experimental)",
+	)
+
+	flags.Bool(
+		"self-update-orchestrator",
+		false,
+		"Internal: Run as ephemeral orchestrator for self-update (not for direct use)",
+	)
+	// Hide the orchestrator flag from help output since it's internal.
+	err := flags.MarkHidden("self-update-orchestrator")
+	if err != nil {
+		logrus.WithError(err).Debug("Failed to hide self-update-orchestrator flag")
+	}
 
 	flags.IntP(
 		"lifecycle-uid",
@@ -695,8 +735,10 @@ func SetDefaults() {
 	viper.SetDefault("DOCKER_HOST", "unix:///var/run/docker.sock")
 	viper.SetDefault("WATCHTOWER_POLL_INTERVAL", defaultPollIntervalSeconds)
 	viper.SetDefault("WATCHTOWER_TIMEOUT", time.Second*defaultStopTimeoutSeconds)
+	viper.SetDefault("WATCHTOWER_COOLDOWN_DELAY", "")
 	viper.SetDefault("WATCHTOWER_HTTP_API_HOST", "")
 	viper.SetDefault("WATCHTOWER_HTTP_API_PORT", "8080")
+	viper.SetDefault("WATCHTOWER_HTTP_API_RATE_LIMIT", defaultAPIRateLimitPerMinute)
 	viper.SetDefault("WATCHTOWER_NOTIFICATIONS", []string{})
 	viper.SetDefault("WATCHTOWER_NOTIFICATIONS_LEVEL", "info")
 	viper.SetDefault("WATCHTOWER_NOTIFICATION_EMAIL_SERVER_PORT", defaultEmailServerPort)
@@ -706,6 +748,7 @@ func SetDefaults() {
 	viper.SetDefault("WATCHTOWER_LOG_FORMAT", "auto")
 	viper.SetDefault("WATCHTOWER_DISABLE_MEMORY_SWAPPINESS", false)
 	viper.SetDefault("WATCHTOWER_CPU_COPY_MODE", "auto")
+	viper.SetDefault("WATCHTOWER_USE_COMPOSE_DEPENDS_ON", true)
 	viper.SetDefault("WATCHTOWER_REGISTRY_TLS_SKIP", false)
 	viper.SetDefault("WATCHTOWER_REGISTRY_TLS_MIN_VERSION", "TLS1.2")
 }
@@ -1137,6 +1180,14 @@ func SetupLogging(flags *pflag.FlagSet) error {
 		return fmt.Errorf("%w: %w", errSetFlagFailed, err)
 	}
 
+	// Default to "auto" when neither the flag nor WATCHTOWER_LOG_FORMAT is set.
+	// This prevents configureLogFormat from returning errInvalidLogFormat on empty strings,
+	// which is the case when running the ephemeral orchestrator container without
+	// WATCHTOWER_LOG_FORMAT in its environment.
+	if logFormat == "" {
+		logFormat = "auto"
+	}
+
 	noColor, err := flags.GetBool("no-color")
 	if err != nil {
 		logrus.WithField("flag", "no-color").WithError(err).Debug("Failed to get no-color flag")
@@ -1149,7 +1200,7 @@ func SetupLogging(flags *pflag.FlagSet) error {
 		return err
 	}
 
-	// Set log level.
+	// Set log level only when explicitly specified.
 	rawLogLevel, err := flags.GetString("log-level")
 	if err != nil {
 		logrus.WithField("flag", "log-level").WithError(err).Debug("Failed to get log-level flag")
@@ -1157,17 +1208,26 @@ func SetupLogging(flags *pflag.FlagSet) error {
 		return fmt.Errorf("%w: %w", errSetFlagFailed, err)
 	}
 
-	logLevel, err := logrus.ParseLevel(rawLogLevel)
-	if err != nil {
-		logrus.WithError(err).WithField("level", rawLogLevel).Debug("Invalid log level specified")
+	// Only parse and override the log level when a value was explicitly set.
+	// When rawLogLevel is empty (neither --log-level nor WATCHTOWER_LOG_LEVEL is set),
+	// preserve the level configured earlier (e.g., InfoLevel from main.go init).
+	// This prevents logrus.ParseLevel("") from returning an error, which would
+	// cause SetupLogging to fail and preRun to call logrus.Fatal before the
+	// orchestrator mode check — silently killing the ephemeral orchestrator container.
+	if rawLogLevel != "" {
+		logLevel, err := logrus.ParseLevel(rawLogLevel)
+		if err != nil {
+			logrus.WithError(err).WithField("level", rawLogLevel).Debug("Invalid log level specified")
 
-		return fmt.Errorf("%w: %w", errInvalidLogLevel, err)
+			return fmt.Errorf("%w: %w", errInvalidLogLevel, err)
+		}
+
+		logrus.SetLevel(logLevel)
 	}
 
-	logrus.SetLevel(logLevel)
 	logrus.WithFields(logrus.Fields{
 		"format":   logFormat,
-		"level":    logLevel,
+		"level":    logrus.GetLevel(),
 		"no_color": noColor,
 	}).Debug("Configured logging settings")
 

@@ -10,7 +10,177 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Chores
 
+- Update google.golang.org/genproto/googleapis/rpc digest to 9d38bb4 by @renovate[bot] in [#1517](https://github.com/nicholas-fedor/watchtower/pull/1517)
+- Update google.golang.org/genproto/googleapis/api digest to 9d38bb4 by @renovate[bot] in [#1516](https://github.com/nicholas-fedor/watchtower/pull/1516)
+
+## [1.16.1] - 2026-04-01
+
+### Chores
+
+- Update google.golang.org/genproto/googleapis/rpc digest to 3a24fdc by @renovate[bot] in [#1515](https://github.com/nicholas-fedor/watchtower/pull/1515)
+- Update module github.com/nicholas-fedor/shoutrrr to v0.14.3 by @renovate[bot] in [#1513](https://github.com/nicholas-fedor/watchtower/pull/1513)
+- Update google.golang.org/genproto/googleapis/rpc digest to f93e5f3 by @renovate[bot] in [#1511](https://github.com/nicholas-fedor/watchtower/pull/1511)
+- Update google.golang.org/genproto/googleapis/api digest to f93e5f3 by @renovate[bot] in [#1510](https://github.com/nicholas-fedor/watchtower/pull/1510)
+
+### Fixed
+
+- Skip registry requests for locally built images by @nicholas-fedor in [#1514](https://github.com/nicholas-fedor/watchtower/pull/1514)
+
+## [1.16.0] - 2026-03-31
+
+### Added
+
+- Add image cooldown supply-chain defense mechanism by @nicholas-fedor in [#1495](https://github.com/nicholas-fedor/watchtower/pull/1495)
+- Add ephemeral self-update capability by @nicholas-fedor in [#1491](https://github.com/nicholas-fedor/watchtower/pull/1491)
+
+### Changed
+
+- Overhaul HTTP API with security hardening and rate limiting by @nicholas-fedor in [#1505](https://github.com/nicholas-fedor/watchtower/pull/1505)
+
+### Chores
+
+- Update step-security/harden-runner action to v2.16.1 by @renovate[bot] in [#1507](https://github.com/nicholas-fedor/watchtower/pull/1507)
+- Update module github.com/nicholas-fedor/shoutrrr to v0.14.2 by @renovate[bot] in [#1504](https://github.com/nicholas-fedor/watchtower/pull/1504)
+- Update docker/setup-qemu-action digest to 6412e4f by @renovate[bot] in [#1503](https://github.com/nicholas-fedor/watchtower/pull/1503)
+- Update docker/setup-buildx-action digest to e35beed by @renovate[bot] in [#1502](https://github.com/nicholas-fedor/watchtower/pull/1502)
+- Update docker/login-action digest to de05a6d by @renovate[bot] in [#1501](https://github.com/nicholas-fedor/watchtower/pull/1501)
+- Update docker/setup-buildx-action digest to dae0651 by @renovate[bot] in [#1500](https://github.com/nicholas-fedor/watchtower/pull/1500)
+- Update docker/login-action digest to bb9683d by @renovate[bot] in [#1499](https://github.com/nicholas-fedor/watchtower/pull/1499)
+- Update google.golang.org/genproto/googleapis/rpc digest to d5a96ad by @renovate[bot] in [#1498](https://github.com/nicholas-fedor/watchtower/pull/1498)
+- Update google.golang.org/genproto/googleapis/api digest to d5a96ad by @renovate[bot] in [#1497](https://github.com/nicholas-fedor/watchtower/pull/1497)
+- Update google.golang.org/genproto/googleapis/rpc digest to b2ae96c by @renovate[bot] in [#1496](https://github.com/nicholas-fedor/watchtower/pull/1496)
+- Update docker/login-action digest to 5c42dd2 by @renovate[bot] in [#1494](https://github.com/nicholas-fedor/watchtower/pull/1494)
+- Update crazy-max/ghaction-import-gpg digest to 1c06494 by @renovate[bot] in [#1493](https://github.com/nicholas-fedor/watchtower/pull/1493)
+- Update crazy-max/ghaction-import-gpg digest to da46d52 by @renovate[bot] in [#1489](https://github.com/nicholas-fedor/watchtower/pull/1489)
+- Update peter-evans/create-pull-request digest to 8170bcc by @renovate[bot] in [#1488](https://github.com/nicholas-fedor/watchtower/pull/1488)
+- Update github/codeql-action digest to c10b806 by @renovate[bot] in [#1487](https://github.com/nicholas-fedor/watchtower/pull/1487)
+- Update github/codeql-action digest to b8bb9f2 by @renovate[bot] in [#1486](https://github.com/nicholas-fedor/watchtower/pull/1486)
+- Update golangci/golangci-lint-action digest to 2d7e7b6 by @renovate[bot] in [#1474](https://github.com/nicholas-fedor/watchtower/pull/1474)
+- Update codecov/codecov-action digest to 57e3a13 by @renovate[bot] in [#1473](https://github.com/nicholas-fedor/watchtower/pull/1473)
+- Update module github.com/docker/cli to v29.3.1+incompatible by @renovate[bot] in [#1472](https://github.com/nicholas-fedor/watchtower/pull/1472)
+- Update peter-evans/create-pull-request digest to 0041819 by @renovate[bot] in [#1470](https://github.com/nicholas-fedor/watchtower/pull/1470)
+- Update docker/setup-qemu-action digest to 6804d31 by @renovate[bot] in [#1469](https://github.com/nicholas-fedor/watchtower/pull/1469)
+- Update docker/setup-buildx-action digest to 172dff0 by @renovate[bot] in [#1467](https://github.com/nicholas-fedor/watchtower/pull/1467)
+- Update docker/login-action digest to a0d57b8 by @renovate[bot] in [#1466](https://github.com/nicholas-fedor/watchtower/pull/1466)
+
+### Fixed
+
+- Correct self-update and add skipped container tracking in HTTP API by @nicholas-fedor in [#1506](https://github.com/nicholas-fedor/watchtower/pull/1506)
+- Retry transient Docker daemon connection failures during container listing by @nicholas-fedor in [#1492](https://github.com/nicholas-fedor/watchtower/pull/1492)
+- Reorganize container tests into dedicated files by @nicholas-fedor in [#1484](https://github.com/nicholas-fedor/watchtower/pull/1484)
+- Deduplicate image removal and grouped notification entries by @nicholas-fedor in [#1483](https://github.com/nicholas-fedor/watchtower/pull/1483)
+- Make Watchtower cleanup non-fatal after self-update by @nicholas-fedor in [#1482](https://github.com/nicholas-fedor/watchtower/pull/1482)
+- Skip self-update when Watchtower has host-bound ports by @nicholas-fedor in [#1481](https://github.com/nicholas-fedor/watchtower/pull/1481)
+- Prefer Watchtower-labeled container when multiple share hostname by @nicholas-fedor in [#1480](https://github.com/nicholas-fedor/watchtower/pull/1480)
+- Replace global mutex with per-image keyed locks by @nicholas-fedor in [#1479](https://github.com/nicholas-fedor/watchtower/pull/1479)
+- Validate port bindings before ContainerCreate by @nicholas-fedor in [#1478](https://github.com/nicholas-fedor/watchtower/pull/1478)
+- Differentiate auth, not-found, and transient errors during image pull by @nicholas-fedor in [#1477](https://github.com/nicholas-fedor/watchtower/pull/1477)
+- Replace fragile string-based error checking with typed errors by @nicholas-fedor in [#1476](https://github.com/nicholas-fedor/watchtower/pull/1476)
+- Handle container removed between check and stop by @nicholas-fedor in [#1475](https://github.com/nicholas-fedor/watchtower/pull/1475)
+
+## [1.15.0] - 2026-03-24
+
+### Added
+
+- Add option to disable Docker Compose depends_on dependency detection by @nicholas-fedor in [#1457](https://github.com/nicholas-fedor/watchtower/pull/1457)
+- Add LJspice as a contributor for code by @allcontributors[bot] in [#1449](https://github.com/nicholas-fedor/watchtower/pull/1449)
+
+### Changed
+
+- Onboard StepSecurity by @stepsecurity-app[bot] in [#1456](https://github.com/nicholas-fedor/watchtower/pull/1456)
+- Enable updates for transitive go dependencies by @nicholas-fedor in [#1428](https://github.com/nicholas-fedor/watchtower/pull/1428)
+
+### Chores
+
+- Update module github.com/nicholas-fedor/shoutrrr to v0.14.1 by @renovate[bot] in [#1462](https://github.com/nicholas-fedor/watchtower/pull/1462)
+- Update module github.com/pelletier/go-toml/v2 to v2.3.0 by @renovate[bot] in [#1461](https://github.com/nicholas-fedor/watchtower/pull/1461)
+- Update docker/login-action digest to 292fe2d by @renovate[bot] in [#1460](https://github.com/nicholas-fedor/watchtower/pull/1460)
+- Update goreleaser/goreleaser-action digest to fdcf0b9 by @renovate[bot] in [#1459](https://github.com/nicholas-fedor/watchtower/pull/1459)
+- Update module go.yaml.in/yaml/v2 to v2.4.4 by @renovate[bot] in [#1440](https://github.com/nicholas-fedor/watchtower/pull/1440)
+- Update golangci/golangci-lint-action digest to e94e72c by @renovate[bot] in [#1458](https://github.com/nicholas-fedor/watchtower/pull/1458)
+- Update github/codeql-action digest to 3869755 by @renovate[bot] in [#1455](https://github.com/nicholas-fedor/watchtower/pull/1455)
+- Update docker/setup-qemu-action digest to 6632d37 by @renovate[bot] in [#1454](https://github.com/nicholas-fedor/watchtower/pull/1454)
+- Update docker/setup-buildx-action digest to d91f340 by @renovate[bot] in [#1453](https://github.com/nicholas-fedor/watchtower/pull/1453)
+- Update docker/login-action digest to da5b89b by @renovate[bot] in [#1452](https://github.com/nicholas-fedor/watchtower/pull/1452)
+- Update github/codeql-action digest to c6f9311 by @renovate[bot] in [#1450](https://github.com/nicholas-fedor/watchtower/pull/1450)
+- Update golangci/golangci-lint-action digest to b269f19 by @renovate[bot] in [#1448](https://github.com/nicholas-fedor/watchtower/pull/1448)
+- Update peter-evans/create-pull-request digest to b993918 by @renovate[bot] in [#1447](https://github.com/nicholas-fedor/watchtower/pull/1447)
+- Update google.golang.org/genproto/googleapis/rpc digest to d00831a by @renovate[bot] in [#1444](https://github.com/nicholas-fedor/watchtower/pull/1444)
+- Update golangci/golangci-lint-action digest to fa2a845 by @renovate[bot] in [#1446](https://github.com/nicholas-fedor/watchtower/pull/1446)
+- Update google.golang.org/genproto/googleapis/api digest to d00831a by @renovate[bot] in [#1445](https://github.com/nicholas-fedor/watchtower/pull/1445)
+- Update google.golang.org/genproto/googleapis/api digest to cd36c79 by @renovate[bot] in [#1443](https://github.com/nicholas-fedor/watchtower/pull/1443)
+- Update securego/gosec action to v2.25.0 by @renovate[bot] in [#1442](https://github.com/nicholas-fedor/watchtower/pull/1442)
+- Update module go.yaml.in/yaml/v2 to v3 by @renovate[bot] in [#1439](https://github.com/nicholas-fedor/watchtower/pull/1439)
+- Update codecov/codecov-action digest to 1af5884 by @renovate[bot] in [#1438](https://github.com/nicholas-fedor/watchtower/pull/1438)
+- Update module go.yaml.in/yaml/v2 to v2.4.4 by @renovate[bot] in [#1436](https://github.com/nicholas-fedor/watchtower/pull/1436)
+- Update golangci/golangci-lint-action digest to 2bcbc9e by @renovate[bot] in [#1435](https://github.com/nicholas-fedor/watchtower/pull/1435)
+- Update module go.yaml.in/yaml/v2 to v3 by @renovate[bot] in [#1434](https://github.com/nicholas-fedor/watchtower/pull/1434)
+- Update module golang.org/x/tools to v0.43.0 by @renovate[bot] in [#1433](https://github.com/nicholas-fedor/watchtower/pull/1433)
+- Update module golang.org/x/net to v0.52.0 by @renovate[bot] in [#1432](https://github.com/nicholas-fedor/watchtower/pull/1432)
+- Update actions/cache digest to 6682284 by @renovate[bot] in [#1431](https://github.com/nicholas-fedor/watchtower/pull/1431)
+- Update google.golang.org/genproto/googleapis/rpc digest to 0b37fe3 by @renovate[bot] in [#1430](https://github.com/nicholas-fedor/watchtower/pull/1430)
+- Update google.golang.org/genproto/googleapis/api digest to 0b37fe3 by @renovate[bot] in [#1429](https://github.com/nicholas-fedor/watchtower/pull/1429)
+- Update nicholas-fedor/govulncheck-action digest to b438bbb by @renovate[bot] in [#1425](https://github.com/nicholas-fedor/watchtower/pull/1425)
+
+### Fixed
+
+- Resolve type mismatch with shoutrrr API change by @nicholas-fedor in [#1463](https://github.com/nicholas-fedor/watchtower/pull/1463)
+- Prevent cleanup of images actively used by active containers by @LJspice in [#1427](https://github.com/nicholas-fedor/watchtower/pull/1427)
+
+### New Contributors
+
+- @stepsecurity-app[bot] made their first contribution in [#1456](https://github.com/nicholas-fedor/watchtower/pull/1456)
+- @LJspice made their first contribution in [#1427](https://github.com/nicholas-fedor/watchtower/pull/1427)
+
+## [1.14.4] - 2026-03-17
+
+### Changed
+
+- Document regex pattern matching support by @nicholas-fedor in [#1404](https://github.com/nicholas-fedor/watchtower/pull/1404)
+- Refactor and cleanup security workflow by @nicholas-fedor in [#1397](https://github.com/nicholas-fedor/watchtower/pull/1397)
+
+### Chores
+
+- Update actions/setup-go digest to 4a36011 by @renovate[bot] in [#1423](https://github.com/nicholas-fedor/watchtower/pull/1423)
+- Update docker/dockerfile:1 docker digest to 4a43a54 by @renovate[bot] in [#1422](https://github.com/nicholas-fedor/watchtower/pull/1422)
+- Apply go modernize to use modern Go atomic types by @nicholas-fedor in [#1421](https://github.com/nicholas-fedor/watchtower/pull/1421)
+- Update nicholas-fedor/govulncheck-action digest to 4878bd2 by @renovate[bot] in [#1420](https://github.com/nicholas-fedor/watchtower/pull/1420)
+- Update github/codeql-action digest to b1bff81 by @renovate[bot] in [#1419](https://github.com/nicholas-fedor/watchtower/pull/1419)
+- Update docker/setup-qemu-action digest to b99055d by @renovate[bot] in [#1418](https://github.com/nicholas-fedor/watchtower/pull/1418)
+- Update actions/setup-go digest to 8f19afc by @renovate[bot] in [#1417](https://github.com/nicholas-fedor/watchtower/pull/1417)
+- Update docker/setup-buildx-action digest to 8016837 by @renovate[bot] in [#1415](https://github.com/nicholas-fedor/watchtower/pull/1415)
+- Update docker/login-action digest to c144859 by @renovate[bot] in [#1414](https://github.com/nicholas-fedor/watchtower/pull/1414)
+- Update peter-evans/create-pull-request digest to 36d7c84 by @renovate[bot] in [#1412](https://github.com/nicholas-fedor/watchtower/pull/1412)
+- Update OpenTelemetry and golang.org/x dependencies by @nicholas-fedor in [#1411](https://github.com/nicholas-fedor/watchtower/pull/1411)
+- Update module golang.org/x/text to v0.35.0 by @renovate[bot] in [#1410](https://github.com/nicholas-fedor/watchtower/pull/1410)
+- Update cimg/go:1.26.1 docker digest to ff658f9 by @renovate[bot] in [#1409](https://github.com/nicholas-fedor/watchtower/pull/1409)
+- Update module github.com/nicholas-fedor/shoutrrr to v0.14.0 by @renovate[bot] in [#1407](https://github.com/nicholas-fedor/watchtower/pull/1407)
+- Update cimg/go:1.26.1 docker digest to d6efbd2 by @renovate[bot] in [#1406](https://github.com/nicholas-fedor/watchtower/pull/1406)
+- Update cimg/go docker tag to v1.26.1 by @renovate[bot] in [#1405](https://github.com/nicholas-fedor/watchtower/pull/1405)
+- Update docker/setup-qemu-action digest to a4bc6cd by @renovate[bot] in [#1401](https://github.com/nicholas-fedor/watchtower/pull/1401)
+- Update docker/setup-buildx-action digest to c8ad1c5 by @renovate[bot] in [#1400](https://github.com/nicholas-fedor/watchtower/pull/1400)
+- Update docker/login-action digest to 9fe7774 by @renovate[bot] in [#1399](https://github.com/nicholas-fedor/watchtower/pull/1399)
+- Update actions/setup-python digest to 28f2168 by @renovate[bot] in [#1398](https://github.com/nicholas-fedor/watchtower/pull/1398)
+- Update nicholas-fedor/govulncheck-action digest to ac1aadb by @renovate[bot] in [#1396](https://github.com/nicholas-fedor/watchtower/pull/1396)
+- Update docker/setup-buildx-action digest to 8f54c6f by @renovate[bot] in [#1395](https://github.com/nicholas-fedor/watchtower/pull/1395)
+- Update golang docker tag to v1.26.1 by @renovate[bot] in [#1394](https://github.com/nicholas-fedor/watchtower/pull/1394)
+- Update dependency go to v1.26.1 by @renovate[bot] in [#1393](https://github.com/nicholas-fedor/watchtower/pull/1393)
+- Update nicholas-fedor/go-proxy-pull-action digest to 66b03fb by @renovate[bot] in [#1392](https://github.com/nicholas-fedor/watchtower/pull/1392)
+- Update golang:alpine docker digest to 2389ebf by @renovate[bot] in [#1391](https://github.com/nicholas-fedor/watchtower/pull/1391)
+- Update module github.com/docker/cli to v29.3.0+incompatible by @renovate[bot] in [#1390](https://github.com/nicholas-fedor/watchtower/pull/1390)
+- Update github/codeql-action digest to 0d579ff by @renovate[bot] in [#1389](https://github.com/nicholas-fedor/watchtower/pull/1389)
+- Update docker/login-action digest to db14339 by @renovate[bot] in [#1388](https://github.com/nicholas-fedor/watchtower/pull/1388)
+- Update peter-evans/create-pull-request digest to a45d1fb by @renovate[bot] in [#1387](https://github.com/nicholas-fedor/watchtower/pull/1387)
+- Update docker/setup-qemu-action digest to 72cd565 by @renovate[bot] in [#1386](https://github.com/nicholas-fedor/watchtower/pull/1386)
+- Update docker/setup-buildx-action digest to 2ae358d by @renovate[bot] in [#1385](https://github.com/nicholas-fedor/watchtower/pull/1385)
+- Update docker/login-action digest to e46b7e3 by @renovate[bot] in [#1384](https://github.com/nicholas-fedor/watchtower/pull/1384)
+- Update docker/setup-buildx-action digest to 28a438e by @renovate[bot] in [#1383](https://github.com/nicholas-fedor/watchtower/pull/1383)
+- Update actions/attest-build-provenance digest to 10334b5 by @renovate[bot] in [#1381](https://github.com/nicholas-fedor/watchtower/pull/1381)
 - Update docker/setup-qemu-action digest to ce36039 by @renovate[bot] in [#1379](https://github.com/nicholas-fedor/watchtower/pull/1379)
+
+### Fixed
+
+- Improve graceful shutdown with context cancellation by @nicholas-fedor in [#1408](https://github.com/nicholas-fedor/watchtower/pull/1408)
 
 ## [1.14.3] - 2026-03-04
 
@@ -2730,7 +2900,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Compare Releases
 
-- [unreleased](https://github.com/nicholas-fedor/watchtower/compare/v1.14.3...HEAD)
+- [unreleased](https://github.com/nicholas-fedor/watchtower/compare/v1.16.1...HEAD)
+- [1.16.1](https://github.com/nicholas-fedor/watchtower/compare/v1.16.0...v1.16.1)
+- [1.16.0](https://github.com/nicholas-fedor/watchtower/compare/v1.15.0...v1.16.0)
+- [1.15.0](https://github.com/nicholas-fedor/watchtower/compare/v1.14.4...v1.15.0)
+- [1.14.4](https://github.com/nicholas-fedor/watchtower/compare/v1.14.3...v1.14.4)
 - [1.14.3](https://github.com/nicholas-fedor/watchtower/compare/v1.14.2...v1.14.3)
 - [1.14.2](https://github.com/nicholas-fedor/watchtower/compare/v1.14.1...v1.14.2)
 - [1.14.1](https://github.com/nicholas-fedor/watchtower/compare/v1.14.0...v1.14.1)

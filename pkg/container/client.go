@@ -37,7 +37,15 @@ const (
 	// The value is 30 seconds, which should be sufficient for most Docker daemon
 	// initialization scenarios while preventing indefinite hangs.
 	DaemonInitTimeout = 30 * time.Second
+
+	// maxListRetries is the maximum number of retry attempts for transient Docker
+	// connection failures when listing containers.
+	maxListRetries = 3
 )
+
+// baseListRetryDelay is the base delay for exponential backoff between retries.
+// Actual delays are baseDelay * 2^attempt (5s, 10s).
+var baseListRetryDelay = 5 * time.Second
 
 // Errors for container health operations.
 var (
@@ -265,6 +273,40 @@ type Client interface {
 	// Returns:
 	//   - error: Non-nil if removal fails, nil on success.
 	RemoveContainer(ctx context.Context, container types.Container) error
+
+	// CreateEphemeralOrchestrator creates a short-lived container that orchestrates
+	// the Watchtower self-update transition.
+	//
+	// Parameters:
+	//   - ctx: Context for cancellation and timeout control.
+	//   - sourceContainer: The current Watchtower container being replaced.
+	//   - newImage: The image reference for the new Watchtower container.
+	//   - containerChain: The container chain label for lineage tracking.
+	//
+	// Returns:
+	//   - types.ContainerID: ID of the ephemeral orchestrator container.
+	//   - error: Non-nil if creation or start fails, nil on success.
+	CreateEphemeralOrchestrator(
+		ctx context.Context,
+		sourceContainer types.Container,
+		newImage string,
+		containerChain string,
+	) (types.ContainerID, error)
+
+	// StartContainerByID starts a container by its ID directly.
+	//
+	// Unlike StartContainer, this does not check the reviveStopped option or
+	// create a new container from a source configuration. It directly starts
+	// an existing, already-created container. This is used by the ephemeral
+	// orchestrator to start the new container after the old one has been stopped.
+	//
+	// Parameters:
+	//   - ctx: Context for cancellation and timeout control.
+	//   - containerID: ID of the container to start.
+	//
+	// Returns:
+	//   - error: Non-nil if starting fails, nil on success.
+	StartContainerByID(ctx context.Context, containerID types.ContainerID) error
 }
 
 // client is the concrete implementation of the Client interface.
@@ -341,7 +383,7 @@ func NewClient(opts ClientOptions) Client {
 		case err == nil:
 			// Ping succeeded: use the forced version client
 			cli = pingCli
-		case strings.Contains(err.Error(), "page not found"):
+		case cerrdefs.IsNotFound(err):
 			logrus.WithFields(logrus.Fields{
 				"version":  version,
 				"error":    err,
@@ -419,14 +461,51 @@ func (c *client) ListContainers(ctx context.Context, filter ...types.Filter) ([]
 		}
 	}
 
-	// Attempt to list source containers and handle errors by logging and returning them.
-	containers, err := ListSourceContainers(
-		ctx,
-		c.api,
-		c.ClientOptions,
-		containerFilter,
-		isPodman,
+	// Attempt to list source containers with retry for transient Docker connection failures.
+	// The Docker daemon may become temporarily unreachable (e.g., during host maintenance),
+	// so retrying with exponential backoff (5s then 10s between attempts) improves resilience.
+	var (
+		containers []types.Container
+		err        error
 	)
+
+	for attempt := range maxListRetries {
+		containers, err = ListSourceContainers(
+			ctx,
+			c.api,
+			c.ClientOptions,
+			containerFilter,
+			isPodman,
+		)
+		if err == nil {
+			break
+		}
+
+		// Only retry for transient connection errors; fail immediately for others.
+		if !isDaemonConnectionError(err) {
+			break
+		}
+
+		// Don't sleep after the last attempt.
+		if attempt == maxListRetries-1 {
+			break
+		}
+
+		delay := baseListRetryDelay * time.Duration(1<<attempt)
+
+		logrus.WithFields(logrus.Fields{
+			"attempt": attempt + 1,
+			"max":     maxListRetries,
+			"delay":   delay,
+		}).Warn("Docker daemon unavailable, retrying container list...")
+
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return nil, fmt.Errorf("context canceled during container list retry: %w", ctx.Err())
+		}
+	}
+
 	if err != nil {
 		logrus.WithError(err).Debug("Failed to list containers")
 
@@ -612,6 +691,47 @@ func (c *client) StartContainer(ctx context.Context, container types.Container) 
 		Debug("Started new container")
 
 	return newID, nil
+}
+
+// StartContainerByID starts a container by its ID directly.
+//
+// Unlike StartContainer, this does not create a new container from a source
+// configuration. It directly starts an existing, already-created container
+// using the Docker API's ContainerStart method. This bypasses the reviveStopped
+// check that prevents StartContainer from starting new containers when the
+// source container is stopped.
+//
+// This method is used by the ephemeral orchestrator to start the new container
+// after the old one has been stopped during the self-update sequence.
+//
+// Parameters:
+//   - ctx: Context for cancellation and timeout control.
+//   - containerID: ID of the container to start.
+//
+// Returns:
+//   - error: Non-nil if starting fails, nil on success.
+func (c *client) StartContainerByID(
+	ctx context.Context,
+	containerID types.ContainerID,
+) error {
+	clog := logrus.WithField("container_id", containerID.ShortID())
+
+	clog.Debug("Starting container by ID")
+
+	err := c.api.ContainerStart(
+		ctx,
+		string(containerID),
+		dockerContainer.StartOptions{},
+	)
+	if err != nil {
+		clog.WithError(err).Debug("Failed to start container by ID")
+
+		return fmt.Errorf("failed to start container %s: %w", containerID.ShortID(), err)
+	}
+
+	clog.Debug("Container started successfully")
+
+	return nil
 }
 
 // UpdateContainer updates the configuration of an existing container.
@@ -1438,4 +1558,26 @@ func (c *client) waitForExecOrTimeout(
 	}
 
 	return false, nil
+}
+
+// isDaemonConnectionError checks if an error is a transient Docker daemon connection error.
+// These errors indicate the Docker daemon is temporarily unreachable and may self-heal,
+// making them suitable for retry logic.
+//
+// Parameters:
+//   - err: The error to check.
+//
+// Returns:
+//   - bool: True if the error is a Docker daemon connection error, false otherwise.
+func isDaemonConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errMsg := err.Error()
+
+	return strings.Contains(errMsg, "Cannot connect to the Docker daemon") ||
+		strings.Contains(errMsg, "connection refused") ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF)
 }

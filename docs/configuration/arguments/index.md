@@ -444,6 +444,42 @@ Environment Variable: WATCHTOWER_LABEL_TAKE_PRECEDENCE
              Default: false
 ```
 
+### Use Docker Compose Depends-On
+
+Enables or disables processing of the Docker Compose `depends_on` configuration for determining container update order.
+When enabled (default), Watchtower automatically detects and respects Docker Compose service dependencies.
+When disabled, only the Watchtower `depends-on` label, Docker links, and network mode are used.
+
+```text
+            Argument: --use-compose-depends-on
+Environment Variable: WATCHTOWER_USE_COMPOSE_DEPENDS_ON
+                Type: Boolean
+             Default: true
+```
+
+!!! Note
+    Disabling this is useful when you want to prevent Watchtower from automatically using Docker Compose dependencies but still use explicit Watchtower labels or Docker links for ordering.
+    For more information on Watchtower's handling of linked containers, please reference the [Linked Containers documentation](../../advanced-features/linked-containers/index.md).
+
+!!! Warning
+    Rolling restarts are not supported when any container has linked dependencies (including Docker Compose `depends_on`, Watchtower `depends-on` labels, Docker links, or network mode dependencies). When `--rolling-restart` is enabled, `--use-compose-depends-on` controls whether Docker Compose `depends_on` labels are included in the dependency validation check.
+
+### Ephemeral Self-Update
+
+Uses a short-lived orchestrator container to perform Watchtower self-updates instead of the default rename-based approach.
+
+```text
+            Argument: --ephemeral-self-update
+Environment Variable: WATCHTOWER_EPHEMERAL_SELF_UPDATE
+                Type: Boolean
+             Default: false
+```
+
+!!! Warning "This is an experimental feature."
+
+!!! Note
+    The ephemeral self-update mechanism is only active when Watchtower is running in normal daemon mode. When Watchtower is started with `--run-once` (one-shot execution), this flag is ignored because the process exits immediately after the initial update pass and there is no continuously running instance to replace. See [Updating Watchtower](../../getting-started/updating-watchtower/index.md#ephemeral-self-update) for details on how this mechanism works.
+
 ## Registry & Authentication
 
 ### REPO_USER
@@ -700,8 +736,7 @@ Environment Variable: WATCHTOWER_HTTP_API_UPDATE
              Default: false
 ```
 
-!!! Note
-    See [HTTP API Mode](../../advanced-features/http-api/index.md) for details.
+!!! Note "See the [HTTP API documentation](../../advanced-features/http-api/index.md) for details"
 
 ### HTTP API Token
 
@@ -726,12 +761,11 @@ Environment Variable: WATCHTOWER_HTTP_API_METRICS
              Default: false
 ```
 
-!!! Note
-    See [Metrics](../../advanced-features/metrics/index.md) for details.
+!!! Note "See the [Metrics API documentation](../../advanced-features/metrics-api/index.md) for details"
 
 ### HTTP API Host
 
-Sets the host to bind the HTTP API to.
+Sets the host interface for binding the HTTP API.
 
 ```text
             Argument: --http-api-host
@@ -740,11 +774,7 @@ Environment Variable: WATCHTOWER_HTTP_API_HOST
              Default: empty (binds to all interfaces)
 ```
 
-!!! Note
-     If not specified, Watchtower listens on all interfaces on the port specified by `--http-api-port`.
-     Use this option to bind to a specific host, such as `127.0.0.1` for localhost only.
-     The host must be a valid IP address (IPv4 or IPv6).
-     The port is set separately with `--http-api-port`.
+!!! Note "See the [HTTP API Host documentation](../../advanced-features/http-api/index.md#http_api_host) for details"
 
 ### HTTP API Port
 
@@ -756,6 +786,26 @@ Environment Variable: WATCHTOWER_HTTP_API_PORT
                 Type: String
              Default: 8080
 ```
+
+!!! Note "See the [HTTP API Port documentation](../../advanced-features/http-api/index.md#http_api_port) for details"
+
+### HTTP API Rate Limit
+
+Sets the maximum number of API requests allowed per minute per IP address for the HTTP API.
+This helps protect against brute-force attacks while allowing normal API usage.
+
+```text
+            Argument: --http-api-rate-limit
+Environment Variable: WATCHTOWER_HTTP_API_RATE_LIMIT
+                Type: Integer
+             Default: 60
+```
+
+!!! Note
+    Rate limiting is enforced per client IP address and applies to all HTTP API endpoints
+    (`/v1/update` and `/v1/metrics`). When the limit is exceeded, the client receives
+    HTTP 429 (Too Many Requests). The burst capacity is fixed at 10 requests to allow short
+    bursts of legitimate activity (e.g., concurrent dashboard updates).
 
 ## Notifications
 
@@ -885,6 +935,84 @@ Environment Variable: WATCHTOWER_TIMEOUT
                 Type: Duration
               Default: 30s
 ```
+
+### Cooldown Delay
+
+Sets a global minimum image age before Watchtower will perform the update.
+
+Image age is determined from the image creation timestamp in the registry config blob.
+This helps to establish a time buffer against newly pushed images; however, is not a comprehensive security control.
+
+```text
+            Argument: --cooldown-delay
+Environment Variable: WATCHTOWER_COOLDOWN_DELAY
+                Type: String
+             Default: (empty / disabled)
+```
+
+- Accepted units: `h` (hours), `m` (minutes), `s` (seconds), `d` (days), `w` (weeks), `M` (months, i.e. 30 days).
+- These can be combined (e.g., `24h`, `3d`, `1w`, `1M`, `1w12h`).
+- Leaving the setting empty disables cooldown.
+
+!!! Warning
+    This setting delays *all* updates, including critical security patches.
+    Operators should weigh the trade-off between update immediacy and exposure to unverified images.
+
+!!! Note
+    See [Image Cooldown](../../advanced-features/image-cooldown/index.md) for detailed information on how cooldown works, boundary behavior, per-container labels, limitations, and interaction with other features like `--no-pull`.
+
+### Cooldown Platform OS
+
+Overrides the OS used for platform selection when fetching image manifests during cooldown checks.
+By default, Watchtower uses the runtime OS (e.g., `linux`).
+
+```text
+            Argument: None
+Environment Variable: WATCHTOWER_COOLDOWN_PLATFORM_OS
+                Type: String
+             Default: runtime.GOOS
+```
+
+!!! Note
+    Useful for cross-platform monitoring (e.g., monitoring Linux containers from a macOS or Windows host).
+    Only affects the cooldown image age check; does not impact Docker's local platform detection.
+
+    See [Image Cooldown](../../advanced-features/image-cooldown/index.md) for details on how platform selection works with multi-platform images.
+
+### Cooldown Platform Architecture
+
+Overrides the architecture used for platform selection when fetching image manifests during cooldown checks.
+By default, Watchtower uses the runtime architecture (e.g., `amd64`, `arm64`).
+
+```text
+            Argument: None
+Environment Variable: WATCHTOWER_COOLDOWN_PLATFORM_ARCH
+                Type: String
+             Default: runtime.GOARCH
+```
+
+!!! Note
+    Useful for cross-platform monitoring (e.g., monitoring `arm64` containers from an `amd64` host).
+    Only affects the cooldown image age check; does not impact Docker's local platform detection.
+
+    See [Image Cooldown](../../advanced-features/image-cooldown/index.md) for details on how platform selection works with multi-platform images.
+
+### Cooldown Platform Variant
+
+Specifies the platform variant for platform selection when fetching image manifests during cooldown checks. This disambiguates when multiple image index entries share the same OS and architecture but differ by variant (e.g., ARM `v7` vs `v8`).
+
+```text
+            Argument: None
+Environment Variable: WATCHTOWER_COOLDOWN_PLATFORM_VARIANT
+                Type: String
+             Default: None
+```
+
+!!! Note
+    Required only for ARM images with multiple variants (e.g., `v7`, `v8`).
+    When not specified and multiple variants exist, Watchtower returns an ambiguous platform match error.
+
+    See [Image Cooldown](../../advanced-features/image-cooldown/index.md) for details on how platform selection works with multi-platform images.
 
 ### Lifecycle UID
 
