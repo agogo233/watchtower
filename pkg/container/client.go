@@ -17,8 +17,8 @@ import (
 	"github.com/spf13/afero"
 
 	cerrdefs "github.com/containerd/errdefs"
-	dockerContainer "github.com/docker/docker/api/types/container"
-	dockerClient "github.com/docker/docker/client"
+	dockerContainer "github.com/moby/moby/api/types/container"
+	dockerClient "github.com/moby/moby/client"
 
 	"github.com/nicholas-fedor/watchtower/internal/flags"
 	"github.com/nicholas-fedor/watchtower/pkg/registry"
@@ -355,69 +355,48 @@ func NewClient(opts ClientOptions) Client {
 	)
 	defer cancel()
 
-	// Initialize client with autonegotiation, ignoring DOCKER_API_VERSION initially.
-	cli, err := dockerClient.NewClientWithOpts(
-		dockerClient.FromEnv,
-		dockerClient.WithAPIVersionNegotiation(),
-	)
+	// Initialize client from environment. FromEnv reads DOCKER_HOST, DOCKER_TLS_VERIFY,
+	// DOCKER_CERT_PATH, and DOCKER_API_VERSION. When DOCKER_API_VERSION is set, the client
+	// uses that fixed version; otherwise, it defaults to the maximum supported version
+	// with automatic negotiation enabled.
+	cli, err := dockerClient.New(dockerClient.FromEnv)
 	if err != nil {
 		logrus.WithError(err).Fatal("Failed to initialize Docker client")
 	}
-	// Set default filesystem if not provided
+
+	// Set default filesystem if not provided.
 	if opts.Fs == nil {
 		opts.Fs = afero.NewOsFs()
 	}
 
-	// Apply forced API version if set and valid.
-	if version := strings.Trim(os.Getenv("DOCKER_API_VERSION"), "\""); version != "" {
-		pingCli, err := dockerClient.NewClientWithOpts(
-			dockerClient.FromEnv, // Include env config for TLS, etc.
-			dockerClient.WithVersion(version),
-		)
-		if err != nil {
-			logrus.WithError(err).Fatal("Failed to create test client")
-		}
-
-		_, err = pingCli.Ping(ctx)
-		switch {
-		case err == nil:
-			// Ping succeeded: use the forced version client
-			cli = pingCli
-		case cerrdefs.IsNotFound(err):
-			logrus.WithFields(logrus.Fields{
-				"version":  version,
-				"error":    err,
-				"endpoint": "/_ping",
-			}).Warn("Invalid API version; falling back to autonegotiation")
-			cli.NegotiateAPIVersion(ctx)
-		default:
-			// Other ping failure: fall back to negotiation (don't override with broken client)
-			logrus.WithFields(logrus.Fields{
-				"version":  version,
-				"error":    err,
-				"endpoint": "/_ping",
-			}).Warn("Ping failed with non-version error; falling back to autonegotiation")
-			cli.NegotiateAPIVersion(ctx)
-		}
-	} else {
-		cli.NegotiateAPIVersion(ctx)
-	}
-
-	// Log client and server API versions.
-	selectedVersion := cli.ClientVersion()
-
-	serverVersion, err := cli.ServerVersion(ctx)
+	// Ping triggers API version negotiation (or validates DOCKER_API_VERSION if set).
+	result, err := cli.Ping(ctx, dockerClient.PingOptions{NegotiateAPIVersion: true})
 	if err != nil {
-		logrus.WithFields(logrus.Fields{
-			"error":    err,
-			"endpoint": "/version",
-		}).Error("Failed to retrieve server version")
-	} else {
-		logrus.WithFields(logrus.Fields{
-			"client_version": selectedVersion,
-			"server_version": serverVersion.APIVersion,
-		}).Debug("Initialized Docker client")
+		// If DOCKER_API_VERSION was set to an incompatible value, the ping may fail
+		// with a not-found error. Recreate the client without a fixed version to allow
+		// negotiation to find a compatible API version.
+		if cerrdefs.IsNotFound(err) {
+			logrus.WithError(err).Warn("DOCKER_API_VERSION incompatible with server; falling back to autonegotiation")
+
+			cli, err = dockerClient.New(dockerClient.FromEnv, dockerClient.WithAPIVersion(""))
+			if err != nil {
+				logrus.WithError(err).Fatal("Failed to recreate Docker client")
+			}
+
+			result, err = cli.Ping(ctx, dockerClient.PingOptions{NegotiateAPIVersion: true})
+		}
+
+		if err != nil {
+			logrus.WithError(err).Warn("Ping failed during initialization; will negotiate on first API call")
+
+			result = dockerClient.PingResult{}
+		}
 	}
+
+	logrus.WithFields(logrus.Fields{
+		"client_version": cli.ClientVersion(),
+		"server_version": result.APIVersion,
+	}).Debug("Initialized Docker client")
 
 	return &client{
 		api:           cli,
@@ -563,6 +542,7 @@ func (c *client) GetCurrentWatchtowerContainer(
 	containerInfo, err := c.api.ContainerInspect(
 		ctx,
 		string(containerID),
+		dockerClient.ContainerInspectOptions{},
 	)
 	if err != nil {
 		clog.WithError(err).Debug("Failed to inspect current Watchtower container")
@@ -572,7 +552,7 @@ func (c *client) GetCurrentWatchtowerContainer(
 
 	clog.Debug("Retrieved minimal container info")
 
-	return NewContainer(&containerInfo, nil), nil
+	return NewContainer(&containerInfo.Container, nil), nil
 }
 
 // StopContainer stops a specified container.
@@ -718,10 +698,10 @@ func (c *client) StartContainerByID(
 
 	clog.Debug("Starting container by ID")
 
-	err := c.api.ContainerStart(
+	_, err := c.api.ContainerStart(
 		ctx,
 		string(containerID),
-		dockerContainer.StartOptions{},
+		dockerClient.ContainerStartOptions{},
 	)
 	if err != nil {
 		clog.WithError(err).Debug("Failed to start container by ID")
@@ -755,7 +735,10 @@ func (c *client) UpdateContainer(
 	_, err := c.api.ContainerUpdate(
 		ctx,
 		string(container.ID()),
-		config,
+		dockerClient.ContainerUpdateOptions{
+			Resources:     &config.Resources,
+			RestartPolicy: &config.RestartPolicy,
+		},
 	)
 	if err != nil {
 		clog.WithError(err).Debug("Failed to update container")
@@ -784,10 +767,10 @@ func (c *client) RemoveContainer(ctx context.Context, container types.Container)
 
 	clog.Debug("Removing container")
 
-	err := c.api.ContainerRemove(
+	_, err := c.api.ContainerRemove(
 		ctx,
 		string(container.ID()),
-		dockerContainer.RemoveOptions{
+		dockerClient.ContainerRemoveOptions{
 			Force: true,
 		},
 	)
@@ -948,17 +931,18 @@ func (c *client) ExecuteCommand(
 
 	// Set up exec configuration with command and metadata.
 	clog.WithField("command", command).Debug("Creating exec instance")
-	execConfig := dockerContainer.ExecOptions{
-		Tty:    true,
-		Detach: true,
-		Cmd:    []string{"sh", "-c", command},
-		Env:    []string{"WT_CONTAINER=" + metadataJSON},
-		User:   user,
+	execConfig := dockerClient.ExecCreateOptions{
+		TTY:          true,
+		Cmd:          []string{"sh", "-c", command},
+		Env:          []string{"WT_CONTAINER=" + metadataJSON},
+		User:         user,
+		AttachStdout: true,
+		AttachStderr: true,
 	}
 
 	// Create the exec instance using the parent context.
 	// Timeout management is handled by waitForExecOrTimeout.
-	exec, err := c.api.ContainerExecCreate(
+	exec, err := c.api.ExecCreate(
 		ctx,
 		string(container.ID()),
 		execConfig,
@@ -972,9 +956,9 @@ func (c *client) ExecuteCommand(
 	// Start the exec instance.
 	clog.WithField("exec_id", exec.ID).Debug("Starting exec instance")
 
-	execStartCheck := dockerContainer.ExecStartOptions{Tty: true}
+	execStartCheck := dockerClient.ExecStartOptions{TTY: true}
 
-	err = c.api.ContainerExecStart(ctx, exec.ID, execStartCheck)
+	_, err = c.api.ExecStart(ctx, exec.ID, execStartCheck)
 	if err != nil {
 		clog.WithError(err).Debug("Failed to start exec instance")
 
@@ -1103,7 +1087,7 @@ func (c *client) GetVersion() string {
 //   - map[string]interface{}: System information.
 //   - error: Non-nil if retrieval fails, nil on success.
 func (c *client) GetInfo(ctx context.Context) (map[string]any, error) {
-	info, err := c.api.Info(ctx)
+	info, err := c.api.Info(ctx, dockerClient.InfoOptions{})
 	if err != nil {
 		logrus.WithError(err).Debug("Failed to get system info")
 
@@ -1112,11 +1096,11 @@ func (c *client) GetInfo(ctx context.Context) (map[string]any, error) {
 
 	// Convert to map for easier access
 	infoMap := map[string]any{
-		"Name":            info.Name,
-		"ServerVersion":   info.ServerVersion,
-		"OSType":          info.OSType,
-		"OperatingSystem": info.OperatingSystem,
-		"Driver":          info.Driver,
+		"Name":            info.Info.Name,
+		"ServerVersion":   info.Info.ServerVersion,
+		"OSType":          info.Info.OSType,
+		"OperatingSystem": info.Info.OperatingSystem,
+		"Driver":          info.Info.Driver,
 	}
 
 	return infoMap, nil
@@ -1178,6 +1162,7 @@ func (c *client) WaitForContainerHealthy(
 			inspect, err := c.api.ContainerInspect(
 				ctx,
 				string(containerID),
+				dockerClient.ContainerInspectOptions{},
 			)
 			if err != nil {
 				clog.WithError(err).Debug("Failed to inspect container for health check")
@@ -1186,13 +1171,13 @@ func (c *client) WaitForContainerHealthy(
 			}
 
 			// Check if health check is configured
-			if inspect.State == nil || inspect.State.Health == nil {
+			if inspect.Container.State == nil || inspect.Container.State.Health == nil {
 				clog.Debug("No health check configured for container, proceeding")
 
 				return nil
 			}
 
-			status := inspect.State.Health.Status
+			status := inspect.Container.State.Health.Status
 			clog.WithField("health_status", status).Debug("Checked container health status")
 
 			if status == "healthy" {
@@ -1426,10 +1411,10 @@ func (c *client) captureExecOutput(ctx context.Context, execID string) (string, 
 	// Attach to the exec instance for output.
 	clog.Debug("Attaching to exec instance")
 
-	response, err := c.api.ContainerExecAttach(
+	response, err := c.api.ExecAttach(
 		ctx,
 		execID,
-		dockerContainer.ExecStartOptions{Tty: true},
+		dockerClient.ExecAttachOptions{TTY: true},
 	)
 	if err != nil {
 		clog.WithError(err).Debug("Failed to attach to exec instance")
@@ -1511,7 +1496,7 @@ func (c *client) waitForExecOrTimeout(
 
 	// Poll exec status until completion.
 	for {
-		execInspect, err := c.api.ContainerExecInspect(execCtx, execID)
+		execInspect, err := c.api.ExecInspect(execCtx, execID, dockerClient.ExecInspectOptions{})
 		if err != nil {
 			clog.WithError(err).Debug("Failed to inspect exec instance")
 

@@ -12,7 +12,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	cerrdefs "github.com/containerd/errdefs"
-	dockerContainer "github.com/docker/docker/api/types/container"
+	dockerContainer "github.com/moby/moby/api/types/container"
 
 	"github.com/nicholas-fedor/watchtower/internal/util"
 	"github.com/nicholas-fedor/watchtower/pkg/compose"
@@ -1314,8 +1314,8 @@ func stopContainersInReversedOrder(
 	stopped := make([]types.RemovedImageInfo, 0, len(containers))
 
 	// Stop containers in reverse order to avoid breaking dependencies.
-	for i := len(containers) - 1; i >= 0; i-- {
-		c := containers[i]
+	for i, v := range slices.Backward(containers) {
+		c := v
 
 		// Check for context cancellation to avoid additional work when context is canceled.
 		// First, log and track the current container, then iterate remaining containers.
