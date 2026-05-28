@@ -32,7 +32,7 @@ var (
 	errStartContainerFailed = errors.New("failed to start container")
 	// errCreateContainerFailed indicates a failure to create a container during the update process.
 	errCreateContainerFailed = errors.New("failed to create container")
-	// errParseImageReference indicates a failure to parse a container’s image reference.
+	// errParseImageReference indicates a failure to parse a container's image reference.
 	errParseImageReference = errors.New("failed to parse image reference")
 	// errInvalidImageReference indicates an invalid image reference that cannot be processed.
 	errInvalidImageReference = errors.New("invalid image reference")
@@ -40,16 +40,6 @@ var (
 	errCircularDependency = errors.New("circular dependency detected")
 	// errSelfDependency indicates a container has a self-dependency.
 	errSelfDependency = errors.New("container has self-dependency")
-)
-
-// Errors for image cooldown operations.
-var (
-	// errImageCooldown indicates the image is within the cooldown period and the update is deferred.
-	errImageCooldown = errors.New("deferred")
-	// errFetchImageAgeFailed indicates the image creation time could not be determined from the registry.
-	errFetchImageAgeFailed = errors.New("image creation time unavailable")
-	// errGetPullOptionsFailed indicates pull options (e.g., registry auth) could not be retrieved for cooldown check.
-	errGetPullOptionsFailed = errors.New("failed to get pull options")
 )
 
 // Errors for Watchtower self-update operations.

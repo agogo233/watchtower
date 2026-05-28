@@ -743,9 +743,9 @@ func (c *client) StartContainer(ctx context.Context, container types.Container) 
 //
 // Unlike StartContainer, this does not create a new container from a source
 // configuration. It directly starts an existing, already-created container
-// using the Docker API's ContainerStart method. This bypasses the reviveStopped
-// check that prevents StartContainer from starting new containers when the
-// source container is stopped.
+// using the Docker API's ContainerStart method. Callers are responsible for
+// checking whether the container should be started (e.g., the reviveStopped
+// and noRestart checks in restartStaleContainer).
 //
 // This method is used by the ephemeral orchestrator to start the new container
 // after the old one has been stopped during the self-update sequence.
@@ -907,7 +907,7 @@ func (c *client) WarnOnHeadPullFailed(container types.Container) bool {
 	return registry.WarnOnAPIConsumption(container)
 }
 
-// IsContainerStale checks if a container’s image is outdated.
+// IsContainerStale checks if a container's image is outdated.
 //
 // Parameters:
 //   - container: Container to check.
@@ -1022,7 +1022,7 @@ func (c *client) ExecuteCommand(
 	// Start the exec instance.
 	clog.WithField("exec_id", exec.ID).Debug("Starting exec instance")
 
-	execStartCheck := dockerClient.ExecStartOptions{TTY: true}
+	execStartCheck := dockerClient.ExecStartOptions{Detach: true, TTY: true}
 
 	_, err = c.api.ExecStart(ctx, exec.ID, execStartCheck)
 	if err != nil {
@@ -1136,7 +1136,7 @@ func (c *client) RemoveImageByID(
 	return nil
 }
 
-// GetVersion returns the client’s API version.
+// GetVersion returns the client's API version.
 //
 // Returns:
 //   - string: Docker API version (e.g., "1.44").

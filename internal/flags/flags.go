@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,9 +45,9 @@ var (
 	errOpenFileFailed = errors.New("failed to open secret file")
 	// errReplaceSliceFailed indicates a failure to replace a slice value in a flag.
 	errReplaceSliceFailed = errors.New("failed to replace slice value in flag")
-	// errReadFileFailed indicates a failure to read a file’s contents for secrets.
+	// errReadFileFailed indicates a failure to read a file's contents for secrets.
 	errReadFileFailed = errors.New("failed to read secret file")
-	// errSetFlagFailed indicates a failure to set a flag’s value during configuration.
+	// errSetFlagFailed indicates a failure to set a flag's value during configuration.
 	errSetFlagFailed = errors.New("failed to set flag value")
 	// errInvalidFlagName indicates an invalid flag name was provided for modification.
 	errInvalidFlagName = errors.New("invalid flag name provided")
@@ -92,7 +94,7 @@ func RegisterSystemFlags(rootCmd *cobra.Command) {
 		"stop-timeout",
 		"t",
 		envDuration("WATCHTOWER_TIMEOUT"),
-		"Timeout before a container is forcefully stopped")
+		"Timeout before a container is forcefully stopped (e.g., 30s, 1m, 5m)")
 
 	flags.StringP(
 		"cooldown-delay",
@@ -597,6 +599,8 @@ func envBool(key string) bool {
 
 // envDuration fetches a duration from an environment variable.
 //
+// Bare values without a time unit are treated as seconds.
+//
 // Parameters:
 //   - key: Environment variable key.
 //
@@ -605,7 +609,61 @@ func envBool(key string) bool {
 func envDuration(key string) time.Duration {
 	viper.MustBindEnv(key)
 
+	// Check the raw env var so bare numbers are treated as seconds before
+	// viper/cast turns them into nanoseconds.
+	if raw := os.Getenv(key); raw != "" {
+		trimmed := strings.TrimSpace(raw)
+		if isPureNumeric(trimmed) {
+			val, err := strconv.ParseFloat(trimmed, 64)
+			if err == nil {
+				nanos := val * float64(time.Second)
+
+				if nanos > float64(math.MaxInt64) {
+					return time.Duration(math.MaxInt64)
+				}
+
+				if nanos < float64(math.MinInt64) {
+					return time.Duration(math.MinInt64)
+				}
+
+				return time.Duration(nanos)
+			}
+		}
+	}
+
 	return viper.GetDuration(key)
+}
+
+// isPureNumeric reports whether str is a bare number (integer or float,
+// possibly signed) with no duration unit characters.
+func isPureNumeric(str string) bool {
+	if str == "" {
+		return false
+	}
+
+	sawDigit := false
+	sawDot := false
+
+	for i, char := range str {
+		switch {
+		case char >= '0' && char <= '9':
+			sawDigit = true
+		case char == '.':
+			if sawDot {
+				return false
+			}
+
+			sawDot = true
+		case char == '-' || char == '+':
+			if i != 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+
+	return sawDigit
 }
 
 // filterEmptyStrings removes empty or whitespace-only strings from a slice.
@@ -1070,7 +1128,7 @@ func getSecretFromFile(flags *pflag.FlagSet, secret string) error {
 func isFilePath(path string) bool {
 	firstColon := strings.IndexRune(path, ':')
 	if firstColon != 1 && firstColon != -1 {
-		// If ':' exists but isn’t the second character, it’s likely not a file path (e.g., URLs).
+		// If ':' exists but isn't the second character, it's likely not a file path (e.g., URLs).
 		return false
 	}
 
@@ -1323,7 +1381,7 @@ func appendFlagValue(flags *pflag.FlagSet, name string, values ...string) error 
 	return nil
 }
 
-// setFlagIfDefault sets a flag’s default value if unchanged.
+// setFlagIfDefault sets a flag's default value if unchanged.
 //
 // Parameters:
 //   - flags: Flag set.

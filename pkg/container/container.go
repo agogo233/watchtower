@@ -123,7 +123,7 @@ func (c *Container) SetLinkedToRestarting(value bool) {
 	c.LinkedToRestarting = value
 }
 
-// IsStale returns whether the container’s image is outdated.
+// IsStale returns whether the container's image is outdated.
 //
 // Returns:
 //   - bool: True if stale, false otherwise.
@@ -222,7 +222,7 @@ func (c *Container) Name() string {
 	return c.normalizedName
 }
 
-// ImageID returns the ID of the container’s image.
+// ImageID returns the ID of the container's image.
 //
 // Returns:
 //   - types.ImageID: Image ID or empty string if imageInfo is nil.
@@ -234,7 +234,7 @@ func (c *Container) ImageID() types.ImageID {
 	return types.ImageID(c.imageInfo.ID)
 }
 
-// ImageName returns the name of the container’s image.
+// ImageName returns the name of the container's image.
 //
 // It uses the Zodiac label if present, otherwise Config.Image, appending ":latest" if untagged.
 //
@@ -421,6 +421,14 @@ func (c *Container) GetCreateHostConfig() *dockerContainer.HostConfig {
 	hostConfigCopy := *c.containerInfo.HostConfig
 	hostConfig := &hostConfigCopy
 
+	// Deep copy slices that will be mutated to avoid modifying the original
+	// under a read lock.
+	if len(hostConfig.Devices) > 0 {
+		devicesCopy := make([]dockerContainer.DeviceMapping, len(hostConfig.Devices))
+		copy(devicesCopy, hostConfig.Devices)
+		hostConfig.Devices = devicesCopy
+	}
+
 	// Adjust link format for each entry (and drop invalid ones).
 	adjusted := make([]string, 0, len(hostConfig.Links))
 	for _, link := range hostConfig.Links {
@@ -447,10 +455,24 @@ func (c *Container) GetCreateHostConfig() *dockerContainer.HostConfig {
 
 	hostConfig.Links = adjusted
 
+	// Normalize device CgroupPermissions for Podman compatibility.
+	//
+	// Podman leaves CgroupPermissions empty in Docker API inspect responses.
+	// Both Docker and Podman treat bare device specifications (without explicit
+	// permissions) as "rwm". Defaulting here prevents "empty device mode"
+	// errors when recreating containers.
+	for i := range hostConfig.Devices {
+		if hostConfig.Devices[i].CgroupPermissions == "" {
+			hostConfig.Devices[i].CgroupPermissions = "rwm"
+			clog.WithField("device", hostConfig.Devices[i].PathOnHost).
+				Debug("Defaulted empty device CgroupPermissions to 'rwm'")
+		}
+	}
+
 	return hostConfig
 }
 
-// VerifyConfiguration validates the container’s metadata for recreation.
+// VerifyConfiguration validates the container's metadata for recreation.
 //
 // Returns:
 //   - error: Non-nil if metadata is missing or invalid, nil on success.

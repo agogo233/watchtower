@@ -14,7 +14,7 @@ var (
 	errAttachExecFailed = errors.New("failed to attach to exec instance")
 	// errReadExecOutputFailed indicates a failure to read output from an exec instance.
 	errReadExecOutputFailed = errors.New("failed to read exec output")
-	// errInspectExecFailed indicates a failure to inspect an exec instance’s status.
+	// errInspectExecFailed indicates a failure to inspect an exec instance's status.
 	errInspectExecFailed = errors.New("failed to inspect exec instance")
 	// errCommandFailed indicates a command executed in a container failed with a non-zero exit code.
 	errCommandFailed = errors.New("command execution failed")
@@ -24,7 +24,7 @@ var (
 var (
 	// errListContainersFailed indicates a failure to list containers from the Docker host.
 	errListContainersFailed = errors.New("failed to list containers")
-	// errInspectContainerFailed indicates a failure to inspect a container’s details.
+	// errInspectContainerFailed indicates a failure to inspect a container's details.
 	errInspectContainerFailed = errors.New("failed to inspect container")
 	// errStopContainerFailed indicates a failure to stop a container with a signal.
 	errStopContainerFailed = errors.New("failed to stop container")
@@ -56,7 +56,7 @@ var (
 	errNoImageInfo = errors.New("no image info available")
 	// errNoContainerInfo indicates the container lacks metadata required for recreation.
 	errNoContainerInfo = errors.New("no container info available")
-	// errInvalidConfig indicates the container’s configuration is invalid for recreation.
+	// errInvalidConfig indicates the container's configuration is invalid for recreation.
 	errInvalidConfig = errors.New("invalid container configuration")
 	// ErrUnexpectedContainerType indicates an unexpected container type was encountered.
 	ErrUnexpectedContainerType = errors.New("unexpected container type")
@@ -84,9 +84,15 @@ var (
 	errRemoveImageFailed = errors.New("failed to remove image")
 )
 
+// Errors for image cooldown operations in cooldown.go and image.go.
+var (
+	// ErrImageCooldown indicates the image is within the configured cooldown window and should not be pulled.
+	ErrImageCooldown = errors.New("image is within cooldown period")
+)
+
 // Errors for label operations in metadata.go.
 var (
-	// errLabelNotFound indicates a requested label is not present in the container’s metadata.
+	// errLabelNotFound indicates a requested label is not present in the container's metadata.
 	errLabelNotFound = errors.New("label not found")
 )
 

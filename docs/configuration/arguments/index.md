@@ -932,9 +932,13 @@ Sets the timeout (e.g., `30s`) before forcibly stopping a container during updat
 ```text
             Argument: --stop-timeout
 Environment Variable: WATCHTOWER_TIMEOUT
-                Type: Duration
+                Type: Duration (e.g., 30s, 1m, 5m)
               Default: 30s
 ```
+
+!!! Note
+    Bare numeric values (e.g., `60` or `1.5`) without a time unit are interpreted as seconds.
+    Using a unit suffix (`s`, `m`, etc.) is recommended and required for other time units.
 
 ### Cooldown Delay
 
