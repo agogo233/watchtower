@@ -21,6 +21,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Chores
 
+- Update nicholas-fedor/actionlint-action action to v1.0.4 by @renovate[bot] in [#1741](https://github.com/nicholas-fedor/watchtower/pull/1741)
+- Update codecov/codecov-action action to v7 by @renovate[bot] in [#1739](https://github.com/nicholas-fedor/watchtower/pull/1739)
+- Deprecate legacy notification types for v2 removal by @nicholas-fedor in [#1737](https://github.com/nicholas-fedor/watchtower/pull/1737)
+- Update github/codeql-action action to v4.36.2 by @renovate[bot] in [#1735](https://github.com/nicholas-fedor/watchtower/pull/1735)
+- Update github.com/google/pprof digest to 7023385 by @renovate[bot] in [#1733](https://github.com/nicholas-fedor/watchtower/pull/1733)
+- Update module github.com/docker/cli to v29.5.3+incompatible by @renovate[bot] in [#1731](https://github.com/nicholas-fedor/watchtower/pull/1731)
+- Update cimg/go docker tag to v1.26.4 by @renovate[bot] in [#1728](https://github.com/nicholas-fedor/watchtower/pull/1728)
+- Update module github.com/prometheus/common to v0.68.1 by @renovate[bot] in [#1726](https://github.com/nicholas-fedor/watchtower/pull/1726)
+- Update golang:alpine docker digest to f23e8b2 by @renovate[bot] in [#1724](https://github.com/nicholas-fedor/watchtower/pull/1724)
+- Update golang:1.26.4-alpine3.22 docker digest to 727cfc3 by @renovate[bot] in [#1723](https://github.com/nicholas-fedor/watchtower/pull/1723)
+- Update golang docker tag to v1.26.4 by @renovate[bot] in [#1721](https://github.com/nicholas-fedor/watchtower/pull/1721)
+- Update golang:alpine docker digest to 376f4a3 by @renovate[bot] in [#1719](https://github.com/nicholas-fedor/watchtower/pull/1719)
+- Update module github.com/nicholas-fedor/shoutrrr to v0.16.0 by @renovate[bot] in [#1716](https://github.com/nicholas-fedor/watchtower/pull/1716)
+- Update go module directive to v1.26.4 by @renovate[bot] in [#1715](https://github.com/nicholas-fedor/watchtower/pull/1715)
+- Update github/codeql-action action to v4.36.1 by @renovate[bot] in [#1711](https://github.com/nicholas-fedor/watchtower/pull/1711)
+- Update actions/checkout action to v6.0.3 by @renovate[bot] in [#1710](https://github.com/nicholas-fedor/watchtower/pull/1710)
 - Update securego/gosec action to v2.27.1 by @renovate[bot] in [#1707](https://github.com/nicholas-fedor/watchtower/pull/1707)
 - Update module github.com/prometheus/common to v0.68.0 by @renovate[bot] in [#1703](https://github.com/nicholas-fedor/watchtower/pull/1703)
 - Update module github.com/mattn/go-colorable to v0.1.15 by @renovate[bot] in [#1701](https://github.com/nicholas-fedor/watchtower/pull/1701)
@@ -31,6 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Update Shoutrrr MS Teams integration by @nicholas-fedor in [#1718](https://github.com/nicholas-fedor/watchtower/pull/1718)
+- Resolve stale watchtower container ambiguity in detection and cleanup by @nicholas-fedor in [#1713](https://github.com/nicholas-fedor/watchtower/pull/1713)
 - Strip quotes from cron schedule spec before parsing by @nicholas-fedor in [#1686](https://github.com/nicholas-fedor/watchtower/pull/1686)
 - Set Detach true in ExecStart to prevent blocking on command execution by @nicholas-fedor in [#1683](https://github.com/nicholas-fedor/watchtower/pull/1683)
 - Rewrite implicit restart resolution and dependency matching by @nicholas-fedor in [#1677](https://github.com/nicholas-fedor/watchtower/pull/1677)
