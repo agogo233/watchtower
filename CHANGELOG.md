@@ -8,6 +8,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Chores
+
+- Update golang:alpine docker digest to 7a3e500 by @renovate[bot] in [#1787](https://github.com/nicholas-fedor/watchtower/pull/1787)
+
+## [1.18.1] - 2026-06-11
+
+### Added
+
+- Add Thubo as a contributor for docs by @allcontributors[bot] in [#1783](https://github.com/nicholas-fedor/watchtower/pull/1783)
+
+### Chores
+
+- Update golang:alpine docker digest to a6a091e by @renovate[bot] in [#1780](https://github.com/nicholas-fedor/watchtower/pull/1780)
+- Update golang:alpine docker digest to bd14630 by @renovate[bot] in [#1778](https://github.com/nicholas-fedor/watchtower/pull/1778)
+- Update module golang.org/x/net to v0.56.0 by @renovate[bot] in [#1776](https://github.com/nicholas-fedor/watchtower/pull/1776)
+- Update dependency python to v3.14.6 by @renovate[bot] in [#1775](https://github.com/nicholas-fedor/watchtower/pull/1775)
+- Update alpine:3.24.0 docker digest to a2d49ea by @renovate[bot] in [#1771](https://github.com/nicholas-fedor/watchtower/pull/1771)
+- Update alpine:3.24.0 docker digest to 8ddefa9 by @renovate[bot] in [#1769](https://github.com/nicholas-fedor/watchtower/pull/1769)
+- Update alpine docker tag to v3.24.0 by @renovate[bot] in [#1767](https://github.com/nicholas-fedor/watchtower/pull/1767)
+
+### Fixed
+
+- Suppress deprecation warning when legacy email subject tag is empty by @nicholas-fedor in [#1785](https://github.com/nicholas-fedor/watchtower/pull/1785)
+- Fix notify-upgrade exec command by @Thubo in [#1774](https://github.com/nicholas-fedor/watchtower/pull/1774)
+
+### New Contributors
+
+- @Thubo made their first contribution in [#1774](https://github.com/nicholas-fedor/watchtower/pull/1774)
+
+## [1.18.0] - 2026-06-09
+
 ### Added
 
 - Add barnabasbusa as a contributor for code and doc by @allcontributors[bot] in [#1706](https://github.com/nicholas-fedor/watchtower/pull/1706)
@@ -21,6 +52,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Chores
 
+- Update module github.com/nicholas-fedor/shoutrrr to v0.16.1 by @renovate[bot] in [#1765](https://github.com/nicholas-fedor/watchtower/pull/1765)
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.1 by @renovate[bot] in [#1763](https://github.com/nicholas-fedor/watchtower/pull/1763)
+- Update module golang.org/x/text to v0.38.0 by @renovate[bot] in [#1758](https://github.com/nicholas-fedor/watchtower/pull/1758)
+- Update module golang.org/x/term to v0.44.0 by @renovate[bot] in [#1756](https://github.com/nicholas-fedor/watchtower/pull/1756)
+- Update nicholas-fedor/actionlint-action action to v1.0.6 by @renovate[bot] in [#1755](https://github.com/nicholas-fedor/watchtower/pull/1755)
+- Update module golang.org/x/sys to v0.46.0 by @renovate[bot] in [#1753](https://github.com/nicholas-fedor/watchtower/pull/1753)
+- Update module github.com/docker/docker-credential-helpers to v0.9.8 by @renovate[bot] in [#1752](https://github.com/nicholas-fedor/watchtower/pull/1752)
+- Update module golang.org/x/sync to v0.21.0 by @renovate[bot] in [#1750](https://github.com/nicholas-fedor/watchtower/pull/1750)
+- Update module golang.org/x/mod to v0.37.0 by @renovate[bot] in [#1749](https://github.com/nicholas-fedor/watchtower/pull/1749)
+- Update nicholas-fedor/govulncheck-action action to v1.0.5 by @renovate[bot] in [#1746](https://github.com/nicholas-fedor/watchtower/pull/1746)
+- Update nicholas-fedor/actionlint-action action to v1.0.5 by @renovate[bot] in [#1744](https://github.com/nicholas-fedor/watchtower/pull/1744)
 - Update nicholas-fedor/actionlint-action action to v1.0.4 by @renovate[bot] in [#1741](https://github.com/nicholas-fedor/watchtower/pull/1741)
 - Update codecov/codecov-action action to v7 by @renovate[bot] in [#1739](https://github.com/nicholas-fedor/watchtower/pull/1739)
 - Deprecate legacy notification types for v2 removal by @nicholas-fedor in [#1737](https://github.com/nicholas-fedor/watchtower/pull/1737)
@@ -47,6 +89,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Add additional safeguards to address persistent old Watchtower containers by @nicholas-fedor in [#1743](https://github.com/nicholas-fedor/watchtower/pull/1743)
 - Update Shoutrrr MS Teams integration by @nicholas-fedor in [#1718](https://github.com/nicholas-fedor/watchtower/pull/1718)
 - Resolve stale watchtower container ambiguity in detection and cleanup by @nicholas-fedor in [#1713](https://github.com/nicholas-fedor/watchtower/pull/1713)
 - Strip quotes from cron schedule spec before parsing by @nicholas-fedor in [#1686](https://github.com/nicholas-fedor/watchtower/pull/1686)
@@ -3105,7 +3148,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Compare Releases
 
-- [unreleased](https://github.com/nicholas-fedor/watchtower/compare/v1.17.2...HEAD)
+- [unreleased](https://github.com/nicholas-fedor/watchtower/compare/v1.18.1...HEAD)
+- [1.18.1](https://github.com/nicholas-fedor/watchtower/compare/v1.18.0...v1.18.1)
+- [1.18.0](https://github.com/nicholas-fedor/watchtower/compare/v1.17.2...v1.18.0)
 - [1.17.2](https://github.com/nicholas-fedor/watchtower/compare/v1.17.1...v1.17.2)
 - [1.17.1](https://github.com/nicholas-fedor/watchtower/compare/v1.17.0...v1.17.1)
 - [1.17.0](https://github.com/nicholas-fedor/watchtower/compare/v1.16.1...v1.17.0)
