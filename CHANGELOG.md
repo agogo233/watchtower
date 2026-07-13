@@ -8,8 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Update star history chart by @nicholas-fedor in [#1907](https://github.com/nicholas-fedor/watchtower/pull/1907)
+
 ### Chores
 
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.19 by @renovate[bot] in [#1931](https://github.com/nicholas-fedor/watchtower/pull/1931)
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.18 by @renovate[bot] in [#1929](https://github.com/nicholas-fedor/watchtower/pull/1929)
+- Update module github.com/prometheus/common to v0.70.0 by @renovate[bot] in [#1928](https://github.com/nicholas-fedor/watchtower/pull/1928)
+- Update github.com/google/pprof digest to b9395ee by @renovate[bot] in [#1926](https://github.com/nicholas-fedor/watchtower/pull/1926)
+- Update github.com/google/pprof digest to 301c45c by @renovate[bot] in [#1924](https://github.com/nicholas-fedor/watchtower/pull/1924)
+- Update github.com/google/pprof digest to e2ebcbe by @renovate[bot] in [#1922](https://github.com/nicholas-fedor/watchtower/pull/1922)
+- Update module golang.org/x/tools to v0.48.0 by @renovate[bot] in [#1920](https://github.com/nicholas-fedor/watchtower/pull/1920)
+- Update module golang.org/x/net to v0.57.0 by @renovate[bot] in [#1917](https://github.com/nicholas-fedor/watchtower/pull/1917)
+- Update golang:alpine docker digest to 0178a64 by @renovate[bot] in [#1916](https://github.com/nicholas-fedor/watchtower/pull/1916)
+- Update module golang.org/x/mod to v0.38.0 by @renovate[bot] in [#1914](https://github.com/nicholas-fedor/watchtower/pull/1914)
+- Update github/codeql-action action to v4.37.0 by @renovate[bot] in [#1913](https://github.com/nicholas-fedor/watchtower/pull/1913)
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.17 by @renovate[bot] in [#1911](https://github.com/nicholas-fedor/watchtower/pull/1911)
+- Update cimg/go docker tag to v1.26.5 by @renovate[bot] in [#1910](https://github.com/nicholas-fedor/watchtower/pull/1910)
+- Update golang:alpine docker digest to 9097beb by @renovate[bot] in [#1906](https://github.com/nicholas-fedor/watchtower/pull/1906)
+- Update go module directive to v1.26.5 by @renovate[bot] in [#1904](https://github.com/nicholas-fedor/watchtower/pull/1904)
+- Update step-security/harden-runner action to v2.20.0 by @renovate[bot] in [#1903](https://github.com/nicholas-fedor/watchtower/pull/1903)
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.16 by @renovate[bot] in [#1902](https://github.com/nicholas-fedor/watchtower/pull/1902)
+- Update module golang.org/x/text to v0.39.0 by @renovate[bot] in [#1898](https://github.com/nicholas-fedor/watchtower/pull/1898)
 - Update cimg/go:1.26.4 docker digest to 66a357f by @renovate[bot] in [#1897](https://github.com/nicholas-fedor/watchtower/pull/1897)
 - Update nicholas-fedor/go-proxy-pull-action action to v1.1.15 by @renovate[bot] in [#1893](https://github.com/nicholas-fedor/watchtower/pull/1893)
 - Update module github.com/pelletier/go-toml/v2 to v2.4.3 by @renovate[bot] in [#1890](https://github.com/nicholas-fedor/watchtower/pull/1890)

@@ -1,7 +1,8 @@
 ---
-name: Lint Go
+name: Run Tests and Upload Coverage
 
 on:
+  workflow_call:
   workflow_dispatch:
   pull_request:
     paths:
@@ -16,11 +17,16 @@ permissions:
   contents: read # Set default read-only permissions
 
 jobs:
-  lint:
-    name: Run Golangci-lint
-    runs-on: ubuntu-latest
-    permissions:
-      pull-requests: read
+  test:
+    name: Run Tests and Upload Coverage Report
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - macos-latest
+          - windows-2025
+          - ubuntu-latest
     steps:
       - name: Harden the Runner (Step Security)
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
@@ -40,8 +46,14 @@ jobs:
           cache-dependency-path: "**/go.sum"
           go-version-file: go.mod
 
-      - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+      - name: Install Dependencies
+        run: go mod download
+
+      - name: Run Tests
+        run: |
+          go test -timeout 60s -v -coverprofile="coverage.out" -covermode atomic ./...
+
+      - name: Upload Coverage Report to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
-          args: --timeout=5m --config=build/golangci-lint/golangci-lint.yaml
-          only-new-issues: true
+          token: ${{ secrets.CODECOV_TOKEN }}

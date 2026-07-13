@@ -1,20 +1,21 @@
 ---
-name: Lint GitHub Actions Workflows
-
+name: Cleanup GH Actions Cache
 on:
   workflow_dispatch: {}
   pull_request:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/**"
+    types:
+      - closed
 
 permissions:
   contents: read # Set default read-only permissions
 
 jobs:
-  actionlint:
+  cleanup:
+    name: Cleanup Cache
     runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged
     steps:
       - name: Harden the Runner (Step Security)
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
@@ -26,5 +27,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Run actionlint
-        uses: nicholas-fedor/actionlint-action@b349ef9a439253e292855fc2b07b337a27bb2954 # v1.0.18
+      - name: Clean Cache
+        uses: ./.github/actions/clean-cache
+        with:
+          gh-token: ${{ secrets.GITHUB_TOKEN }}
+          gh-repo: ${{ github.repository }}
+          branch: refs/pull/${{ github.event.pull_request.number }}/merge
