@@ -15,8 +15,9 @@ import (
 	dockerNetwork "github.com/moby/moby/api/types/network"
 
 	mockActions "github.com/nicholas-fedor/watchtower/internal/actions/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/metrics"
 	"github.com/nicholas-fedor/watchtower/pkg/filters"
-	"github.com/nicholas-fedor/watchtower/pkg/metrics"
+	"github.com/nicholas-fedor/watchtower/pkg/session"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 	mockTypes "github.com/nicholas-fedor/watchtower/pkg/types/mocks"
 )
@@ -326,7 +327,7 @@ var _ = ginkgo.Describe("executeUpdate", func() {
 		gomega.Expect(client.TestData.StartContainerCount.Load()).To(gomega.Equal(int32(0)))
 	})
 
-	ginkgo.It("should call UpdateContainer for Watchtower restart policy changes", func() {
+	ginkgo.It("should call SetNoRestartPolicy for Watchtower restart policy changes", func() {
 		client := mockActions.CreateMockClient(
 			&mockActions.TestData{
 				Containers: []types.Container{
@@ -361,7 +362,7 @@ var _ = ginkgo.Describe("executeUpdate", func() {
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 		gomega.Expect(report).NotTo(gomega.BeNil())
 		gomega.Expect(cleanupInfos).NotTo(gomega.BeNil())
-		gomega.Expect(client.TestData.UpdateContainerCount.Load()).To(gomega.Equal(int32(1)))
+		gomega.Expect(client.TestData.SetNoRestartPolicyCount.Load()).To(gomega.Equal(int32(1)))
 	})
 })
 
@@ -1354,36 +1355,40 @@ type stopContainersTestCase struct {
 
 // TestDetachedContextDeadline tests the detached context creation logic in restartStaleContainer.
 // These tests verify that the detached context is created correctly based on the Timeout config value:
-// - When Timeout > 0: context has a deadline
-// - When Timeout <= 0: context has no deadline.
+// - When Timeout > 0: context has a deadline derived from Timeout
+// - When Timeout <= 0: context has a fallback deadline to prevent indefinite blocking.
 var _ = ginkgo.Describe("DetachedContext", func() {
 	// TestDetachedContextDeadlineCase represents a test case for detached context deadline behavior.
 	type TestDetachedContextDeadlineCase struct {
-		name           string
-		timeout        time.Duration
-		expectDeadline bool
-		description    string
+		name            string
+		timeout         time.Duration
+		expectDeadline  bool
+		expectedTimeout time.Duration
+		description     string
 	}
 
 	ginkgo.Describe("restartStaleContainer detached context deadline", func() {
 		testCases := []TestDetachedContextDeadlineCase{
 			{
-				name:           "positive timeout creates context with deadline",
-				timeout:        30 * time.Second,
-				expectDeadline: true,
-				description:    "When Timeout > 0, the detached context should have a deadline set",
+				name:            "positive timeout creates context with deadline",
+				timeout:         30 * time.Second,
+				expectDeadline:  true,
+				expectedTimeout: 30 * time.Second,
+				description:     "When Timeout > 0, the detached context should have a deadline set",
 			},
 			{
-				name:           "zero timeout creates context without deadline",
-				timeout:        0,
-				expectDeadline: false,
-				description:    "When Timeout is zero, the detached context should not have a deadline",
+				name:            "zero timeout creates context with fallback deadline",
+				timeout:         0,
+				expectDeadline:  true,
+				expectedTimeout: defaultRestartPolicyTimeout,
+				description:     "When Timeout is zero, the detached context should use the fallback deadline",
 			},
 			{
-				name:           "negative timeout creates context without deadline",
-				timeout:        -1 * time.Second,
-				expectDeadline: false,
-				description:    "When Timeout is negative, the detached context should not have a deadline",
+				name:            "negative timeout creates context with fallback deadline",
+				timeout:         -1 * time.Second,
+				expectDeadline:  true,
+				expectedTimeout: defaultRestartPolicyTimeout,
+				description:     "When Timeout is negative, the detached context should use the fallback deadline",
 			},
 		}
 
@@ -1437,12 +1442,124 @@ var _ = ginkgo.Describe("DetachedContext", func() {
 				gomega.Expect(renamed).To(gomega.BeTrue())
 				gomega.Expect(newID).NotTo(gomega.BeEmpty())
 
-				// Verify UpdateContainer was called (this uses the detached context).
+				// Verify SetNoRestartPolicy was called (this uses the detached context).
 				// The detached context is used for updating the restart policy of the
 				// renamed Watchtower container.
-				gomega.Expect(client.TestData.UpdateContainerCount.Load()).To(gomega.Equal(int32(1)))
+				gomega.Expect(client.TestData.SetNoRestartPolicyCount.Load()).To(gomega.Equal(int32(1)))
+
+				if tc.expectDeadline {
+					deadline, hasDeadline := client.TestData.SetNoRestartPolicyCtx.Deadline()
+					gomega.Expect(hasDeadline).To(gomega.BeTrue())
+
+					expectedDeadline := time.Now().Add(tc.expectedTimeout)
+					gomega.Expect(deadline).To(gomega.BeTemporally("~", expectedDeadline, time.Second))
+				} else {
+					_, hasDeadline := client.TestData.SetNoRestartPolicyCtx.Deadline()
+					gomega.Expect(hasDeadline).To(gomega.BeFalse())
+				}
 			})
 		}
+	})
+
+	ginkgo.Describe("Watchtower self-update create failure recovery", func() {
+		ginkgo.It("renames the source back to the original name when create fails", func() {
+			client := mockActions.CreateMockClient(
+				&mockActions.TestData{
+					Containers: []types.Container{
+						mockActions.CreateMockContainerWithConfig(
+							"watchtower-source-id",
+							"/watchtower",
+							"watchtower:latest",
+							true,
+							false,
+							time.Now(),
+							&dockerContainer.Config{
+								Labels: map[string]string{
+									"com.centurylinklabs.watchtower": "true",
+								},
+							}),
+					},
+					Staleness: map[string]bool{
+						"watchtower": true,
+					},
+					CreateContainerError: errors.New("simulated create failure"),
+				},
+				false,
+				false,
+			)
+
+			params := types.UpdateParams{
+				Timeout: 0,
+				RunOnce: false,
+			}
+
+			testContainer := client.TestData.Containers[0]
+			_, renamed, err := restartStaleContainer(
+				context.Background(),
+				testContainer,
+				client,
+				params,
+			)
+
+			gomega.Expect(err).To(gomega.HaveOccurred())
+			gomega.Expect(err.Error()).To(gomega.ContainSubstring("failed to create container"))
+			gomega.Expect(renamed).To(gomega.BeFalse(), "name should be restored after create failure")
+			gomega.Expect(client.TestData.RenameContainerCount.Load()).To(gomega.Equal(int32(2)))
+			gomega.Expect(client.TestData.RenameTargets).To(gomega.HaveLen(2))
+			gomega.Expect(client.TestData.RenameTargets[1]).To(gomega.Equal("watchtower"))
+			gomega.Expect(client.TestData.StartContainerCount.Load()).To(gomega.Equal(int32(0)))
+		})
+	})
+
+	ginkgo.Describe("Watchtower self-update start failure cleanup", func() {
+		ginkgo.It("removes the newly created container, not the renamed source", func() {
+			client := mockActions.CreateMockClient(
+				&mockActions.TestData{
+					Containers: []types.Container{
+						mockActions.CreateMockContainerWithConfig(
+							"watchtower-source-id",
+							"/watchtower",
+							"watchtower:latest",
+							true,
+							false,
+							time.Now(),
+							&dockerContainer.Config{
+								Labels: map[string]string{
+									"com.centurylinklabs.watchtower": "true",
+								},
+							}),
+					},
+					Staleness: map[string]bool{
+						"watchtower": true,
+					},
+					StartContainerError: errors.New("simulated start failure"),
+				},
+				false,
+				false,
+			)
+
+			params := types.UpdateParams{
+				Timeout: 0,
+				RunOnce: false,
+			}
+
+			testContainer := client.TestData.Containers[0]
+			_, renamed, err := restartStaleContainer(
+				context.Background(),
+				testContainer,
+				client,
+				params,
+			)
+
+			gomega.Expect(err).To(gomega.HaveOccurred())
+			gomega.Expect(err.Error()).To(gomega.ContainSubstring("failed to start container"))
+			gomega.Expect(renamed).To(gomega.BeTrue())
+			gomega.Expect(client.TestData.CreateContainerCount.Load()).To(gomega.Equal(int32(1)))
+			gomega.Expect(client.TestData.LastCreatedContainerID).ToNot(gomega.BeEmpty())
+			gomega.Expect(client.TestData.StopAndRemoveContainerCount.Load()).To(gomega.Equal(int32(1)))
+			gomega.Expect(client.TestData.LastStopAndRemoveID).To(gomega.Equal(client.TestData.LastCreatedContainerID))
+			gomega.Expect(client.TestData.LastStopAndRemoveID).ToNot(gomega.Equal(testContainer.ID()))
+		})
 	})
 
 	ginkgo.Describe("restartStaleContainer detached context survival", func() {
@@ -1480,7 +1597,7 @@ var _ = ginkgo.Describe("DetachedContext", func() {
 			)
 
 			params := types.UpdateParams{
-				Timeout: 0, // No deadline on detached context
+				Timeout: 0, // Fallback deadline applied to detached context
 				RunOnce: false,
 			}
 
@@ -1569,7 +1686,7 @@ var _ = ginkgo.Describe("DetachedContext", func() {
 			)
 
 			params := types.UpdateParams{
-				Timeout: 0, // No deadline on detached context
+				Timeout: 0, // Fallback deadline applied to detached context
 				RunOnce: false,
 			}
 
@@ -1626,7 +1743,7 @@ var _ = ginkgo.Describe("DetachedContext", func() {
 				false,
 			)
 
-			// Use a timeout of 0 to create a detached context without deadline.
+			// Use a timeout of 0 to create a detached context with the fallback deadline.
 			params := types.UpdateParams{
 				Timeout: 0,
 				RunOnce: false,
@@ -1647,10 +1764,11 @@ var _ = ginkgo.Describe("DetachedContext", func() {
 			gomega.Expect(renamed).To(gomega.BeTrue())
 			gomega.Expect(newID).NotTo(gomega.BeEmpty())
 
-			// Verify that both StartContainer and UpdateContainer were called.
-			// UpdateContainer uses the detached context for the restart policy update.
+			// Verify that both StartContainer and SetNoRestartPolicy were called.
+			// SetNoRestartPolicy uses the detached context for the restart policy update.
 			gomega.Expect(client.TestData.StartContainerCount.Load()).To(gomega.Equal(int32(1)))
-			gomega.Expect(client.TestData.UpdateContainerCount.Load()).To(gomega.Equal(int32(1)))
+			gomega.Expect(client.TestData.SetNoRestartPolicyCount.Load()).To(gomega.Equal(int32(1)))
+			gomega.Expect(client.TestData.SetNoRestartPolicyCtx).NotTo(gomega.Equal(context.Background()))
 		})
 	})
 })
@@ -1949,7 +2067,8 @@ var _ = ginkgo.Describe("stopContainersInReversedOrder", func() {
 
 			for _, entry := range logHook.entries {
 				if entry.message == "Skipped container stop due to context cancellation" {
-					if containerName, ok := entry.fields["container"]; ok {
+					containerName, ok := entry.fields["container"]
+					if ok {
 						loggedNames[containerName.(string)] = true
 					}
 
@@ -2082,6 +2201,70 @@ var _ = ginkgo.Describe("stopContainersInReversedOrder", func() {
 			gomega.Expect(client.TestData.StopOrder[1]).To(gomega.Equal("container-1"))
 			gomega.Expect(client.TestData.StopOrder[2]).To(gomega.Equal("container-0"))
 		})
+	})
+})
+
+var _ = ginkgo.Describe("restartContainersInSortedOrder cancel recovery", func() {
+	ginkgo.It("still recreates containers that were already stopped when parent ctx is canceled", func() {
+		containers := make([]types.Container, 3)
+
+		for i := range 3 {
+			c := mockActions.CreateMockContainerWithConfig(
+				fmt.Sprintf("container-%d", i),
+				fmt.Sprintf("/container-%d", i),
+				fmt.Sprintf("image-%d:latest", i),
+				true,
+				false,
+				time.Now(),
+				&dockerContainer.Config{
+					Labels:       map[string]string{},
+					ExposedPorts: dockerNetwork.PortSet{},
+				},
+			)
+			c.SetStale(true)
+			containers[i] = c
+		}
+
+		client := mockActions.CreateMockClient(
+			&mockActions.TestData{
+				Containers: containers,
+				Staleness: map[string]bool{
+					"container-0": true,
+					"container-1": true,
+					"container-2": true,
+				},
+			},
+			false,
+			false,
+		)
+
+		// Pretend the stop phase already removed all three.
+		stoppedImages := []types.RemovedImageInfo{
+			{ContainerID: containers[0].ID(), ImageID: containers[0].ImageID(), ImageName: containers[0].ImageName(), ContainerName: containers[0].Name()},
+			{ContainerID: containers[1].ID(), ImageID: containers[1].ImageID(), ImageName: containers[1].ImageName(), ContainerName: containers[1].Name()},
+			{ContainerID: containers[2].ID(), ImageID: containers[2].ImageID(), ImageName: containers[2].ImageName(), ContainerName: containers[2].Name()},
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		progress := session.Progress{}
+
+		var cleanup []types.RemovedImageInfo
+
+		failed := restartContainersInSortedOrder(
+			ctx,
+			containers,
+			client,
+			types.UpdateParams{Timeout: 0},
+			stoppedImages,
+			&cleanup,
+			&progress,
+		)
+
+		gomega.Expect(failed).To(gomega.BeEmpty(), "stopped containers must still be recreated after cancel")
+		gomega.Expect(client.TestData.CreateContainerCount.Load()).To(gomega.Equal(int32(3)))
+		gomega.Expect(client.TestData.StartContainerCount.Load()).To(gomega.Equal(int32(3)))
 	})
 })
 
@@ -2416,7 +2599,8 @@ var _ = ginkgo.Describe("performRollingRestart", func() {
 
 			for _, entry := range logHook.entries {
 				if entry.message == "Skipped container restart due to context cancellation" {
-					if containerName, ok := entry.fields["container"]; ok {
+					containerName, ok := entry.fields["container"]
+					if ok {
 						loggedNames[containerName.(string)] = true
 					}
 
@@ -2912,5 +3096,84 @@ var _ = ginkgo.Describe("deduplicateByImageID", func() {
 		gomega.Expect(result[0].ContainerName).To(gomega.Equal("container-a"))
 		gomega.Expect(result[1].ImageID).To(gomega.Equal(types.ImageID("sha256:bbb")))
 		gomega.Expect(result[2].ImageID).To(gomega.Equal(types.ImageID("sha256:ccc")))
+	})
+})
+
+var _ = ginkgo.Describe("isPinned", func() {
+	// Valid 64-hex digest used by Docker/OCI references.
+	const fullDigest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+
+	ginkgo.DescribeTable("digest pin detection via shared helper",
+		func(image string, wantPinned bool) {
+			cont := mockActions.CreateMockContainer(
+				"id1",
+				"/name",
+				image,
+				time.Now(),
+			)
+			progress := session.Progress{}
+			params := types.UpdateParams{}
+
+			pinned, err := isPinned(cont, &progress, params)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(pinned).To(gomega.Equal(wantPinned))
+
+			if wantPinned {
+				gomega.Expect(progress).To(gomega.HaveLen(1), "pinned containers are marked scanned")
+			} else {
+				gomega.Expect(progress).To(gomega.BeEmpty(), "unpinned containers are not scanned here")
+			}
+		},
+		ginkgo.Entry("tagged image", "nginx:latest", false),
+		ginkgo.Entry("repo@digest", "nginx@"+fullDigest, true),
+		ginkgo.Entry("tag and digest", "nginx:1.27@"+fullDigest, true),
+		ginkgo.Entry("registry/repo@digest", "registry.example.com/org/app@"+fullDigest, true),
+		ginkgo.Entry("bare content digest", fullDigest, true),
+	)
+
+	ginkgo.It("detects pin before parse fallback can replace the image name", func() {
+		// ImageName is a valid digest pin. Even if parse were flaky, pin must win.
+		cont := mockActions.CreateMockContainer(
+			"pinned-id",
+			"/pinned-name",
+			"library/nginx@"+fullDigest,
+			time.Now(),
+		)
+		progress := session.Progress{}
+
+		pinned, err := isPinned(cont, &progress, types.UpdateParams{})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(pinned).To(gomega.BeTrue())
+		gomega.Expect(progress).To(gomega.HaveLen(1))
+	})
+
+	ginkgo.It("returns error for unresolvable invalid image names", func() {
+		cont := mockActions.CreateMockContainer(
+			"InvalidContainer",
+			"/InvalidContainer",
+			":latest",
+			time.Now(),
+		)
+		progress := session.Progress{}
+
+		pinned, err := isPinned(cont, &progress, types.UpdateParams{})
+		gomega.Expect(err).To(gomega.HaveOccurred())
+		gomega.Expect(pinned).To(gomega.BeFalse())
+		gomega.Expect(progress).To(gomega.BeEmpty())
+	})
+
+	ginkgo.It("does not panic when ContainerInfo Config is nil", func() {
+		cont := mockTypes.NewMockContainer(ginkgo.GinkgoT())
+		cont.On("Name").Return("/nil-config")
+		cont.On("ImageName").Return("nginx:latest")
+		cont.On("ContainerInfo").Return(&dockerContainer.InspectResponse{
+			Config: nil,
+		})
+
+		progress := session.Progress{}
+
+		pinned, err := isPinned(cont, &progress, types.UpdateParams{})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(pinned).To(gomega.BeFalse())
 	})
 })

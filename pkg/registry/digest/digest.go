@@ -14,7 +14,9 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 
+	"github.com/distribution/reference"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 
@@ -35,6 +37,8 @@ var (
 	errMissingImageInfo = errors.New("container image info missing")
 	// errInvalidRegistryResponse indicates the registry's HEAD response lacks a digest or is malformed.
 	errInvalidRegistryResponse = errors.New("registry responded with invalid HEAD request")
+	// ErrManifestNotFound indicates the registry returned 404 for the manifest request.
+	ErrManifestNotFound = errors.New("manifest not found")
 	// errFailedGetToken indicates a failure to obtain an authentication token from the registry.
 	errFailedGetToken = errors.New("failed to get token")
 	// errFailedBuildManifestURL indicates a failure to construct the manifest URL for the registry.
@@ -44,6 +48,47 @@ var (
 	// errFailedExecuteRequest indicates a failure to execute an HTTP request to the registry.
 	errFailedExecuteRequest = errors.New("failed to execute request")
 )
+
+// localOnlyImageCache records image name+ID pairs previously confirmed as local-only
+// (domain-less Config.Image with a registry 404). Subsequent checks skip remote
+// probes, avoiding Docker Hub rate-limit pressure that can starve concurrent
+// staleness checks for other containers in the same update cycle.
+//
+// Keyed by "imageName|imageID". Entries live for process lifetime; a rebuild
+// (new image ID) forces a fresh probe.
+var localOnlyImageCache sync.Map
+
+// localOnlyCacheKey builds a cache key for a container's image identity.
+func localOnlyCacheKey(container types.Container) string {
+	if !container.HasImageInfo() {
+		return container.ImageName() + "|"
+	}
+
+	return container.ImageName() + "|" + container.ImageInfo().ID
+}
+
+// rememberLocalOnlyImage records that the container's image was confirmed local-only.
+func rememberLocalOnlyImage(container types.Container) {
+	localOnlyImageCache.Store(localOnlyCacheKey(container), true)
+}
+
+// isCachedLocalOnlyImage reports whether the container's image was previously
+// confirmed local-only for this process.
+func isCachedLocalOnlyImage(container types.Container) bool {
+	_, ok := localOnlyImageCache.Load(localOnlyCacheKey(container))
+
+	return ok
+}
+
+// ClearLocalOnlyImageCache removes all cached local-only image entries.
+// Intended for tests.
+func ClearLocalOnlyImageCache() {
+	localOnlyImageCache.Range(func(key, _ any) bool {
+		localOnlyImageCache.Delete(key)
+
+		return true
+	})
+}
 
 // NormalizeDigest standardizes a digest string for consistent comparison.
 //
@@ -58,7 +103,8 @@ func NormalizeDigest(digest string) string {
 	// List of prefixes to strip from the digest.
 	prefixes := []string{"sha256:"}
 	for _, prefix := range prefixes {
-		if after, ok := strings.CutPrefix(digest, prefix); ok {
+		after, ok := strings.CutPrefix(digest, prefix)
+		if ok {
 			// Trim the prefix to get the raw digest value.
 			normalized := after
 			logrus.WithFields(logrus.Fields{
@@ -74,7 +120,114 @@ func NormalizeDigest(digest string) string {
 	return digest
 }
 
-// CompareDigest checks whether a container's current image digest matches the latest from its registry.
+// CompareDigest checks whether a container's current image digest matches the
+// latest from its registry.
+//
+// It is a convenience wrapper around CompareDigestWithRemote that discards the
+// remote digest.
+//
+// Parameters:
+//   - ctx: Context for request lifecycle control.
+//   - container: Container whose digest is being compared.
+//   - registryAuth: Base64-encoded auth string.
+//   - endpoints: Optional list of registry mirror host overrides to try before the canonical host.
+//
+// Returns:
+//   - bool: True if digests match (image is up-to-date), false otherwise.
+//   - error: Non-nil if operation fails, nil on success.
+func CompareDigest(
+	ctx context.Context,
+	container types.Container,
+	registryAuth string,
+	endpoints ...string,
+) (bool, error) {
+	match, _, err := CompareDigestWithRemote(
+		ctx,
+		container,
+		registryAuth,
+		endpoints...,
+	)
+
+	return match, err
+}
+
+// isLocalImageNotFound reports whether the digest fetch failed because the
+// registry returned 404 for a manifest request and the container's image looks
+// local-only: domain-less Config.Image and no registry-qualified RepoDigests.
+//
+// Official Hub short names (for example nginx) often store Config.Image without
+// a domain but still have docker.io/... RepoDigests. Those must not be cached as
+// local-only after a transient 404, or updates are skipped for the process life.
+//
+// Parameters:
+//   - container: Container whose image name is inspected.
+//   - err: Error returned from digest fetch.
+//
+// Returns:
+//   - bool: True if the image should be treated as local-only, false otherwise.
+func isLocalImageNotFound(container types.Container, err error) bool {
+	if !errors.Is(err, ErrManifestNotFound) {
+		return false
+	}
+
+	if !container.HasImageInfo() ||
+		container.ContainerInfo() == nil ||
+		container.ContainerInfo().Config == nil {
+		return false
+	}
+
+	// Evaluate only the repository name so tags/digests (e.g. my-app:1.0) do not
+	// make a domain-less image look registry-qualified via "." in a semver tag.
+	originalImage := container.ContainerInfo().Config.Image
+	namePart, _, _ := strings.Cut(originalImage, "@")
+
+	if i := strings.LastIndex(namePart, ":"); i >= 0 {
+		if j := strings.LastIndex(namePart, "/"); j < i {
+			namePart = namePart[:i]
+		}
+	}
+
+	if strings.ContainsAny(namePart, "./") {
+		return false
+	}
+
+	// Registry-qualified digests mean the image was pulled from a remote source;
+	// a 404 is a probe failure, not proof the image is local-only. Official Hub
+	// short names often keep a domain-less Config.Image while RepoDigests still
+	// records docker.io/library/... .
+	for _, digestRef := range container.ImageInfo().RepoDigests {
+		repoPart, _, _ := strings.Cut(digestRef, "@")
+		if repoPartHasRegistryHost(repoPart) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// repoPartHasRegistryHost reports whether a RepoDigest repository path includes
+// a registry host (hostname with a dot, or host:port).
+func repoPartHasRegistryHost(repoPart string) bool {
+	// Strip optional scheme leftovers; RepoDigests are host/path form.
+	hostOrName, remainder, hasSlash := strings.Cut(repoPart, "/")
+	if !hasSlash {
+		// Bare name (e.g. "nginx") has no host segment.
+		return false
+	}
+
+	// host:port/path or registry.example.com/path
+	if strings.Contains(hostOrName, ":") || strings.Contains(hostOrName, ".") {
+		return true
+	}
+
+	// Remainder unused; keep signature clear for future extension.
+	_ = remainder
+
+	return false
+}
+
+// CompareDigestWithRemote checks whether a container's current image digest matches
+// the latest from its registry and returns the remote digest used for comparison.
 //
 // It first inspects the image to check if it's locally built (empty RepoDigests).
 // For local images, digest comparison against a remote registry is not possible,
@@ -92,13 +245,14 @@ func NormalizeDigest(digest string) string {
 //
 // Returns:
 //   - bool: True if digests match (image is up-to-date), false otherwise.
+//   - string: Remote registry digest in "sha256:..." form (empty when unavailable).
 //   - error: Non-nil if operation fails, nil on success.
-func CompareDigest(
+func CompareDigestWithRemote(
 	ctx context.Context,
 	container types.Container,
 	registryAuth string,
 	endpoints ...string,
-) (bool, error) {
+) (bool, string, error) {
 	fields := logrus.Fields{
 		"container": container.Name(),
 		"image":     container.ImageName(),
@@ -108,7 +262,7 @@ func CompareDigest(
 	if !container.HasImageInfo() {
 		logrus.WithFields(fields).Debug("Container image info missing")
 
-		return false, errMissingImageInfo
+		return false, "", errMissingImageInfo
 	}
 
 	// Check if the container's image has no RepoDigests, which indicates a locally
@@ -119,13 +273,23 @@ func CompareDigest(
 	// We check container.ImageInfo().RepoDigests rather than inspecting via the
 	// Docker daemon because:
 	// 1. The container was already populated with image info during initialization
-	// 2. For locally built images, RepoDigests is always empty
+	// 2. For locally built images, RepoDigests are either empty or registry-less
 	// 3. This avoids an extra Docker daemon call
 	if len(container.ImageInfo().RepoDigests) == 0 {
 		logrus.WithFields(fields).
 			Debug("Image with no registry reference detected (empty RepoDigests) - skipping digest comparison")
 
-		return true, nil
+		return true, "", nil
+	}
+
+	// Skip registry probes for images previously confirmed local-only (same name+ID).
+	// This prevents repeated Docker Hub 404 traffic that can rate-limit concurrent
+	// checks for other containers in the same update session.
+	if isCachedLocalOnlyImage(container) {
+		logrus.WithFields(fields).
+			Debug("Cached local-only image - skipping digest comparison")
+
+		return true, "", nil
 	}
 
 	// Fetch the latest digest from the registry using a HEAD request for efficiency.
@@ -137,7 +301,17 @@ func CompareDigest(
 		endpoints...,
 	)
 	if err != nil {
-		return false, err
+		// Domain-less image names that 404 are local-only builds; treat as up-to-date
+		// with no error so callers skip the pull without logging a warning.
+		if isLocalImageNotFound(container, err) {
+			rememberLocalOnlyImage(container)
+			logrus.WithFields(fields).
+				Debug("Image not found in registry - treating as local image")
+
+			return true, "", nil
+		}
+
+		return false, "", err
 	}
 
 	// If HEAD request returned empty digest (due to missing Docker-Content-Digest header),
@@ -153,7 +327,7 @@ func CompareDigest(
 			endpoints...,
 		)
 		if err != nil {
-			return false, err
+			return false, "", err
 		}
 	}
 
@@ -166,7 +340,29 @@ func CompareDigest(
 		WithField("matches", matches).
 		Debug("Completed digest comparison")
 
-	return matches, nil
+	return matches, FormatDigest(remoteDigest), nil
+}
+
+// FormatDigest ensures a digest string uses the "sha256:..." form.
+//
+// Empty input is returned unchanged. Digests that already include a known
+// algorithm prefix are returned as-is, otherwise "sha256:" is prepended.
+//
+// Parameters:
+//   - digest: Digest string (raw hash or "sha256:...").
+//
+// Returns:
+//   - string: Digest with algorithm prefix when non-empty.
+func FormatDigest(digest string) string {
+	if digest == "" {
+		return ""
+	}
+
+	if strings.Contains(digest, ":") {
+		return digest
+	}
+
+	return "sha256:" + digest
 }
 
 // FetchDigest retrieves the digest of an image from its registry using a GET request.
@@ -216,29 +412,51 @@ func BuildManifestURL(
 	container types.Container,
 	hostOverride string,
 ) (string, string, *url.URL, error) {
+	fields := logrus.Fields{
+		"container": container.Name(),
+		"image":     container.ImageName(),
+	}
+
 	// Determine scheme based on WATCHTOWER_REGISTRY_TLS_SKIP.
 	scheme := "https"
 	if viper.GetBool("WATCHTOWER_REGISTRY_TLS_SKIP") {
 		scheme = "http"
 	}
 
-	// Build the initial manifest URL based on the container's image name and tag.
-	manifestURL, err := manifest.BuildManifestURL(container, scheme)
+	// Capture the original registry host from the image reference before any
+	// canonicalization or host remapping. For lscr.io images, preserve the
+	// original host so the redirect-detection logic can distinguish lscr.io
+	// from its ghcr.io target. For all other images use the canonical host.
+	originalHost := ""
+
+	normalizedRef, parseErr := reference.ParseNormalizedNamed(container.ImageName())
+	if parseErr == nil {
+		rawDomain := reference.Domain(normalizedRef)
+
+		canonicalHost, _ := auth.GetRegistryAddress(container.ImageName())
+		if rawDomain == auth.LSCRRegistryDomain {
+			originalHost = rawDomain
+		} else if canonicalHost != "" {
+			originalHost = canonicalHost
+		}
+	}
+
+	// Build the canonical manifest URL.
+	manifestURLStr, err := manifest.BuildManifestURL(container, scheme)
 	if err != nil {
+		logrus.WithError(err).WithFields(fields).Debug("Failed to build manifest URL")
+
 		return "", "", nil, fmt.Errorf("%w: %w", errFailedBuildManifestURL, err)
 	}
 
-	// Parse the initial manifest URL to extract the original host.
-	parsedURL, err := url.Parse(manifestURL)
-	if err != nil {
+	parsedURL, parseErr := url.Parse(manifestURLStr)
+	if parseErr != nil {
 		return "", "", nil, fmt.Errorf(
 			"%w: failed to parse manifest URL: %w",
 			errFailedBuildManifestURL,
-			err,
+			parseErr,
 		)
 	}
-
-	originalHost := parsedURL.Host
 
 	// Special handling for lscr.io registry redirects:
 	// lscr.io (LinuxServer.io) images are hosted on GitHub Container Registry (ghcr.io)
@@ -257,22 +475,22 @@ func BuildManifestURL(
 	// 2. Authentication tokens are obtained from ghcr.io using the redirected challenge
 	// 3. Manifest requests are made directly to ghcr.io (not lscr.io) to avoid 401/404 errors
 	// 4. Digest extraction succeeds from the 200 OK response
-	if parsedURL.Host == "lscr.io" {
-		parsedURL.Host = "ghcr.io"
-		manifestURL = parsedURL.String()
+	if parsedURL.Host == auth.LSCRRegistryDomain {
+		parsedURL.Host = auth.GitHubRegistryDomain
+		manifestURLStr = parsedURL.String()
 	}
 
 	if parsedURL.Host == "" {
 		return "", "", nil, fmt.Errorf(
 			"%w: manifest URL has no host: %s",
 			errFailedBuildManifestURL,
-			manifestURL,
+			manifestURLStr,
 		)
 	}
 
 	if hostOverride != "" {
 		// Parse hostOverride to support full endpoint URLs (with scheme) in addition to bare hosts.
-		// Mirrors from daemon.json may include schemes; mirrors the logic in GetChallengeURL.
+		// Mirrors from daemon.json may include schemes and mirrors the logic in GetChallengeURL.
 		overrideURL, parseErr := url.Parse(hostOverride)
 		if parseErr == nil && overrideURL.Host != "" {
 			parsedURL.Host = overrideURL.Host
@@ -283,10 +501,10 @@ func BuildManifestURL(
 			parsedURL.Host = hostOverride
 		}
 
-		manifestURL = parsedURL.String()
+		manifestURLStr = parsedURL.String()
 	}
 
-	return manifestURL, originalHost, parsedURL, nil
+	return manifestURLStr, originalHost, parsedURL, nil
 }
 
 // fetchDigest retrieves an image digest using the specified HTTP method.
@@ -330,17 +548,18 @@ func fetchDigest(
 	// Create an authentication client for registry requests.
 	client := auth.NewAuthClient()
 
-	// Build initial manifest URL to get canonical host
-	_, originalHost, _, err := BuildManifestURL(container, "")
+	// Build the canonical manifest URL and apply lscr.io/host-override handling.
+	manifestURL, originalHost, _, err := BuildManifestURL(container, "")
 	if err != nil {
 		logrus.WithError(err).WithFields(fields).Debug("Failed to build manifest URL")
 
-		return "", err
+		return "", fmt.Errorf("failed to build manifest URL: %w", err)
 	}
 
 	logrus.WithFields(fields).
 		WithField("original_host", originalHost).
-		Debug("Extracted original host from manifest URL")
+		WithField("manifest_url", manifestURL).
+		Debug("Built manifest URL for container")
 
 	// If no endpoints specified, use a single empty endpoint (canonical host).
 	if len(endpoints) == 0 {
@@ -364,7 +583,7 @@ func fetchDigest(
 		}
 
 		// Obtain an authentication token from the current endpoint.
-		token, challengeHost, redirected, redirectHost, err := auth.GetToken(
+		result, err := auth.GetToken(
 			ctx,
 			container,
 			registryAuth,
@@ -378,6 +597,11 @@ func fetchDigest(
 
 			continue
 		}
+
+		token := result.Token
+		challengeHost := result.ChallengeHost
+		redirected := result.Redirected
+		redirectHost := result.RedirectHost
 
 		if token == "" {
 			logrus.WithFields(fields).WithFields(epFields).
@@ -622,7 +846,8 @@ func HandleManifestResponse(
 				Debug("Response status not successful")
 
 			return "", "", false, fmt.Errorf(
-				"%w: status %s",
+				"%w: %w: status %s",
+				ErrManifestNotFound,
 				errInvalidRegistryResponse,
 				resp.Status,
 			)

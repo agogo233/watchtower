@@ -72,7 +72,7 @@ type MockOperations_ContainerCreate_Call struct {
 // ContainerCreate is a helper method to define mock.On call
 //   - ctx context.Context
 //   - options client.ContainerCreateOptions
-func (_e *MockOperations_Expecter) ContainerCreate(ctx interface{}, options interface{}) *MockOperations_ContainerCreate_Call {
+func (_e *MockOperations_Expecter) ContainerCreate(ctx any, options any) *MockOperations_ContainerCreate_Call {
 	return &MockOperations_ContainerCreate_Call{Call: _e.mock.On("ContainerCreate", ctx, options)}
 }
 
@@ -100,6 +100,78 @@ func (_c *MockOperations_ContainerCreate_Call) Return(containerCreateResult clie
 }
 
 func (_c *MockOperations_ContainerCreate_Call) RunAndReturn(run func(ctx context.Context, options client.ContainerCreateOptions) (client.ContainerCreateResult, error)) *MockOperations_ContainerCreate_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// ContainerInspect provides a mock function for the type MockOperations
+func (_mock *MockOperations) ContainerInspect(ctx context.Context, containerID string, options client.ContainerInspectOptions) (client.ContainerInspectResult, error) {
+	ret := _mock.Called(ctx, containerID, options)
+
+	if len(ret) == 0 {
+		panic("no return value specified for ContainerInspect")
+	}
+
+	var r0 client.ContainerInspectResult
+	var r1 error
+	if returnFunc, ok := ret.Get(0).(func(context.Context, string, client.ContainerInspectOptions) (client.ContainerInspectResult, error)); ok {
+		return returnFunc(ctx, containerID, options)
+	}
+	if returnFunc, ok := ret.Get(0).(func(context.Context, string, client.ContainerInspectOptions) client.ContainerInspectResult); ok {
+		r0 = returnFunc(ctx, containerID, options)
+	} else {
+		r0 = ret.Get(0).(client.ContainerInspectResult)
+	}
+	if returnFunc, ok := ret.Get(1).(func(context.Context, string, client.ContainerInspectOptions) error); ok {
+		r1 = returnFunc(ctx, containerID, options)
+	} else {
+		r1 = ret.Error(1)
+	}
+	return r0, r1
+}
+
+// MockOperations_ContainerInspect_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'ContainerInspect'
+type MockOperations_ContainerInspect_Call struct {
+	*mock.Call
+}
+
+// ContainerInspect is a helper method to define mock.On call
+//   - ctx context.Context
+//   - containerID string
+//   - options client.ContainerInspectOptions
+func (_e *MockOperations_Expecter) ContainerInspect(ctx any, containerID any, options any) *MockOperations_ContainerInspect_Call {
+	return &MockOperations_ContainerInspect_Call{Call: _e.mock.On("ContainerInspect", ctx, containerID, options)}
+}
+
+func (_c *MockOperations_ContainerInspect_Call) Run(run func(ctx context.Context, containerID string, options client.ContainerInspectOptions)) *MockOperations_ContainerInspect_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		var arg0 context.Context
+		if args[0] != nil {
+			arg0 = args[0].(context.Context)
+		}
+		var arg1 string
+		if args[1] != nil {
+			arg1 = args[1].(string)
+		}
+		var arg2 client.ContainerInspectOptions
+		if args[2] != nil {
+			arg2 = args[2].(client.ContainerInspectOptions)
+		}
+		run(
+			arg0,
+			arg1,
+			arg2,
+		)
+	})
+	return _c
+}
+
+func (_c *MockOperations_ContainerInspect_Call) Return(containerInspectResult client.ContainerInspectResult, err error) *MockOperations_ContainerInspect_Call {
+	_c.Call.Return(containerInspectResult, err)
+	return _c
+}
+
+func (_c *MockOperations_ContainerInspect_Call) RunAndReturn(run func(ctx context.Context, containerID string, options client.ContainerInspectOptions) (client.ContainerInspectResult, error)) *MockOperations_ContainerInspect_Call {
 	_c.Call.Return(run)
 	return _c
 }
@@ -139,7 +211,7 @@ type MockOperations_ContainerRemove_Call struct {
 //   - ctx context.Context
 //   - containerID string
 //   - options client.ContainerRemoveOptions
-func (_e *MockOperations_Expecter) ContainerRemove(ctx interface{}, containerID interface{}, options interface{}) *MockOperations_ContainerRemove_Call {
+func (_e *MockOperations_Expecter) ContainerRemove(ctx any, containerID any, options any) *MockOperations_ContainerRemove_Call {
 	return &MockOperations_ContainerRemove_Call{Call: _e.mock.On("ContainerRemove", ctx, containerID, options)}
 }
 
@@ -211,7 +283,7 @@ type MockOperations_ContainerRename_Call struct {
 //   - ctx context.Context
 //   - containerID string
 //   - options client.ContainerRenameOptions
-func (_e *MockOperations_Expecter) ContainerRename(ctx interface{}, containerID interface{}, options interface{}) *MockOperations_ContainerRename_Call {
+func (_e *MockOperations_Expecter) ContainerRename(ctx any, containerID any, options any) *MockOperations_ContainerRename_Call {
 	return &MockOperations_ContainerRename_Call{Call: _e.mock.On("ContainerRename", ctx, containerID, options)}
 }
 
@@ -283,7 +355,7 @@ type MockOperations_ContainerStart_Call struct {
 //   - ctx context.Context
 //   - containerID string
 //   - options client.ContainerStartOptions
-func (_e *MockOperations_Expecter) ContainerStart(ctx interface{}, containerID interface{}, options interface{}) *MockOperations_ContainerStart_Call {
+func (_e *MockOperations_Expecter) ContainerStart(ctx any, containerID any, options any) *MockOperations_ContainerStart_Call {
 	return &MockOperations_ContainerStart_Call{Call: _e.mock.On("ContainerStart", ctx, containerID, options)}
 }
 
@@ -355,7 +427,7 @@ type MockOperations_NetworkConnect_Call struct {
 //   - ctx context.Context
 //   - networkID string
 //   - options client.NetworkConnectOptions
-func (_e *MockOperations_Expecter) NetworkConnect(ctx interface{}, networkID interface{}, options interface{}) *MockOperations_NetworkConnect_Call {
+func (_e *MockOperations_Expecter) NetworkConnect(ctx any, networkID any, options any) *MockOperations_NetworkConnect_Call {
 	return &MockOperations_NetworkConnect_Call{Call: _e.mock.On("NetworkConnect", ctx, networkID, options)}
 }
 

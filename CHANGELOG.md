@@ -8,12 +8,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Chores
+
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.31 by @renovate[bot] in [#2019](https://github.com/nicholas-fedor/watchtower/pull/2019)
+- Update module github.com/gofiber/utils/v2 to v2.4.0 by @renovate[bot] in [#2017](https://github.com/nicholas-fedor/watchtower/pull/2017)
+- Update ossf/scorecard-action action to v2.4.4 by @renovate[bot] in [#2016](https://github.com/nicholas-fedor/watchtower/pull/2016)
+- Update docker/login-action action to v4.5.0 by @renovate[bot] in [#2014](https://github.com/nicholas-fedor/watchtower/pull/2014)
+- Update module github.com/mattn/go-isatty to v0.0.24 by @renovate[bot] in [#2013](https://github.com/nicholas-fedor/watchtower/pull/2013)
+- Update module github.com/gofiber/utils/v2 to v2.3.0 by @renovate[bot] in [#2010](https://github.com/nicholas-fedor/watchtower/pull/2010)
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.30 by @renovate[bot] in [#2009](https://github.com/nicholas-fedor/watchtower/pull/2009)
+
+### Fixed
+
+- Harden self-update failure and cancel recovery by @nicholas-fedor in [#2005](https://github.com/nicholas-fedor/watchtower/pull/2005)
+- Clean up failed recreates and nil host config by @nicholas-fedor in [#2004](https://github.com/nicholas-fedor/watchtower/pull/2004)
+- Prefer config auth and accept identity tokens by @nicholas-fedor in [#2002](https://github.com/nicholas-fedor/watchtower/pull/2002)
+- Tighten image filter matching and local-only detection by @nicholas-fedor in [#2003](https://github.com/nicholas-fedor/watchtower/pull/2003)
+- Restore correct restart order for named network dependencies by @nicholas-fedor in [#2000](https://github.com/nicholas-fedor/watchtower/pull/2000)
+
+## [1.20.1] - 2026-07-22
+
+### Chores
+
+- Update module github.com/prometheus/common to v0.70.1 by @renovate[bot] in [#1998](https://github.com/nicholas-fedor/watchtower/pull/1998)
+- Update github/codeql-action action to v4.37.3 by @renovate[bot] in [#1995](https://github.com/nicholas-fedor/watchtower/pull/1995)
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.29 by @renovate[bot] in [#1993](https://github.com/nicholas-fedor/watchtower/pull/1993)
+
+### Fixed
+
+- Use application context for async update execution by @nicholas-fedor in [#1997](https://github.com/nicholas-fedor/watchtower/pull/1997)
+
+## [1.20.0] - 2026-07-21
+
+### Added
+
+- Add label-based container enable and disable filtering by @nicholas-fedor in [#1969](https://github.com/nicholas-fedor/watchtower/pull/1969)
+- Add and consolidate restart-policy updates by @nicholas-fedor in [#1965](https://github.com/nicholas-fedor/watchtower/pull/1965)
+
 ### Changed
 
+- Parallelize staleness checks with bounded concurrency by @nicholas-fedor in [#1958](https://github.com/nicholas-fedor/watchtower/pull/1958)
+- Restructure registry auth and add bearer token caching by @nicholas-fedor in [#1951](https://github.com/nicholas-fedor/watchtower/pull/1951)
+- Expand and reorganize http-api and metrics, improve logging, and restructure documentation by @nicholas-fedor in [#1939](https://github.com/nicholas-fedor/watchtower/pull/1939)
 - Update star history chart by @nicholas-fedor in [#1907](https://github.com/nicholas-fedor/watchtower/pull/1907)
 
 ### Chores
 
+- Update module github.com/nicholas-fedor/shoutrrr to v0.16.2 by @renovate[bot] in [#1991](https://github.com/nicholas-fedor/watchtower/pull/1991)
+- Update github/codeql-action action to v4.37.2 by @renovate[bot] in [#1989](https://github.com/nicholas-fedor/watchtower/pull/1989)
+- Update actions/setup-python action to v7 by @renovate[bot] in [#1978](https://github.com/nicholas-fedor/watchtower/pull/1978)
+- Update module github.com/prometheus/client_golang to v1.24.0 by @renovate[bot] in [#1986](https://github.com/nicholas-fedor/watchtower/pull/1986)
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.28 by @renovate[bot] in [#1985](https://github.com/nicholas-fedor/watchtower/pull/1985)
+- Update module github.com/klauspost/compress to v1.19.1 by @renovate[bot] in [#1983](https://github.com/nicholas-fedor/watchtower/pull/1983)
+- Update module github.com/go-logr/logr to v1.4.4 by @renovate[bot] in [#1982](https://github.com/nicholas-fedor/watchtower/pull/1982)
+- Update go-openapi packages by @renovate[bot] in [#1980](https://github.com/nicholas-fedor/watchtower/pull/1980)
+- Update actions/checkout action to v7.0.1 by @renovate[bot] in [#1979](https://github.com/nicholas-fedor/watchtower/pull/1979)
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.27 by @renovate[bot] in [#1977](https://github.com/nicholas-fedor/watchtower/pull/1977)
+- Update go-openapi packages to v0.27.1 by @renovate[bot] in [#1975](https://github.com/nicholas-fedor/watchtower/pull/1975)
+- Update module github.com/gofiber/schema to v1.8.3 by @renovate[bot] in [#1973](https://github.com/nicholas-fedor/watchtower/pull/1973)
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.26 by @renovate[bot] in [#1955](https://github.com/nicholas-fedor/watchtower/pull/1955)
+- Update module github.com/docker/cli to v29.6.2+incompatible by @renovate[bot] in [#1953](https://github.com/nicholas-fedor/watchtower/pull/1953)
+- Update github/codeql-action action to v4.37.1 by @renovate[bot] in [#1952](https://github.com/nicholas-fedor/watchtower/pull/1952)
+- Update actions/setup-go action to v7 by @renovate[bot] in [#1946](https://github.com/nicholas-fedor/watchtower/pull/1946)
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.25 by @renovate[bot] in [#1948](https://github.com/nicholas-fedor/watchtower/pull/1948)
+- Update module github.com/mattn/go-isatty to v0.0.23 by @renovate[bot] in [#1947](https://github.com/nicholas-fedor/watchtower/pull/1947)
+- Update module github.com/gofiber/utils/v2 to v2.2.0 by @renovate[bot] in [#1944](https://github.com/nicholas-fedor/watchtower/pull/1944)
+- Update module github.com/gofiber/schema to v1.8.2 by @renovate[bot] in [#1941](https://github.com/nicholas-fedor/watchtower/pull/1941)
+- Update securego/gosec action to v2.28.0 by @renovate[bot] in [#1937](https://github.com/nicholas-fedor/watchtower/pull/1937)
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.23 by @renovate[bot] in [#1935](https://github.com/nicholas-fedor/watchtower/pull/1935)
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.21 by @renovate[bot] in [#1934](https://github.com/nicholas-fedor/watchtower/pull/1934)
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.20 by @renovate[bot] in [#1932](https://github.com/nicholas-fedor/watchtower/pull/1932)
 - Update nicholas-fedor/go-proxy-pull-action action to v1.1.19 by @renovate[bot] in [#1931](https://github.com/nicholas-fedor/watchtower/pull/1931)
 - Update nicholas-fedor/go-proxy-pull-action action to v1.1.18 by @renovate[bot] in [#1929](https://github.com/nicholas-fedor/watchtower/pull/1929)
 - Update module github.com/prometheus/common to v0.70.0 by @renovate[bot] in [#1928](https://github.com/nicholas-fedor/watchtower/pull/1928)
@@ -47,6 +111,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Update nicholas-fedor/go-proxy-pull-action action to v1.1.11 by @renovate[bot] in [#1875](https://github.com/nicholas-fedor/watchtower/pull/1875)
 - Update github/codeql-action action to v4.36.3 by @renovate[bot] in [#1874](https://github.com/nicholas-fedor/watchtower/pull/1874)
 - Update docker/setup-qemu-action action to v4.2.0 by @renovate[bot] in [#1872](https://github.com/nicholas-fedor/watchtower/pull/1872)
+
+### Fixed
+
+- Validate notification-url secret file entries by @nicholas-fedor in [#1971](https://github.com/nicholas-fedor/watchtower/pull/1971)
+- Ensure revive-stopped configuration reaches scheduled update runs by @nicholas-fedor in [#1961](https://github.com/nicholas-fedor/watchtower/pull/1961)
+- Handle local-only images and clarify self-update skip messages by @nicholas-fedor in [#1960](https://github.com/nicholas-fedor/watchtower/pull/1960)
+- Derive bearer service from realm by @llc1123 in [#1895](https://github.com/nicholas-fedor/watchtower/pull/1895)
+
+### Removed
+
+- Remove yaml array recommendation and restructure notifications documentation by @nicholas-fedor in [#1967](https://github.com/nicholas-fedor/watchtower/pull/1967)
+- Remove unsupported go report card by @nicholas-fedor in [#1963](https://github.com/nicholas-fedor/watchtower/pull/1963)
+
+### New Contributors
+
+- @llc1123 made their first contribution in [#1895](https://github.com/nicholas-fedor/watchtower/pull/1895)
 
 ## [1.19.0] - 2026-06-30
 
@@ -3249,7 +3329,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Compare Releases
 
-- [unreleased](https://github.com/nicholas-fedor/watchtower/compare/v1.19.0...HEAD)
+- [unreleased](https://github.com/nicholas-fedor/watchtower/compare/v1.20.1...HEAD)
+- [1.20.1](https://github.com/nicholas-fedor/watchtower/compare/v1.20.0...v1.20.1)
+- [1.20.0](https://github.com/nicholas-fedor/watchtower/compare/v1.19.0...v1.20.0)
 - [1.19.0](https://github.com/nicholas-fedor/watchtower/compare/v1.18.1...v1.19.0)
 - [1.18.1](https://github.com/nicholas-fedor/watchtower/compare/v1.18.0...v1.18.1)
 - [1.18.0](https://github.com/nicholas-fedor/watchtower/compare/v1.17.2...v1.18.0)

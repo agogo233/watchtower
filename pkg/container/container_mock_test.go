@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"sync/atomic"
@@ -398,10 +399,12 @@ func WithDevices(devices []dockerContainer.DeviceMapping) MockContainerUpdate {
 type MockClient struct {
 	createFunc        func(context.Context, *dockerContainer.Config, *dockerContainer.HostConfig, *dockerNetwork.NetworkingConfig, *ocispec.Platform, string) (dockerClient.ContainerCreateResult, error)
 	startFunc         func(context.Context, string, dockerClient.ContainerStartOptions) (dockerClient.ContainerStartResult, error)
+	inspectFunc       func(context.Context, string, dockerClient.ContainerInspectOptions) (dockerClient.ContainerInspectResult, error)
 	removeFunc        func(context.Context, string, dockerClient.ContainerRemoveOptions) (dockerClient.ContainerRemoveResult, error)
 	connectFunc       func(context.Context, string, string, *dockerNetwork.EndpointSettings) (dockerClient.NetworkConnectResult, error)
 	renameFunc        func(context.Context, string, string) (dockerClient.ContainerRenameResult, error)
 	removeFuncCalled  atomic.Bool
+	inspectFuncCalled atomic.Bool
 	createFuncCalled  atomic.Bool
 	startFuncCalled   atomic.Bool
 	connectFuncCalled atomic.Bool
@@ -455,6 +458,39 @@ func (m *MockClient) ContainerStart(
 	}
 
 	return dockerClient.ContainerStartResult{}, nil
+}
+
+// ContainerInspect mocks inspection of a container.
+//
+// Parameters:
+//   - ctx: Context for the operation.
+//   - containerID: ID of the container to inspect.
+//   - options: Inspect options.
+//
+// Returns:
+//   - dockerClient.ContainerInspectResult: Mocked inspect result.
+//   - error: Error if the mock inspect function is set to fail, nil otherwise.
+func (m *MockClient) ContainerInspect(
+	ctx context.Context,
+	containerID string,
+	options dockerClient.ContainerInspectOptions,
+) (dockerClient.ContainerInspectResult, error) {
+	m.inspectFuncCalled.Store(true)
+
+	if m.inspectFunc != nil {
+		return m.inspectFunc(ctx, containerID, options)
+	}
+
+	// Default: created but not running (typical after a start failure).
+	return dockerClient.ContainerInspectResult{
+		Container: dockerContainer.InspectResponse{
+			ID: containerID,
+			State: &dockerContainer.State{
+				Status:  "created",
+				Running: false,
+			},
+		},
+	}, nil
 }
 
 // ContainerRemove mocks the removal of a container.
@@ -533,6 +569,48 @@ func APIVersionPingHandler() http.HandlerFunc {
 	return ghttp.CombineHandlers(
 		ghttp.VerifyRequest("HEAD", "/_ping"),
 		ghttp.RespondWith(http.StatusOK, nil),
+	)
+}
+
+// ContainerUpdateHandler returns a handler that responds to the Docker API's
+// POST /containers/{id}/update endpoint. It optionally verifies that the request
+// body contains a restart policy with Name set to "no" when verifyRestartPolicy
+// is true.
+//
+// Parameters:
+//   - containerID: The container ID for the update endpoint.
+//   - status: HTTP status code to return (204 for success, 500 for error).
+//   - verifyRestartPolicy: When true, the handler verifies the request body
+//     contains RestartPolicy.Name == "no".
+//
+// Returns:
+//   - http.HandlerFunc: Handler for the container update endpoint.
+func ContainerUpdateHandler(
+	containerID string,
+	status int,
+	verifyRestartPolicy bool,
+) http.HandlerFunc {
+	return ghttp.CombineHandlers(
+		ghttp.VerifyRequest("POST", gomega.HaveSuffix(fmt.Sprintf("containers/%s/update", containerID))),
+		func(w http.ResponseWriter, r *http.Request) {
+			if verifyRestartPolicy {
+				var body map[string]any
+
+				err := json.NewDecoder(r.Body).Decode(&body)
+				if err != nil {
+					gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				}
+
+				restartPolicy, ok := body["RestartPolicy"].(map[string]any)
+				gomega.Expect(ok).To(gomega.BeTrue(), "RestartPolicy should be present in update body")
+
+				name, ok := restartPolicy["Name"].(string)
+				gomega.Expect(ok).To(gomega.BeTrue(), "RestartPolicy.Name should be a string")
+				gomega.Expect(name).To(gomega.Equal("no"), "RestartPolicy.Name should be 'no'")
+			}
+
+			ghttp.RespondWith(status, nil)(w, r)
+		},
 	)
 }
 

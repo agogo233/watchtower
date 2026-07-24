@@ -18,6 +18,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+//nolint:godox
+// TODO: Remove and/or update unit testing of deprecated configuration options just before v2 Release.
+
 var errSetFailed = errors.New("set failed")
 
 // newTestCommand creates a new cobra.Command with default flags registered for testing.
@@ -335,19 +338,19 @@ func TestGetSecretsFromFiles(t *testing.T) {
 		{
 			name: "slice with file",
 			files: []struct{ path, content string }{
-				{"urls.txt", "\nentry2\n\nentry3"},
+				{"urls.txt", "\ndiscord://entry2\n\ntelegram://entry3"},
 			},
 			flagName: "notification-url",
-			expected: "[entry1,entry2,entry3]",
-			args:     []string{"--notification-url", "entry1", "--notification-url", "urls.txt"},
+			expected: "[discord://entry1,discord://entry2,telegram://entry3]",
+			args:     []string{"--notification-url", "discord://entry1", "--notification-url", "urls.txt"},
 		},
 		{
 			name: "empty lines",
 			files: []struct{ path, content string }{
-				{"urls.txt", "entry1\n\nentry2\n  \nentry3"},
+				{"urls.txt", "discord://entry1\n\ntelegram://entry2\n  \nslack://entry3"},
 			},
 			flagName: "notification-url",
-			expected: "[entry1,entry2,entry3]",
+			expected: "[discord://entry1,telegram://entry2,slack://entry3]",
 			args:     []string{"--notification-url", "urls.txt"},
 		},
 		{
@@ -365,10 +368,10 @@ func TestGetSecretsFromFiles(t *testing.T) {
 		{
 			name: "special chars",
 			files: []struct{ path, content string }{
-				{"urls.txt", "smtp://user:pass@host:port\nslack://token@channel\n!@#$%^&*()"},
+				{"urls.txt", "smtp://user:pass@host:25?key=value\nslack://token@channel"},
 			},
 			flagName: "notification-url",
-			expected: "[smtp://user:pass@host:port,slack://token@channel,!@#$%^&*()]",
+			expected: "[smtp://user:pass@host:25?key=value,slack://token@channel]",
 			args:     []string{"--notification-url", "urls.txt"},
 		},
 		{
@@ -382,17 +385,17 @@ func TestGetSecretsFromFiles(t *testing.T) {
 		{
 			name: "mixed values",
 			files: []struct{ path, content string }{
-				{"urls.txt", "fileentry1\nfileentry2"},
+				{"urls.txt", "discord://fileentry1\ntelegram://fileentry2"},
 			},
 			flagName: "notification-url",
-			expected: "[direct1,fileentry1,fileentry2,direct2]",
+			expected: "[discord://direct1,discord://fileentry1,telegram://fileentry2,discord://direct2]",
 			args: []string{
 				"--notification-url",
-				"direct1",
+				"discord://direct1",
 				"--notification-url",
 				"urls.txt",
 				"--notification-url",
-				"direct2",
+				"discord://direct2",
 			},
 		},
 	}
@@ -648,23 +651,10 @@ func TestSetupLogging(t *testing.T) {
 // TestFlagsArePresentInDocumentation verifies that all flags are documented.
 // It checks documentation files for flag and environment variable mentions.
 func TestFlagsArePresentInDocumentation(t *testing.T) {
-	//nolint:godox
-	// TODO: Remove legacy flags from ignoredEnvs/ignoredFlags when legacy notification types are removed.
-	// Legacy notifications are ignored due to soft deprecation.
-	ignoredEnvs := map[string]string{
-		"WATCHTOWER_NOTIFICATION_SLACK_ICON_EMOJI": "legacy",
-		"WATCHTOWER_NOTIFICATION_SLACK_ICON_URL":   "legacy",
-		"DOCKER_CERT_PATH":                         "new feature",
-		"WATCHTOWER_NOTIFICATION_TEMPLATE_FILE":    "new feature",
-	}
+	ignoredEnvs := map[string]string{}
 
 	ignoredFlags := map[string]string{
-		"notification-gotify-url":       "legacy",
-		"notification-slack-icon-emoji": "legacy",
-		"notification-slack-icon-url":   "legacy",
-		"cert-path":                     "new feature",
-		"notification-template-file":    "new feature",
-		"self-update-orchestrator":      "internal",
+		"self-update-orchestrator": "internal",
 	}
 
 	cmd := new(cobra.Command)
@@ -677,10 +667,17 @@ func TestFlagsArePresentInDocumentation(t *testing.T) {
 	flags := cmd.PersistentFlags()
 
 	docFiles := []string{
-		"../../docs/configuration/arguments/index.md",
-		"../../docs/advanced-features/lifecycle-hooks/index.md",
-		"../../docs/notifications/overview/index.md",
-		"../../docs/notifications/templates/index.md",
+		"../../docs/configuration/container-selection/index.md",
+		"../../docs/configuration/docker-connection/index.md",
+		"../../docs/configuration/http-api/index.md",
+		"../../docs/configuration/image-cooldown/index.md",
+		"../../docs/configuration/introduction/index.md",
+		"../../docs/configuration/lifecycle-hooks/index.md",
+		"../../docs/configuration/logging-and-output/index.md",
+		"../../docs/configuration/notifications/index.md",
+		"../../docs/configuration/registry-and-authentication/index.md",
+		"../../docs/configuration/scheduling/index.md",
+		"../../docs/configuration/update-behavior/index.md",
 	}
 	allDocs := ""
 
@@ -781,6 +778,97 @@ func TestGetSecretFromFile_OpenError(t *testing.T) {
 	assert.Contains(t, err.Error(), "failed to open secret file")
 }
 
+// TestGetSecretFromFile_SkipCommentsAndEmptyLines verifies that comment and empty
+// lines are skipped when reading notification URLs from a secret file.
+func TestGetSecretFromFile_SkipCommentsAndEmptyLines(t *testing.T) {
+	cmd := new(cobra.Command)
+
+	SetDefaults()
+	RegisterNotificationFlags(cmd)
+
+	file, err := os.CreateTemp(t.TempDir(), "watchtower-")
+	require.NoError(t, err)
+	_, err = file.WriteString(
+		"# This is a comment\n" +
+			"discord://token@webhookid\n" +
+			"\n" +
+			"  # indented comment\n" +
+			"telegram://token@telegram?chats=@channel\n" +
+			"# another comment\n",
+	)
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+
+	err = cmd.ParseFlags([]string{"--notification-url", file.Name()})
+	require.NoError(t, err)
+
+	err = getSecretFromFile(cmd.PersistentFlags(), "notification-url")
+	require.NoError(t, err)
+
+	urls, err := cmd.PersistentFlags().GetStringArray("notification-url")
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"discord://token@webhookid", "telegram://token@telegram?chats=@channel"}, urls)
+}
+
+// TestGetSecretFromFile_InvalidSecretURL verifies that non-URL lines and
+// parameterless non-logger/mock URLs in a secret file are rejected with
+// errInvalidSecretURL.
+func TestGetSecretFromFile_InvalidSecretURL(t *testing.T) {
+	cmd := new(cobra.Command)
+
+	SetDefaults()
+	RegisterNotificationFlags(cmd)
+
+	file, err := os.CreateTemp(t.TempDir(), "watchtower-")
+	require.NoError(t, err)
+	_, err = file.WriteString(
+		"discord://token@webhookid\n" +
+			"not-a-url\n" +
+			"://missing-scheme\n" +
+			"discord://\n",
+	)
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+
+	err = cmd.ParseFlags([]string{"--notification-url", file.Name()})
+	require.NoError(t, err)
+
+	err = getSecretFromFile(cmd.PersistentFlags(), "notification-url")
+	require.Error(t, err)
+	require.ErrorIs(t, err, errInvalidSecretURL)
+}
+
+// TestGetSecretFromFile_ParameterlessLoggerAndMockURLs verifies that
+// parameterless logger:// and mock:// URLs are accepted in a secret file.
+func TestGetSecretFromFile_ParameterlessLoggerAndMockURLs(t *testing.T) {
+	cmd := new(cobra.Command)
+
+	SetDefaults()
+	RegisterNotificationFlags(cmd)
+
+	file, err := os.CreateTemp(t.TempDir(), "watchtower-")
+	require.NoError(t, err)
+	_, err = file.WriteString(
+		"logger://\n" +
+			"mock://\n" +
+			"discord://token@webhookid\n",
+	)
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+
+	err = cmd.ParseFlags([]string{"--notification-url", file.Name()})
+	require.NoError(t, err)
+
+	err = getSecretFromFile(cmd.PersistentFlags(), "notification-url")
+	require.NoError(t, err)
+
+	urls, err := cmd.PersistentFlags().GetStringArray("notification-url")
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"logger://", "mock://", "discord://token@webhookid"}, urls)
+}
+
 func TestReadFlags_Errors(t *testing.T) {
 	originalExit := logrus.StandardLogger().ExitFunc
 
@@ -825,7 +913,7 @@ func TestGetSecretFromFile_SliceReplaceError(t *testing.T) {
 	// Use a real file to ensure slice processing
 	file, err := os.CreateTemp(t.TempDir(), "watchtower-")
 	require.NoError(t, err)
-	_, err = file.WriteString("entry1\nentry2")
+	_, err = file.WriteString("discord://entry1\ntelegram://entry2")
 	require.NoError(t, err)
 
 	fileName := file.Name()

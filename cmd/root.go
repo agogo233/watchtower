@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"os/signal"
@@ -13,20 +14,38 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
-	dockerContainer "github.com/moby/moby/api/types/container"
-
 	"github.com/nicholas-fedor/watchtower/internal/actions"
 	"github.com/nicholas-fedor/watchtower/internal/api"
+	"github.com/nicholas-fedor/watchtower/internal/api/config"
+	"github.com/nicholas-fedor/watchtower/internal/api/handlers/events"
 	"github.com/nicholas-fedor/watchtower/internal/flags"
 	"github.com/nicholas-fedor/watchtower/internal/logging"
 	"github.com/nicholas-fedor/watchtower/internal/meta"
+	"github.com/nicholas-fedor/watchtower/internal/metrics"
 	"github.com/nicholas-fedor/watchtower/internal/scheduling"
 	"github.com/nicholas-fedor/watchtower/internal/util"
 	"github.com/nicholas-fedor/watchtower/pkg/container"
 	"github.com/nicholas-fedor/watchtower/pkg/filters"
-	"github.com/nicholas-fedor/watchtower/pkg/metrics"
 	"github.com/nicholas-fedor/watchtower/pkg/notifications"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
+)
+
+const (
+	// restartPolicyTimeout is the maximum duration allowed for restart-policy
+	// update operations.
+	//
+	// It bounds the Docker API call that sets the current Watchtower
+	// container's restart policy to "no", so a slow or unresponsive
+	// daemon cannot delay shutdown paths.
+	restartPolicyTimeout = 5 * time.Second
+
+	// containerLookupTimeout is the maximum duration allowed for current
+	// container ID lookups.
+	//
+	// It bounds the Docker API / hostname / mountinfo detection sequence,
+	// so startup cannot hang indefinitely if the daemon or container runtime
+	// metadata is unreachable.
+	containerLookupTimeout = 5 * time.Second
 )
 
 var (
@@ -109,6 +128,22 @@ var (
 	// environment variable, providing a way to blacklist specific image patterns.
 	skippedImageNamePatterns []string
 
+	// enabledContainersByLabel is a slice of "key=value" label pairs that
+	// restricts which containers are monitored.
+	//
+	// When set, only containers matching at least one pair are monitored.
+	// It is populated in preRun from the --enable-containers-by-label flag or the
+	// WATCHTOWER_ENABLE_CONTAINERS_BY_LABEL environment variable.
+	enabledContainersByLabel []string
+
+	// disabledContainersByLabel is a slice of "key=value" label pairs for
+	// containers to exclude from monitoring.
+	//
+	// Matching containers are not monitored. It is populated in preRun from the
+	// --disable-containers-by-label flag or the WATCHTOWER_DISABLE_CONTAINERS_BY_LABEL
+	// environment variable, providing a way to blacklist containers by label.
+	disabledContainersByLabel []string
+
 	// notifier is the notification system instance responsible for sending update status messages to configured channels.
 	//
 	// It is initialized in preRun with notification types specified via flags (e.g., --notifications), supporting
@@ -138,6 +173,18 @@ var (
 	// It is configured in preRun via the --rolling-restart flag or the WATCHTOWER_ROLLING_RESTART environment variable,
 	// reducing downtime by restarting containers one-by-one during updates.
 	rollingRestart bool
+
+	// includeStopped indicates whether stopped containers are included in updates.
+	//
+	// It is set in preRun via the --include-stopped flag or the WATCHTOWER_INCLUDE_STOPPED environment variable,
+	// allowing Watchtower to manage containers that are not currently running.
+	includeStopped bool
+
+	// includeRestarting indicates whether restarting containers are included in updates.
+	//
+	// It is set in preRun via the --include-restarting flag or the WATCHTOWER_INCLUDE_RESTARTING environment variable,
+	// allowing Watchtower to manage containers that are in the process of restarting.
+	includeRestarting bool
 
 	// scope defines a specific operational scope for Watchtower, limiting updates to containers matching this scope.
 	//
@@ -225,6 +272,11 @@ var (
 	// It defines the base usage string, short and long descriptions, and assigns lifecycle hooks (PreRun and Run)
 	// to manage setup and execution, initialized with default behavior and configured via flags during runtime.
 	rootCmd = NewRootCommand()
+)
+
+// errInvalidAPIHost indicates http-api-host is neither empty nor a valid IP.
+var errInvalidAPIHost = errors.New(
+	"invalid http-api-host: must be empty or a valid IP address (IPv4 or IPv6)",
 )
 
 // init registers command-line flags for the root command during package initialization.
@@ -332,6 +384,12 @@ func preRun(cmd *cobra.Command, _ []string) {
 		skippedImageNamePatterns[i] = strings.TrimSpace(skippedImageNamePatterns[i])
 	}
 
+	// Set label key-value pairs that restrict which containers are monitored.
+	enabledContainersByLabel, _ = flagsSet.GetStringSlice("enable-containers-by-label")
+
+	// Set label key-value pairs for containers to skip during monitoring.
+	disabledContainersByLabel, _ = flagsSet.GetStringSlice("disable-containers-by-label")
+
 	// Enable/disable execution of scripts before or after updates.
 	lifecycleHooks, _ = flagsSet.GetBool("enable-lifecycle-hooks")
 
@@ -391,8 +449,8 @@ func preRun(cmd *cobra.Command, _ []string) {
 
 	// Retrieve flags controlling container inclusion and image handling behavior.
 	noPull, _ = flagsSet.GetBool("no-pull")
-	includeStopped, _ := flagsSet.GetBool("include-stopped")
-	includeRestarting, _ := flagsSet.GetBool("include-restarting")
+	includeStopped, _ = flagsSet.GetBool("include-stopped")
+	includeRestarting, _ = flagsSet.GetBool("include-restarting")
 	reviveStopped, _ = flagsSet.GetBool("revive-stopped")
 	removeVolumes, _ := flagsSet.GetBool("remove-volumes")
 	warnOnHeadPullFailed, _ := flagsSet.GetString("warn-on-head-failure")
@@ -415,16 +473,37 @@ func preRun(cmd *cobra.Command, _ []string) {
 	// Check for orchestrator mode early — this is an internal mode where Watchtower
 	// runs as a one-shot orchestrator for self-update. It reads environment variables
 	// to determine the old container ID, new image, and original container name.
-	if isOrchestrator, _ := flagsSet.GetBool("self-update-orchestrator"); isOrchestrator {
+	isOrchestrator, _ := flagsSet.GetBool("self-update-orchestrator")
+	if isOrchestrator {
 		logrus.Info("Running in ephemeral self-update orchestrator mode")
 
 		actions.RunOrchestrator(context.Background(), client)
 
-		// Defensive: RunOrchestrator should always call os.Exit, but if it ever
+		// RunOrchestrator should always call os.Exit, but if it ever
 		// returns unexpectedly, ensure the process terminates to prevent the
 		// preRun flow from continuing into the main Watchtower loop.
+		//
+		// Resolve the current Watchtower container directly here, before the
+		// general lookup later in preRun, so the restart policy update targets
+		// the actual container instead of a nil reference.
+		currentWatchtowerContainer = resolveCurrentWatchtowerContainerForFallback(
+			context.Background(),
+			client,
+		)
+
+		setNoRestartPolicyCtx, cancel := context.WithTimeout(
+			context.Background(),
+			restartPolicyTimeout,
+		)
+		defer cancel()
+
+		client.SetNoRestartPolicy(
+			setNoRestartPolicyCtx,
+			currentWatchtowerContainer,
+		)
+
 		logrus.WithField("flag", "self-update-orchestrator").
-			Fatal("RunOrchestrator returned unexpectedly; exiting to prevent unintended execution")
+			Fatal("RunOrchestrator returned unexpectedly. Exiting to prevent unintended execution")
 	}
 
 	// Warn about potential redundancy in flag combinations that could result in no action.
@@ -437,7 +516,6 @@ func preRun(cmd *cobra.Command, _ []string) {
 
 	// Create a timeout-bound context for Docker API lookups to prevent hanging indefinitely.
 	// This ensures the container ID lookup fails fast if the Docker API is unresponsive.
-	const containerLookupTimeout = 5 * time.Second
 
 	ctx, cancel := context.WithTimeout(context.Background(), containerLookupTimeout)
 	defer cancel()
@@ -474,31 +552,14 @@ func preRun(cmd *cobra.Command, _ []string) {
 			"Detected invalid restart of old Watchtower container, stopping Watchtower container now",
 		)
 
-		if currentWatchtowerContainer != nil {
-			updateConfig := dockerContainer.UpdateConfig{
-				RestartPolicy: dockerContainer.RestartPolicy{
-					Name: "no",
-				},
-			}
+		ctx, cancel := context.WithTimeout(
+			context.Background(),
+			containerLookupTimeout,
+		)
+		defer cancel()
 
-			ctx, cancel := context.WithTimeout(
-				context.Background(),
-				containerLookupTimeout,
-			)
-			defer cancel()
-
-			err := client.UpdateContainer(
-				ctx,
-				currentWatchtowerContainer,
-				updateConfig,
-			)
-			if err != nil {
-				logrus.WithError(err).
-					Warn("Failed to update restart policy to 'no' for old Watchtower container")
-			} else {
-				logrus.Debug("Updated restart policy to 'no' for old Watchtower container")
-			}
-		}
+		// Update current Watchtower container's restart policy to "no" to prevent unwanted restarts
+		client.SetNoRestartPolicy(ctx, currentWatchtowerContainer)
 
 		logrus.Exit(0)
 	}
@@ -506,6 +567,10 @@ func preRun(cmd *cobra.Command, _ []string) {
 	// Set up the notification system with types specified via flags (e.g., email, Slack).
 	notifier = notifications.NewNotifier(cmd)
 	notifier.AddLogHook()
+
+	// Log deprecated notification configuration options, if set.
+	notificationTypes, _ := cmd.Flags().GetStringSlice("notifications")
+	notifications.LogLegacyDeprecationWarnings(notificationTypes)
 }
 
 // run executes the main Watchtower logic based on parsed command-line flags.
@@ -532,7 +597,8 @@ func run(command *cobra.Command, args []string) {
 		)
 	}
 
-	// Determine the effective operational scope, prioritizing explicit scope over scope derived from the container's label.
+	// Determine the effective operational scope, prioritizing explicit scope
+	// over scope derived from the container's label.
 	// This ensures scope persistence during self-updates.
 	var err error
 
@@ -542,25 +608,61 @@ func run(command *cobra.Command, args []string) {
 	}
 
 	// Build the filter and its description based on normalized names, exclusions, and label settings.
-	filter, filterDesc := filters.BuildFilter(
+	filter, filterDesc, err := filters.BuildFilter(
 		normalizedContainerNames,
 		disableContainers,
 		monitoredImageNamePatterns,
 		skippedImageNamePatterns,
+		enabledContainersByLabel,
+		disabledContainersByLabel,
 		enableLabel,
 		scope,
 	)
+	if err != nil {
+		if currentWatchtowerContainer != nil {
+			setNoRestartPolicyCtx, cancel := context.WithTimeout(
+				context.Background(),
+				restartPolicyTimeout,
+			)
+			defer cancel()
 
-	// Get flags controlling execution mode and HTTP API behavior.
+			client.SetNoRestartPolicy(setNoRestartPolicyCtx, currentWatchtowerContainer)
+		}
+
+		logrus.WithError(err).Fatal("Failed to build container filter")
+	}
+
+	// Get flags controlling execution mode.
 	runOnce, _ := command.PersistentFlags().GetBool("run-once")
 	updateOnStart, _ := command.PersistentFlags().GetBool("update-on-start")
-	enableUpdateAPI, _ := command.PersistentFlags().GetBool("http-api-update")
-	enableMetricsAPI, _ := command.PersistentFlags().GetBool("http-api-metrics")
-	enableContainersAPI, _ := command.PersistentFlags().GetBool("http-api-containers")
-	unblockHTTPAPI, _ := command.PersistentFlags().GetBool("http-api-periodic-polls")
 	noStartupMessage, _ := command.PersistentFlags().GetBool("no-startup-message")
-	apiToken, _ := command.PersistentFlags().GetString("http-api-token")
 	healthCheck, _ := command.PersistentFlags().GetBool("health-check")
+
+	// Get flags controlling HTTP API behavior.
+	apiEndpoints, _ := command.PersistentFlags().GetStringSlice("http-api-endpoints")
+	// TODO: Remove legacy HTTP API enable flags when dropping them in v2.
+	//nolint:godox
+	legacyUpdateAPI, _ := command.PersistentFlags().GetBool("http-api-update")
+	legacyMetricsAPI, _ := command.PersistentFlags().GetBool("http-api-metrics")
+	legacyContainersAPI, _ := command.PersistentFlags().GetBool("http-api-containers")
+	tlsCertPath, _ := command.PersistentFlags().GetString("http-api-tls-cert")
+	tlsKeyPath, _ := command.PersistentFlags().GetString("http-api-tls-key")
+	trustedProxies, _ := command.PersistentFlags().GetStringSlice("http-api-trusted-proxies")
+	proxyHeader, _ := command.PersistentFlags().GetString("http-api-proxy-header")
+	corsOrigins, _ := command.PersistentFlags().GetStringSlice("http-api-cors-origins")
+	unblockHTTPAPI, _ := command.PersistentFlags().GetBool("http-api-periodic-polls")
+	apiToken, _ := command.PersistentFlags().GetString("http-api-token")
+	apiEventsToken, _ := command.PersistentFlags().GetString("http-api-events-token")
+
+	endpointSet, err := config.ResolveEndpoints(
+		apiEndpoints,
+		legacyUpdateAPI,
+		legacyMetricsAPI,
+		legacyContainersAPI,
+	)
+	if err != nil {
+		logrus.WithError(err).Fatal("Invalid HTTP API endpoint configuration")
+	}
 
 	// Get the HTTP API host and port, falling back to "8080" for port if not specified.
 	flagsSet := command.PersistentFlags()
@@ -570,18 +672,21 @@ func run(command *cobra.Command, args []string) {
 		logrus.WithError(err).Fatal("Failed to get http-api-host flag")
 	}
 
-	// Validate APIHost: allow empty or valid IP
-	if apiHost != "" && net.ParseIP(apiHost) == nil {
-		logrus.Fatalf(
-			"invalid http-api-host '%s': must be empty or a valid IP address (IPv4 or IPv6)",
-			apiHost,
-		)
+	// Validate if the configuration option has been changed from the default value.
+	apiHostChanged := flagsSet.Lookup("http-api-host").Changed
+
+	err = validateAPIHost(apiHost)
+	if err != nil {
+		logrus.Fatal(err)
 	}
 
 	apiPort, err := flagsSet.GetString("http-api-port")
 	if err != nil {
 		logrus.WithError(err).Fatal("Failed to get http-api-port flag")
 	}
+
+	// Validate if the configuration option has been changed from the default value.
+	apiPortChanged := flagsSet.Lookup("http-api-port").Changed
 
 	if apiPort == "" {
 		apiPort = "8080" // Default port if unset.
@@ -593,9 +698,27 @@ func run(command *cobra.Command, args []string) {
 		logrus.WithError(err).Fatal("Failed to get http-api-rate-limit flag")
 	}
 
+	// Validate if the configuration option has been changed from the default value.
+	apiRateLimitChanged := flagsSet.Lookup("http-api-rate-limit").Changed
+
+	// Set the API rate limit to the default value (60) if set to an invalid value.
 	if apiRateLimit <= 0 {
-		apiRateLimit = 60 // Default rate limit if invalid.
+		apiRateLimit = 60
 	}
+
+	checkAPITimeout, err := flagsSet.GetDuration("http-api-check-timeout")
+	if err != nil {
+		logrus.WithError(err).Fatal("Failed to get http-api-check-timeout flag")
+	}
+
+	checkAPITimeoutChanged := flagsSet.Lookup("http-api-check-timeout").Changed
+
+	updateAPITimeout, err := flagsSet.GetDuration("http-api-update-timeout")
+	if err != nil {
+		logrus.WithError(err).Fatal("Failed to get http-api-update-timeout flag")
+	}
+
+	updateAPITimeoutChanged := flagsSet.Lookup("http-api-update-timeout").Changed
 
 	// Handle health check mode as an early exit, preventing updates or API setup.
 	if healthCheck {
@@ -611,27 +734,47 @@ func run(command *cobra.Command, args []string) {
 
 	// Set configuration for core execution, encapsulating all operational parameters.
 	cfg := types.RunConfig{
-		Command:             command,
-		Names:               normalizedContainerNames,
-		Filter:              filter,
-		FilterDesc:          filterDesc,
-		RunOnce:             runOnce,
-		UpdateOnStart:       updateOnStart,
-		EnableUpdateAPI:     enableUpdateAPI,
-		EnableMetricsAPI:    enableMetricsAPI,
-		EnableContainersAPI: enableContainersAPI,
-		UnblockHTTPAPI:      unblockHTTPAPI,
-		NoStartupMessage:    noStartupMessage,
-		APIToken:            apiToken,
-		APIHost:             apiHost,
-		APIPort:             apiPort,
-		APIRateLimit:        apiRateLimit,
+		Command:                 command,
+		Names:                   normalizedContainerNames,
+		Filter:                  filter,
+		FilterDesc:              filterDesc,
+		RunOnce:                 runOnce,
+		UpdateOnStart:           updateOnStart,
+		TLSCertPath:             tlsCertPath,
+		TLSKeyPath:              tlsKeyPath,
+		CORSAllowedOrigins:      corsOrigins,
+		TrustedProxies:          trustedProxies,
+		ProxyHeader:             proxyHeader,
+		UnblockHTTPAPI:          unblockHTTPAPI,
+		NoStartupMessage:        noStartupMessage,
+		APIToken:                apiToken,
+		APIEventsToken:          apiEventsToken,
+		APIHost:                 apiHost,
+		APIHostChanged:          apiHostChanged,
+		APIPort:                 apiPort,
+		APIPortChanged:          apiPortChanged,
+		APIRateLimit:            apiRateLimit,
+		APIRateLimitChanged:     apiRateLimitChanged,
+		CheckAPITimeout:         checkAPITimeout,
+		CheckAPITimeoutChanged:  checkAPITimeoutChanged,
+		UpdateAPITimeout:        updateAPITimeout,
+		UpdateAPITimeoutChanged: updateAPITimeoutChanged,
+	}
+
+	// Set the HTTP API Endpoint configuration.
+	config.SetEndpointConfig(endpointSet, &cfg)
+
+	// Warn if HTTP API configuration options are set without an endpoint enabled.
+	if !httpAPIEndpointsEnabled(cfg) && anyHTTPAPIConfig(cfg) {
+		logrus.Warn(
+			"HTTP API configuration options are set, but no endpoints are enabled.",
+		)
 	}
 
 	// Execute core logic and exit with the returned status code (0 for success, 1 for failure).
 	if exitCode := runMain(cfg); exitCode != 0 {
 		logrus.WithField("exit_code", exitCode).Debug("Exiting with non-zero status")
-		os.Exit(exitCode)
+		logrus.Exit(exitCode)
 	}
 }
 
@@ -652,6 +795,17 @@ func runMain(cfg types.RunConfig) int {
 
 	// Validate flag compatibility to prevent conflicting operational modes.
 	if rollingRestart && monitorOnly {
+		setNoRestartPolicyCtx, cancel := context.WithTimeout(
+			context.Background(),
+			restartPolicyTimeout,
+		)
+		defer cancel()
+
+		client.SetNoRestartPolicy(
+			setNoRestartPolicyCtx,
+			currentWatchtowerContainer,
+		)
+
 		logrus.WithFields(logrus.Fields{
 			"rolling_restart": rollingRestart,
 			"monitor_only":    monitorOnly,
@@ -660,6 +814,10 @@ func runMain(cfg types.RunConfig) int {
 
 	// Ensure the Docker client is fully initialized before proceeding.
 	awaitDockerClient()
+
+	// Initialize the event broadcaster for SSE subscribers.
+	// Declared before runUpdatesWithNotifications so the closure can capture it.
+	eventsBroadcaster := events.NewBroadcaster()
 
 	// runUpdatesWithNotifications performs container updates and sends notifications about the results.
 	//
@@ -700,6 +858,7 @@ func runMain(cfg types.RunConfig) int {
 			SkipSelfUpdate:               params.SkipSelfUpdate,        // Skip Watchtower self-update
 			EphemeralSelfUpdate:          ephemeralSelfUpdate,          // Use ephemeral container for self-update
 			CooldownDelay:                cooldownDelay,                // Minimum time since image creation before allowing updates
+			EventBroadcaster:             eventsBroadcaster,            // Broadcaster for SSE event streaming
 		}
 
 		metric := actions.RunUpdatesWithNotifications(ctx, actionParams)
@@ -711,15 +870,32 @@ func runMain(cfg types.RunConfig) int {
 	// enabling graceful shutdown of the API, scheduler, and validation operations.
 	// The stop function is returned but not needed as the context automatically
 	// handles cleanup when the program exits.
-	ctx, stop := createSignalContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := createSignalContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
 	defer stop()
 
 	// If rolling restarts are enabled, validate that the containers being monitored for
 	// updates do not have linked dependencies.
 	if rollingRestart {
-		err := actions.ValidateRollingRestartDependencies(ctx, client, cfg.Filter, useComposeDependsOn)
+		err := actions.ValidateRollingRestartDependencies(
+			ctx,
+			client,
+			cfg.Filter, useComposeDependsOn,
+		)
 		if err != nil {
 			logNotify("Rolling restart compatibility validation failed", err)
+
+			// Update current Watchtower container's restart policy to "no" to prevent unwanted restarts
+			setNoRestartPolicyCtx, cancel := context.WithTimeout(
+				context.Background(),
+				restartPolicyTimeout,
+			)
+			defer cancel()
+
+			client.SetNoRestartPolicy(setNoRestartPolicyCtx, currentWatchtowerContainer)
 
 			return 1 // Exit immediately after logging failure
 		}
@@ -755,23 +931,13 @@ func runMain(cfg types.RunConfig) int {
 		notifier.Close()
 
 		// Update current Watchtower container's restart policy to "no" to prevent unwanted restarts
-		if currentWatchtowerContainer == nil {
-			logrus.Warn("Current container not available for restart policy update")
-		} else {
-			updateConfig := dockerContainer.UpdateConfig{
-				RestartPolicy: dockerContainer.RestartPolicy{
-					Name: "no",
-				},
-			}
+		setNoRestartPolicyCtx, cancel := context.WithTimeout(
+			context.Background(),
+			restartPolicyTimeout,
+		)
+		defer cancel()
 
-			err := client.UpdateContainer(ctx, currentWatchtowerContainer, updateConfig)
-			if err != nil {
-				logrus.WithError(err).
-					Warn("Failed to update restart policy to 'no' for current container")
-			} else {
-				logrus.Debug("Updated current container restart policy to 'no'")
-			}
-		}
+		client.SetNoRestartPolicy(setNoRestartPolicyCtx, currentWatchtowerContainer)
 
 		return 0 // Exit after successful execution
 	}
@@ -824,47 +990,96 @@ func runMain(cfg types.RunConfig) int {
 		logrus.Debug("Disabled update-on-start due to cleanup of old Watchtower containers")
 	}
 
-	// Configure and start the HTTP API, handling any startup errors.
+	// Determine whether self-update should be skipped because the running
+	// Watchtower container has published host ports. Docker cannot rebind
+	// an occupied port during container replacement. Ephemeral self-updates
+	// are exempt, because they remove the old container before creating the new
+	// one, so no port conflict occurs.
 	//
-	// Determine if self-update should be skipped due to host-bound port conflicts.
-	// Ephemeral self-updates are exempt because they remove the old container before
-	// creating the new one, avoiding port conflicts.
-	// This flag is passed to the API so the warning is emitted near the HTTP server startup message.
+	// Perform this check here rather than inside SetupAndStartAPI so the
+	// warning always appears, even when no HTTP API endpoints are enabled
+	// and SetupAndStartAPI returns early.
 	skipSelfUpdate := currentWatchtowerContainer != nil &&
 		currentWatchtowerContainer.HasExposedPorts() &&
 		!ephemeralSelfUpdate
+	if skipSelfUpdate {
+		logrus.Warn("Published port detected - self-updates disabled.")
+	}
 
 	err = api.SetupAndStartAPI(
 		ctx,
-		api.Options{
-			Host:                        cfg.APIHost,
-			Port:                        cfg.APIPort,
-			Token:                       cfg.APIToken,
-			RateLimit:                   cfg.APIRateLimit,
-			EnableUpdateAPI:             cfg.EnableUpdateAPI,
-			EnableMetricsAPI:            cfg.EnableMetricsAPI,
-			EnableContainersAPI:         cfg.EnableContainersAPI,
-			UnblockHTTPAPI:              cfg.UnblockHTTPAPI,
-			NoStartupMessage:            cfg.NoStartupMessage,
-			Filter:                      cfg.Filter,
-			Command:                     cfg.Command,
-			FilterDesc:                  cfg.FilterDesc,
-			UpdateLock:                  updateLock,
-			Cleanup:                     cleanup,
-			MonitorOnly:                 monitorOnly,
-			SkipSelfUpdate:              skipSelfUpdate,
-			Client:                      client,
-			Notifier:                    notifier,
-			Scope:                       scope,
-			Version:                     meta.Version,
-			RunUpdatesWithNotifications: runUpdatesWithNotifications,
-			FilterByImage:               filters.FilterByImage,
-			DefaultMetrics:              metrics.Default,
-			WriteStartupMessage:         logging.WriteStartupMessage,
+		config.Options{
+			Host:                         cfg.APIHost,
+			Port:                         cfg.APIPort,
+			Token:                        cfg.APIToken,
+			EventsToken:                  cfg.APIEventsToken,
+			RateLimit:                    cfg.APIRateLimit,
+			EnableCheckAPI:               cfg.EnableCheckAPI,
+			EnableConfigAPI:              cfg.EnableConfigAPI,
+			EnableContainersAPI:          cfg.EnableContainersAPI,
+			EnableEventsAPI:              cfg.EnableEventsAPI,
+			EnableHealthAPI:              cfg.EnableHealthAPI,
+			EnableHistoryAPI:             cfg.EnableHistoryAPI,
+			EnableImagesAPI:              cfg.EnableImagesAPI,
+			EnableMetricsAPI:             cfg.EnableMetricsAPI,
+			EnableSwaggerAPI:             cfg.EnableSwaggerAPI,
+			EnableUpdateAPI:              cfg.EnableUpdateAPI,
+			CheckTimeout:                 cfg.CheckAPITimeout,
+			UpdateTimeout:                cfg.UpdateAPITimeout,
+			TLSCertPath:                  cfg.TLSCertPath,
+			TLSKeyPath:                   cfg.TLSKeyPath,
+			CORSAllowedOrigins:           cfg.CORSAllowedOrigins,
+			TrustedProxies:               cfg.TrustedProxies,
+			ProxyHeader:                  cfg.ProxyHeader,
+			UnblockHTTPAPI:               cfg.UnblockHTTPAPI,
+			NoStartupMessage:             cfg.NoStartupMessage,
+			Filter:                       cfg.Filter,
+			Command:                      cfg.Command,
+			FilterDesc:                   cfg.FilterDesc,
+			UpdateLock:                   updateLock,
+			Cleanup:                      cleanup,
+			MonitorOnly:                  monitorOnly,
+			NoPull:                       noPull,
+			NoRestart:                    noRestart,
+			RollingRestart:               rollingRestart,
+			IncludeStopped:               includeStopped,
+			IncludeRestarting:            includeRestarting,
+			LifecycleHooks:               lifecycleHooks,
+			LabelEnable:                  enableLabel,
+			LabelPrecedence:              labelPrecedence,
+			CooldownDelay:                cooldownDelay,
+			SkipSelfUpdate:               skipSelfUpdate,
+			ReviveStopped:                reviveStopped,
+			UseComposeDependsOn:          useComposeDependsOn,
+			Client:                       client,
+			Notifier:                     notifier,
+			NotificationSplitByContainer: notificationSplitByContainer,
+			Scope:                        scope,
+			Version:                      meta.Version,
+			RunUpdatesWithNotifications:  runUpdatesWithNotifications,
+			FilterByImage:                filters.FilterByImage,
+			DefaultMetrics:               metrics.Default,
+			WriteStartupMessage:          logging.WriteStartupMessage,
+			EventBroadcaster:             eventsBroadcaster,
+			OnUnexpectedServerStop: func(listenErr error) {
+				logrus.WithError(listenErr).Error(
+					"Canceling process context after unexpected HTTP server stop",
+				)
+				stop()
+			},
 		},
 	)
 	if err != nil {
 		logNotify("API setup failed", err)
+
+		// Update current Watchtower container's restart policy to "no" to prevent unwanted restarts
+		setNoRestartPolicyCtx, cancel := context.WithTimeout(
+			context.Background(),
+			restartPolicyTimeout,
+		)
+		defer cancel()
+
+		client.SetNoRestartPolicy(setNoRestartPolicyCtx, currentWatchtowerContainer)
 
 		return 1 // Exit while indicating failure.
 	}
@@ -892,9 +1107,19 @@ func runMain(cfg types.RunConfig) int {
 		currentWatchtowerContainer,
 		startupMessageSent,
 		ephemeralSelfUpdate,
+		reviveStopped,
 	)
 	if err != nil {
 		logNotify("Scheduled upgrades failed", err)
+
+		// Update current Watchtower container's restart policy to "no" to prevent unwanted restarts
+		setNoRestartPolicyCtx, cancel := context.WithTimeout(
+			context.Background(),
+			restartPolicyTimeout,
+		)
+		defer cancel()
+
+		client.SetNoRestartPolicy(setNoRestartPolicyCtx, currentWatchtowerContainer)
 
 		return 1 // Exit while indicating failure.
 	}
@@ -929,4 +1154,80 @@ func awaitDockerClient() {
 		"Sleeping for a second to ensure the docker api client has been properly initialized.",
 	)
 	sleepFunc(1 * time.Second)
+}
+
+// resolveCurrentWatchtowerContainerForFallback resolves the current Watchtower container
+// for use in the orchestrator fallback path.
+//
+// It attempts to detect the current container ID and retrieve the container object,
+// returning nil if any step fails.
+//
+// Parameters:
+//   - ctx: Context for cancellation and timeouts.
+//   - c: Container client for Docker API operations.
+//
+// Returns:
+//   - types.Container: The resolved Watchtower container, or nil if detection fails.
+func resolveCurrentWatchtowerContainerForFallback(ctx context.Context, c container.Client) types.Container {
+	lookupCtx, cancel := context.WithTimeout(ctx, containerLookupTimeout)
+	defer cancel()
+
+	containerID, err := container.GetCurrentContainerID(lookupCtx, c)
+	if err == nil && containerID != "" {
+		resolvedContainer, _ := c.GetCurrentWatchtowerContainer(lookupCtx, containerID)
+
+		return resolvedContainer
+	}
+
+	return nil
+}
+
+// validateAPIHost ensures http-api-host is empty (all interfaces) or a valid IP.
+//
+// Parameters:
+//   - host: Value of the http-api-host flag.
+//
+// Returns:
+//   - error: Non-nil when host is a non-empty non-IP string (e.g. a hostname).
+func validateAPIHost(host string) error {
+	if host == "" {
+		return nil
+	}
+
+	if net.ParseIP(host) == nil {
+		return fmt.Errorf("%w: %q", errInvalidAPIHost, host)
+	}
+
+	return nil
+}
+
+// anyHTTPAPIConfig reports whether any HTTP API-related settings are present
+// without enabled endpoints, so operators can be warned about a no-op config.
+func anyHTTPAPIConfig(cfg types.RunConfig) bool {
+	return cfg.APIToken != "" ||
+		cfg.APIEventsToken != "" ||
+		cfg.TLSCertPath != "" ||
+		cfg.TLSKeyPath != "" ||
+		len(cfg.CORSAllowedOrigins) > 0 ||
+		len(cfg.TrustedProxies) > 0 ||
+		cfg.ProxyHeader != "" ||
+		cfg.APIHostChanged ||
+		cfg.APIPortChanged ||
+		cfg.APIRateLimitChanged ||
+		cfg.CheckAPITimeoutChanged ||
+		cfg.UpdateAPITimeoutChanged
+}
+
+// httpAPIEndpointsEnabled reports whether any HTTP API endpoint is enabled.
+func httpAPIEndpointsEnabled(cfg types.RunConfig) bool {
+	return cfg.EnableUpdateAPI ||
+		cfg.EnableMetricsAPI ||
+		cfg.EnableContainersAPI ||
+		cfg.EnableCheckAPI ||
+		cfg.EnableSwaggerAPI ||
+		cfg.EnableHealthAPI ||
+		cfg.EnableHistoryAPI ||
+		cfg.EnableImagesAPI ||
+		cfg.EnableConfigAPI ||
+		cfg.EnableEventsAPI
 }

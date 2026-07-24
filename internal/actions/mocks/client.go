@@ -31,9 +31,15 @@ type TestData struct {
 	TriedToRemoveImageCount      atomic.Int32                          // Number of times RemoveImageByID was called.
 	RenameContainerCount         atomic.Int32                          // Number of times RenameContainer was called.
 	StopContainerCount           atomic.Int32                          // Number of times StopContainer was called.
+	StopAndRemoveContainerCount  atomic.Int32                          // Number of times StopAndRemoveContainer was called.
 	StartContainerCount          atomic.Int32                          // Number of times StartContainer was called.
 	CreateContainerCount         atomic.Int32                          // Number of times CreateContainer was called.
+	LastStopAndRemoveID          types.ContainerID                     // ID of the last container passed to StopAndRemoveContainer.
+	LastCreatedContainerID       types.ContainerID                     // ID returned by the last successful CreateContainer call.
+	LastRenameTarget             string                                // Last new name passed to RenameContainer.
+	RenameTargets                []string                              // Ordered list of rename targets.
 	UpdateContainerCount         atomic.Int32                          // Number of times UpdateContainer was called.
+	SetNoRestartPolicyCount      atomic.Int32                          // Number of times SetNoRestartPolicy was called.
 	IsContainerStaleCount        atomic.Int32                          // Number of times IsContainerStale was called.
 	WaitForContainerHealthyCount atomic.Int32                          // Number of times WaitForContainerHealthy was called.
 	ListContainersCount          atomic.Int32                          // Number of times ListContainers was called.
@@ -56,7 +62,9 @@ type TestData struct {
 	StartOrder                   []string                              // Order in which containers were started.
 	SimulatedLatency             time.Duration                         // Simulated latency for operations (default 0 for fast tests, set for context cancellation tests).
 	LastContainerChain           string                                // Last container chain passed to CreateEphemeralOrchestrator.
-	LastUpdateConfig             *dockerContainer.UpdateConfig          // Last UpdateContainer config received.
+	LastUpdateConfig             *dockerContainer.UpdateConfig         // Last UpdateContainer config received.
+	SetNoRestartPolicyContainer  types.Container                        // Last container passed to SetNoRestartPolicy.
+	SetNoRestartPolicyCtx        context.Context                        // Last context passed to SetNoRestartPolicy.
 }
 
 // TriedToRemoveImage checks if RemoveImageByID has been invoked.
@@ -186,6 +194,9 @@ func (client MockClient) StopContainer(ctx context.Context, c types.Container, _
 // StopAndRemoveContainer simulates stopping and removing a container by calling StopContainer followed by RemoveContainer.
 // It properly simulates the stop-and-remove operation sequence while respecting error conditions.
 func (client MockClient) StopAndRemoveContainer(ctx context.Context, c types.Container, timeout time.Duration) error {
+	client.TestData.StopAndRemoveContainerCount.Add(1)
+	client.TestData.LastStopAndRemoveID = c.ID()
+
 	err := client.StopContainer(ctx, c, timeout)
 	if err != nil {
 		return err
@@ -204,6 +215,8 @@ func (client MockClient) IsContainerRunning(c types.Container) bool {
 // configuration without starting it.
 // It provides a minimal implementation for testing purposes.
 // Returns the configured CreateContainerError if set.
+// On success it returns a distinct container ID so callers can distinguish the
+// new instance from the source (required for self-update failure cleanup tests).
 func (client MockClient) CreateContainer(ctx context.Context, c types.Container) (types.ContainerID, error) {
 	client.TestData.CreateContainerCount.Add(1)
 
@@ -217,7 +230,24 @@ func (client MockClient) CreateContainer(ctx context.Context, c types.Container)
 
 	client.TestData.CreateOrder = append(client.TestData.CreateOrder, c.Name())
 
-	return c.ID(), nil
+	newID := types.ContainerID(string(c.ID()) + "-recreated")
+	client.TestData.LastCreatedContainerID = newID
+
+	// Register a lookup entry so GetContainer(newID) succeeds for cleanup paths.
+	if client.TestData.ContainersByID == nil {
+		client.TestData.ContainersByID = make(map[types.ContainerID]types.Container)
+	}
+
+	if _, exists := client.TestData.ContainersByID[newID]; !exists {
+		client.TestData.ContainersByID[newID] = CreateMockContainer(
+			string(newID),
+			c.Name(),
+			c.ImageName(),
+			time.Now(),
+		)
+	}
+
+	return newID, nil
 }
 
 // StartContainer simulates starting a container, returning the container's ID.
@@ -258,8 +288,10 @@ func (client MockClient) StartContainerByID(ctx context.Context, containerID typ
 
 // RenameContainer simulates renaming a container, incrementing the RenameContainerCount.
 // It returns nil to indicate success without modifying any state.
-func (client MockClient) RenameContainer(ctx context.Context, _ types.Container, _ string) error {
+func (client MockClient) RenameContainer(ctx context.Context, _ types.Container, newName string) error {
 	client.TestData.RenameContainerCount.Add(1)
+	client.TestData.LastRenameTarget = newName
+	client.TestData.RenameTargets = append(client.TestData.RenameTargets, newName)
 
 	if err := client.checkContextCancellation(ctx); err != nil {
 		return err
@@ -279,6 +311,14 @@ func (client MockClient) UpdateContainer(ctx context.Context, _ types.Container,
 	}
 
 	return client.TestData.UpdateContainerError
+}
+
+// SetNoRestartPolicy simulates setting a container's restart policy to "no".
+// It increments the SetNoRestartPolicyCount and records the container and context for test assertions.
+func (client MockClient) SetNoRestartPolicy(ctx context.Context, container types.Container) {
+	client.TestData.SetNoRestartPolicyCount.Add(1)
+	client.TestData.SetNoRestartPolicyContainer = container
+	client.TestData.SetNoRestartPolicyCtx = ctx
 }
 
 // RemoveImageByID increments the count of image removal attempts in TestData.
@@ -365,16 +405,16 @@ func (client MockClient) IsContainerStale(
 	ctx context.Context,
 	container types.Container,
 	_ types.UpdateParams,
-) (bool, types.ImageID, error) {
+) (bool, types.ImageID, string, error) {
 	client.TestData.IsContainerStaleCount.Add(1)
 
 	if err := client.checkContextCancellation(ctx); err != nil {
-		return false, "", err
+		return false, "", "", err
 	}
 
 	// Return configured error if set (for testing error conditions)
 	if client.TestData.IsContainerStaleError != nil {
-		return false, "", client.TestData.IsContainerStaleError
+		return false, "", "", client.TestData.IsContainerStaleError
 	}
 
 	stale, found := client.TestData.Staleness[container.Name()]
@@ -382,7 +422,16 @@ func (client MockClient) IsContainerStale(
 		stale = true // Default to stale if not specified.
 	}
 
-	return stale, "", nil
+	return stale, "", "", nil
+}
+
+// CheckContainerUpdate reports update availability using the same staleness map as IsContainerStale.
+func (client MockClient) CheckContainerUpdate(
+	ctx context.Context,
+	container types.Container,
+	params types.UpdateParams,
+) (bool, types.ImageID, string, error) {
+	return client.IsContainerStale(ctx, container, params)
 }
 
 // WarnOnHeadPullFailed always returns true for the mock client.
@@ -443,4 +492,9 @@ func (client MockClient) GetInfo(ctx context.Context) (map[string]any, error) {
 		"ServerVersion": "1.50",
 		"OSType":        "linux",
 	}, nil
+}
+
+// Ping returns nil to simulate a healthy Docker daemon.
+func (client MockClient) Ping(ctx context.Context) error {
+	return client.checkContextCancellation(ctx)
 }
