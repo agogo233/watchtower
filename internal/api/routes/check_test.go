@@ -4,15 +4,13 @@ import (
 	"context"
 	"net/http"
 	"testing"
-	"time"
 
-	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/nicholas-fedor/watchtower/internal/api/config"
 	"github.com/nicholas-fedor/watchtower/internal/api/handlers/events"
+	"github.com/nicholas-fedor/watchtower/internal/logging"
 	"github.com/nicholas-fedor/watchtower/internal/metrics"
-	"github.com/nicholas-fedor/watchtower/pkg/container"
 	mockContainer "github.com/nicholas-fedor/watchtower/pkg/container/mocks"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
@@ -43,9 +41,10 @@ func TestRegisterCheckRoute(t *testing.T) {
 		mockClient := mockContainer.NewMockClient(t)
 
 		opts := config.Options{
-			EnableCheckAPI: true,
-			Client:         mockClient,
-			FilterByImage:  func(_ []string, f types.Filter) types.Filter { return f },
+			EnableCheckAPI:   true,
+			Client:           mockClient,
+			FilterByImage:    func(_ []string, f types.Filter) types.Filter { return f },
+			EventBroadcaster: events.NewBroadcaster(),
 		}
 
 		registerCheckRoute(app, auth, opts)
@@ -103,7 +102,7 @@ func TestRegisterUpdateRoute_WriteStartupMessage(t *testing.T) {
 		},
 		FilterByImage:  func(_ []string, f types.Filter) types.Filter { return f },
 		DefaultMetrics: func() *metrics.Metrics { return testMetrics },
-		WriteStartupMessage: func(_ *cobra.Command, _ time.Time, _, _ string, _ container.Client, _ types.Notifier, _ string, _ *bool) {
+		WriteStartupMessage: func(_ logging.StartupParams) {
 		},
 	}
 

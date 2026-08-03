@@ -6,14 +6,15 @@
   Automate Docker container image updates
   <br/><br/>
 
+  [![All Contributors](https://img.shields.io/github/all-contributors/nicholas-fedor/watchtower)](#contributors)
   [![CircleCI](https://dl.circleci.com/status-badge/img/gh/nicholas-fedor/watchtower/tree/main.svg?style=shield)](https://dl.circleci.com/status-badge/redirect/gh/nicholas-fedor/watchtower/tree/main)
   [![codecov](https://codecov.io/gh/nicholas-fedor/watchtower/branch/main/graph/badge.svg)](https://codecov.io/gh/nicholas-fedor/watchtower)
-  [![GoDoc](https://godoc.org/github.com/nicholas-fedor/watchtower?status.svg)](https://godoc.org/github.com/nicholas-fedor/watchtower)
-  [![latest version](https://img.shields.io/github/tag/nicholas-fedor/watchtower.svg)](https://github.com/nicholas-fedor/watchtower/releases)
-  [![Apache-2.0 License](https://img.shields.io/github/license/nicholas-fedor/watchtower.svg)](https://www.apache.org/licenses/LICENSE-2.0)
   [![Codacy Badge](https://app.codacy.com/project/badge/Grade/1c48cfb7646d4009aa8c6f71287670b8)](https://www.codacy.com/gh/nicholas-fedor/watchtower/dashboard?utm_source=github.com&amp;utm_medium=referral&amp;utm_content=nicholas-fedor/watchtower&amp;utm_campaign=Badge_Grade)
-  [![All Contributors](https://img.shields.io/github/all-contributors/nicholas-fedor/watchtower)](#contributors)
   [![Pulls from DockerHub](https://img.shields.io/docker/pulls/nickfedor/watchtower.svg)](https://hub.docker.com/r/nickfedor/watchtower)
+  [![GoDoc](https://godoc.org/github.com/nicholas-fedor/watchtower?status.svg)](https://godoc.org/github.com/nicholas-fedor/watchtower)
+  [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/nicholas-fedor/watchtower)
+  [![Apache-2.0 License](https://img.shields.io/github/license/nicholas-fedor/watchtower.svg)](https://www.apache.org/licenses/LICENSE-2.0)
+  [![latest version](https://img.shields.io/github/tag/nicholas-fedor/watchtower.svg)](https://github.com/nicholas-fedor/watchtower/releases)
 
 </div>
 
@@ -51,15 +52,6 @@ Watchtower supports the following architectures for its Docker images:
 
 The full documentation is available at <https://watchtower.nickfedor.com/>.
 
-## Star History
-
-<a href="https://www.star-history.com/?type=timeline&logscale=&legend=top-left&repos=nicholas-fedor%2Fwatchtower">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=nicholas-fedor/watchtower&type=timeline&theme=dark&logscale&legend=top-left&sealed_token=psoQA5TipWC1du5poc_YGImqILCN0FiZccvjEEFxLhVS0YlPr7Ur79tUc-gAfaOoQuQBhG0uA4rkmJc_H2nWZPnnfs6Fq1Z9jeWvALffxz0H7YHaCRgcruDl9IAZfnk583p-dw8eADmTsMTnK6t8ANgDLXxFd3mM-R3Y_8_HYOe35IQc3FgUkdYQJG1_" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=nicholas-fedor/watchtower&type=timeline&logscale&legend=top-left&sealed_token=psoQA5TipWC1du5poc_YGImqILCN0FiZccvjEEFxLhVS0YlPr7Ur79tUc-gAfaOoQuQBhG0uA4rkmJc_H2nWZPnnfs6Fq1Z9jeWvALffxz0H7YHaCRgcruDl9IAZfnk583p-dw8eADmTsMTnK6t8ANgDLXxFd3mM-R3Y_8_HYOe35IQc3FgUkdYQJG1_" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=nicholas-fedor/watchtower&type=timeline&logscale&legend=top-left&sealed_token=psoQA5TipWC1du5poc_YGImqILCN0FiZccvjEEFxLhVS0YlPr7Ur79tUc-gAfaOoQuQBhG0uA4rkmJc_H2nWZPnnfs6Fq1Z9jeWvALffxz0H7YHaCRgcruDl9IAZfnk583p-dw8eADmTsMTnK6t8ANgDLXxFd3mM-R3Y_8_HYOe35IQc3FgUkdYQJG1_" />
- </picture>
-</a>
 <!-- markdownlint-restore -->
 
 ## Contributors

@@ -8,8 +8,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Emit SSE events for the HTTP API check endpoint by @nicholas-fedor in [#2066](https://github.com/nicholas-fedor/watchtower/pull/2066)
+
 ### Chores
 
+- Update github.com/google/pprof digest to ef3492d by @renovate[bot] in [#2084](https://github.com/nicholas-fedor/watchtower/pull/2084)
+- Update github.com/google/pprof digest to 5106ece by @renovate[bot] in [#2080](https://github.com/nicholas-fedor/watchtower/pull/2080)
+- Update module github.com/docker/cli to v29.7.1+incompatible by @renovate[bot] in [#2076](https://github.com/nicholas-fedor/watchtower/pull/2076)
+- Update module github.com/docker/cli to v29.7.0+incompatible by @renovate[bot] in [#2073](https://github.com/nicholas-fedor/watchtower/pull/2073)
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.35 by @renovate[bot] in [#2071](https://github.com/nicholas-fedor/watchtower/pull/2071)
+- Update module github.com/gofiber/contrib/v3/swaggo to v1.0.9 by @renovate[bot] in [#2070](https://github.com/nicholas-fedor/watchtower/pull/2070)
+- Update github/codeql-action action to v4.37.4 by @renovate[bot] in [#2068](https://github.com/nicholas-fedor/watchtower/pull/2068)
+- Update docker/login-action action to v4.6.0 by @renovate[bot] in [#2064](https://github.com/nicholas-fedor/watchtower/pull/2064)
+- Update module github.com/gofiber/utils/v2 to v2.4.1 by @renovate[bot] in [#2063](https://github.com/nicholas-fedor/watchtower/pull/2063)
+
+### Fixed
+
+- Prevent repeated self-updates when host ports are published by @nicholas-fedor in [#2079](https://github.com/nicholas-fedor/watchtower/pull/2079)
+
+### Removed
+
+- Remove star history chart by @nicholas-fedor in [#2082](https://github.com/nicholas-fedor/watchtower/pull/2082)
+
+## [1.20.2] - 2026-07-28
+
+### Changed
+
+- Update badges by @nicholas-fedor in [#2037](https://github.com/nicholas-fedor/watchtower/pull/2037)
+- Centralize watchtower configuration management by @nicholas-fedor in [#2035](https://github.com/nicholas-fedor/watchtower/pull/2035)
+
+### Chores
+
+- Update module github.com/nicholas-fedor/shoutrrr to v0.16.3 by @renovate[bot] in [#2058](https://github.com/nicholas-fedor/watchtower/pull/2058)
+- Update docker/login-action action to v4.5.2 by @renovate[bot] in [#2056](https://github.com/nicholas-fedor/watchtower/pull/2056)
+- Update module github.com/moby/moby/client to v0.5.1 by @renovate[bot] in [#2051](https://github.com/nicholas-fedor/watchtower/pull/2051)
+- Update go-openapi packages to v0.28.0 by @renovate[bot] in [#2052](https://github.com/nicholas-fedor/watchtower/pull/2052)
+- Update module github.com/docker/go-connections to v0.8.1 by @renovate[bot] in [#2049](https://github.com/nicholas-fedor/watchtower/pull/2049)
+- Update module github.com/valyala/fasthttp to v1.73.0 by @renovate[bot] in [#2047](https://github.com/nicholas-fedor/watchtower/pull/2047)
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.34 by @renovate[bot] in [#2044](https://github.com/nicholas-fedor/watchtower/pull/2044)
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.33 by @renovate[bot] in [#2042](https://github.com/nicholas-fedor/watchtower/pull/2042)
+- Update module go.yaml.in/yaml/v3 to v3.0.5 by @renovate[bot] in [#2039](https://github.com/nicholas-fedor/watchtower/pull/2039)
+- Update module github.com/docker/go-connections to v0.8.0 by @renovate[bot] in [#2033](https://github.com/nicholas-fedor/watchtower/pull/2033)
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.32 by @renovate[bot] in [#2027](https://github.com/nicholas-fedor/watchtower/pull/2027)
+- Update docker/login-action action to v4.5.1 by @renovate[bot] in [#2026](https://github.com/nicholas-fedor/watchtower/pull/2026)
+- Update module github.com/prometheus/client_golang to v1.24.1 by @renovate[bot] in [#2022](https://github.com/nicholas-fedor/watchtower/pull/2022)
 - Update nicholas-fedor/go-proxy-pull-action action to v1.1.31 by @renovate[bot] in [#2019](https://github.com/nicholas-fedor/watchtower/pull/2019)
 - Update module github.com/gofiber/utils/v2 to v2.4.0 by @renovate[bot] in [#2017](https://github.com/nicholas-fedor/watchtower/pull/2017)
 - Update ossf/scorecard-action action to v2.4.4 by @renovate[bot] in [#2016](https://github.com/nicholas-fedor/watchtower/pull/2016)
@@ -20,6 +64,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Mark slice flags as changed after docker secret expansion by @nicholas-fedor in [#2060](https://github.com/nicholas-fedor/watchtower/pull/2060)
+- Address command execution bugs and update migration docs by @nicholas-fedor in [#2054](https://github.com/nicholas-fedor/watchtower/pull/2054)
+- Ensure SSE stream lifecycle properly unsubscribes broadcaster by @nicholas-fedor in [#2050](https://github.com/nicholas-fedor/watchtower/pull/2050)
+- Honor UseComposeDependsOn on scheduled update runs by @nicholas-fedor in [#2031](https://github.com/nicholas-fedor/watchtower/pull/2031)
 - Harden self-update failure and cancel recovery by @nicholas-fedor in [#2005](https://github.com/nicholas-fedor/watchtower/pull/2005)
 - Clean up failed recreates and nil host config by @nicholas-fedor in [#2004](https://github.com/nicholas-fedor/watchtower/pull/2004)
 - Prefer config auth and accept identity tokens by @nicholas-fedor in [#2002](https://github.com/nicholas-fedor/watchtower/pull/2002)
@@ -3329,7 +3377,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Compare Releases
 
-- [unreleased](https://github.com/nicholas-fedor/watchtower/compare/v1.20.1...HEAD)
+- [unreleased](https://github.com/nicholas-fedor/watchtower/compare/v1.20.2...HEAD)
+- [1.20.2](https://github.com/nicholas-fedor/watchtower/compare/v1.20.1...v1.20.2)
 - [1.20.1](https://github.com/nicholas-fedor/watchtower/compare/v1.20.0...v1.20.1)
 - [1.20.0](https://github.com/nicholas-fedor/watchtower/compare/v1.19.0...v1.20.0)
 - [1.19.0](https://github.com/nicholas-fedor/watchtower/compare/v1.18.1...v1.19.0)
