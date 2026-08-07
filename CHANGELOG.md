@@ -8,12 +8,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Chores
+
+- Update module github.com/klauspost/compress to v1.19.2 by @renovate[bot] in [#2116](https://github.com/nicholas-fedor/watchtower/pull/2116)
+- Update dependency python to v3.14.7 by @renovate[bot] in [#2112](https://github.com/nicholas-fedor/watchtower/pull/2112)
+- Update step-security/harden-runner action to v2.20.1 by @renovate[bot] in [#2102](https://github.com/nicholas-fedor/watchtower/pull/2102)
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.39 by @renovate[bot] in [#2101](https://github.com/nicholas-fedor/watchtower/pull/2101)
+
+### Fixed
+
+- Recover orphaned Watchtower containers on startup by @nicholas-fedor in [#2110](https://github.com/nicholas-fedor/watchtower/pull/2110)
+- Remove orphaned Watchtower containers stuck in created state by @nicholas-fedor in [#2109](https://github.com/nicholas-fedor/watchtower/pull/2109)
+- Increase create/start timeout and use fresh contexts for recovery by @nicholas-fedor in [#2108](https://github.com/nicholas-fedor/watchtower/pull/2108)
+- Clear engine-generated MACs on container recreation by @nicholas-fedor in [#2106](https://github.com/nicholas-fedor/watchtower/pull/2106)
+
+## [1.20.3] - 2026-08-05
+
 ### Changed
 
 - Emit SSE events for the HTTP API check endpoint by @nicholas-fedor in [#2066](https://github.com/nicholas-fedor/watchtower/pull/2066)
 
 ### Chores
 
+- Update module github.com/nicholas-fedor/shoutrrr to v0.17.0 by @renovate[bot] in [#2099](https://github.com/nicholas-fedor/watchtower/pull/2099)
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.38 by @renovate[bot] in [#2098](https://github.com/nicholas-fedor/watchtower/pull/2098)
+- Update module go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp to v0.70.0 by @renovate[bot] in [#2096](https://github.com/nicholas-fedor/watchtower/pull/2096)
+- Update github/codeql-action action to v4.37.6 by @renovate[bot] in [#2094](https://github.com/nicholas-fedor/watchtower/pull/2094)
+- Update opentelemetry-go monorepo to v1.45.0 by @renovate[bot] in [#2091](https://github.com/nicholas-fedor/watchtower/pull/2091)
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.37 by @renovate[bot] in [#2089](https://github.com/nicholas-fedor/watchtower/pull/2089)
+- Update github/codeql-action action to v4.37.5 by @renovate[bot] in [#2088](https://github.com/nicholas-fedor/watchtower/pull/2088)
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.36 by @renovate[bot] in [#2086](https://github.com/nicholas-fedor/watchtower/pull/2086)
 - Update github.com/google/pprof digest to ef3492d by @renovate[bot] in [#2084](https://github.com/nicholas-fedor/watchtower/pull/2084)
 - Update github.com/google/pprof digest to 5106ece by @renovate[bot] in [#2080](https://github.com/nicholas-fedor/watchtower/pull/2080)
 - Update module github.com/docker/cli to v29.7.1+incompatible by @renovate[bot] in [#2076](https://github.com/nicholas-fedor/watchtower/pull/2076)
@@ -3377,7 +3401,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Compare Releases
 
-- [unreleased](https://github.com/nicholas-fedor/watchtower/compare/v1.20.2...HEAD)
+- [unreleased](https://github.com/nicholas-fedor/watchtower/compare/v1.20.3...HEAD)
+- [1.20.3](https://github.com/nicholas-fedor/watchtower/compare/v1.20.2...v1.20.3)
 - [1.20.2](https://github.com/nicholas-fedor/watchtower/compare/v1.20.1...v1.20.2)
 - [1.20.1](https://github.com/nicholas-fedor/watchtower/compare/v1.20.0...v1.20.1)
 - [1.20.0](https://github.com/nicholas-fedor/watchtower/compare/v1.19.0...v1.20.0)

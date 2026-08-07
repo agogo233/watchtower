@@ -35,7 +35,126 @@ const (
 	// defaultRestartPolicyTimeout defines the fallback timeout for restart policy
 	// updates when config.Timeout is non-positive.
 	defaultRestartPolicyTimeout = 30 * time.Second
+
+	// defaultCreateStartTimeout defines the minimum timeout for container create
+	// and start operations during restart. It guards against slow hosts where
+	// Docker API calls can exceed the default 30s restart policy timeout.
+	defaultCreateStartTimeout = 5 * time.Minute
 )
+
+// isRecoverableOrphan determines whether a container is a recoverable orphaned
+// Watchtower instance. It excludes the current container, old-container names,
+// non-Watchtower containers, containers that are not in the created state, and
+// containers from a different scope.
+//
+// Parameters:
+//   - c: Candidate container to evaluate.
+//   - currentContainer: The current running container to exclude.
+//   - currentScope: Normalized scope of the current container ("none" when unset).
+//
+// Returns:
+//   - bool: True if the candidate is a recoverable orphan, false otherwise.
+func isRecoverableOrphan(
+	c types.Container,
+	currentContainer types.Container,
+	currentScope string,
+) bool {
+	if !c.IsWatchtower() {
+		return false
+	}
+
+	if c.ID() == currentContainer.ID() {
+		return false
+	}
+
+	if container.IsOldContainer(c.Name()) {
+		return false
+	}
+
+	if !c.IsCreated() {
+		return false
+	}
+
+	candidateScope, candidateHasScope := c.Scope()
+	if !candidateHasScope || candidateScope == "" {
+		candidateScope = "none"
+	}
+
+	if candidateScope != currentScope {
+		return false
+	}
+
+	return true
+}
+
+// TryRecoverOrphanedContainer attempts to start an orphaned Watchtower container
+// that is stuck in the Docker "created" state. This can happen when a self-update
+// creates a replacement container but fails to start it, leaving the old container
+// running and the new container never started.
+//
+// It lists all containers, filters for Watchtower containers in the created state
+// that are not the current container, and attempts to start the first match.
+//
+// Parameters:
+//   - ctx: Context for cancellation and timeouts.
+//   - client: Container client for Docker API operations.
+//   - currentContainer: The current running container to exclude from recovery.
+//
+// Returns:
+//   - types.Container: The recovered container if successful, nil otherwise.
+//   - bool: True if a container was found and started, false otherwise.
+func TryRecoverOrphanedContainer(
+	ctx context.Context,
+	client container.Client,
+	currentContainer types.Container,
+) (types.Container, bool) {
+	if currentContainer == nil {
+		return nil, false
+	}
+
+	allContainers, err := client.ListContainers(ctx, filters.NoFilter)
+	if err != nil {
+		logrus.WithError(err).
+			Debug("Failed to list containers for orphaned Watchtower recovery")
+
+		return nil, false
+	}
+
+	currentScope, currentHasScope := currentContainer.Scope()
+	if !currentHasScope || currentScope == "" {
+		currentScope = "none"
+	}
+
+	for _, c := range allContainers {
+		if !isRecoverableOrphan(c, currentContainer, currentScope) {
+			continue
+		}
+
+		logrus.WithFields(logrus.Fields{
+			"container_id":   c.ID(),
+			"container_name": c.Name(),
+		}).Info("Attempting to recover orphaned Watchtower container")
+
+		err := client.StartContainerByID(ctx, c.ID())
+		if err != nil {
+			logrus.WithError(err).WithFields(logrus.Fields{
+				"container_id":   c.ID(),
+				"container_name": c.Name(),
+			}).Debug("Failed to start orphaned Watchtower container")
+
+			continue
+		}
+
+		logrus.WithFields(logrus.Fields{
+			"container_id":   c.ID(),
+			"container_name": c.Name(),
+		}).Info("Successfully recovered orphaned Watchtower container")
+
+		return c, true
+	}
+
+	return nil, false
+}
 
 // Update scans and updates containers based on parameters.
 //
@@ -92,13 +211,30 @@ func Update(
 					logrus.WithField("container", c.Name()).
 						Debug("Current container is an old Watchtower container, stopping self")
 
+					recoverCtx, recoverCancel := context.WithTimeout(
+						context.Background(),
+						restartPolicyTimeout(config.Timeout),
+					)
+					defer recoverCancel()
+
+					//nolint:contextcheck // recoverCtx is intentionally created with timeout and passed to recovery
+					recoveredContainer, recovered := TryRecoverOrphanedContainer(
+						recoverCtx,
+						client,
+						c,
+					)
+					if recovered {
+						logrus.WithField("container", recoveredContainer.Name()).
+							Info("Recovered orphaned Watchtower container, exiting old instance")
+					}
+
 					setNoRestartCtx, setNoRestartCancel := context.WithTimeout(
 						context.Background(),
 						restartPolicyTimeout(config.Timeout),
 					)
 					defer setNoRestartCancel()
 
-					//nolint:contextcheck // Using bounded context to survive caller cancellation
+					//nolint:contextcheck // setNoRestartCtx is intentionally used for restart policy update
 					client.SetNoRestartPolicy(setNoRestartCtx, c)
 
 					return nil, nil, errOldSelfDetected
@@ -1820,10 +1956,14 @@ func restartStaleContainer(
 	// Create a detached context to survive parent context cancellation.
 	// This ensures container cleanup and update operations complete even if the
 	// parent context is canceled during the restart process.
-	// A finite fallback is applied when config.Timeout is non-positive.
+	// A finite fallback is applied when config.Timeout is non-positive, and the
+	// create/start phase uses at least defaultCreateStartTimeout to accommodate
+	// slow hosts.
+	detachedTimeout := max(restartPolicyTimeout(config.Timeout), defaultCreateStartTimeout)
+
 	detachedCtx, cancelDetached := context.WithTimeout(
 		context.Background(),
-		restartPolicyTimeout(config.Timeout),
+		detachedTimeout,
 	)
 
 	defer cancelDetached()
@@ -1952,10 +2092,19 @@ func restartStaleContainer(
 
 		// Restore the original name so the running instance is not left only as
 		// watchtower-old-* with the canonical name free and unused.
+		// Use a fresh context here: detachedCtx may already be expired if the
+		// create call hit the timeout, and we do not want recovery to fail for
+		// the same reason.
 		if renamed && originalWatchtowerName != "" && sourceContainer.IsWatchtower() {
-			//nolint:contextcheck // Using detached context intentionally to survive parent cancellation
+			renameBackCtx, renameBackCancel := context.WithTimeout(
+				context.Background(),
+				restartPolicyTimeout(config.Timeout),
+			)
+			defer renameBackCancel()
+
+			//nolint:contextcheck // fresh context is intentional for recovery after timeout
 			renameBackErr := client.RenameContainer(
-				detachedCtx,
+				renameBackCtx,
 				sourceContainer,
 				originalWatchtowerName,
 			)
@@ -1996,25 +2145,33 @@ func restartStaleContainer(
 				WithError(err).
 				Debug("Failed to start container")
 
-				// On start failure after a Watchtower rename, remove only the newly
-			// created container. The renamed source still holds the running process
-			// and must remain so the host keeps a Watchtower instance.
+				// On start failure after a Watchtower rename, remove the failed replacement
+			// container only. The renamed source still holds the running process and must
+			// remain so the host keeps a Watchtower instance.
+			// Use a fresh context because detachedCtx may already be expired if the start
+			// call hit the timeout and we do not want cleanup to fail for the same reason.
 			if renamed && sourceContainer.IsWatchtower() {
 				logrus.WithFields(fields).
 					WithField("new_id", newContainerID.ShortID()).
 					Debug("Cleaning up failed Watchtower container")
 
-				//nolint:contextcheck // Using detached context intentionally to survive parent cancellation
-				failedNew, getErr := client.GetContainer(detachedCtx, newContainerID)
+				cleanupCtx, cleanupCancel := context.WithTimeout(
+					context.Background(),
+					restartPolicyTimeout(config.Timeout),
+				)
+				defer cleanupCancel()
+
+				//nolint:contextcheck // fresh context is intentional for cleanup after timeout
+				failedNew, getErr := client.GetContainer(cleanupCtx, newContainerID)
 				if getErr != nil {
 					logrus.WithError(getErr).
 						WithFields(fields).
 						WithField("new_id", newContainerID.ShortID()).
 						Debug("Failed to inspect failed Watchtower container for cleanup")
 				} else {
-					//nolint:contextcheck // Using detached context intentionally to survive parent cancellation
+					//nolint:contextcheck // fresh context is intentional for cleanup after timeout
 					cleanupErr := client.StopAndRemoveContainer(
-						detachedCtx,
+						cleanupCtx,
 						failedNew,
 						config.Timeout,
 					)
