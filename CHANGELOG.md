@@ -8,8 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Replace logrus with zerolog by @nicholas-fedor in [#2128](https://github.com/nicholas-fedor/watchtower/pull/2128)
+
 ### Chores
 
+- Update module github.com/gofiber/schema to v1.8.4 by @renovate[bot] in [#2138](https://github.com/nicholas-fedor/watchtower/pull/2138)
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.42 by @renovate[bot] in [#2134](https://github.com/nicholas-fedor/watchtower/pull/2134)
+- Update module github.com/onsi/ginkgo/v2 to v2.32.1 by @renovate[bot] in [#2133](https://github.com/nicholas-fedor/watchtower/pull/2133)
+- Update module golang.org/x/mod to v0.39.0 by @renovate[bot] in [#2131](https://github.com/nicholas-fedor/watchtower/pull/2131)
+- Update module google.golang.org/protobuf to v1.36.12 by @renovate[bot] in [#2129](https://github.com/nicholas-fedor/watchtower/pull/2129)
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.41 by @renovate[bot] in [#2126](https://github.com/nicholas-fedor/watchtower/pull/2126)
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.40 by @renovate[bot] in [#2121](https://github.com/nicholas-fedor/watchtower/pull/2121)
+- Update actions/attest-build-provenance action to v4.2.2 by @renovate[bot] in [#2120](https://github.com/nicholas-fedor/watchtower/pull/2120)
+- Update module github.com/docker/cli to v29.7.2+incompatible by @renovate[bot] in [#2118](https://github.com/nicholas-fedor/watchtower/pull/2118)
 - Update module github.com/klauspost/compress to v1.19.2 by @renovate[bot] in [#2116](https://github.com/nicholas-fedor/watchtower/pull/2116)
 - Update dependency python to v3.14.7 by @renovate[bot] in [#2112](https://github.com/nicholas-fedor/watchtower/pull/2112)
 - Update step-security/harden-runner action to v2.20.1 by @renovate[bot] in [#2102](https://github.com/nicholas-fedor/watchtower/pull/2102)
@@ -17,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Respect label-enable setting for container details by @nicholas-fedor in [#2137](https://github.com/nicholas-fedor/watchtower/pull/2137)
+- Validate required fields and standardize error messages by @nicholas-fedor in [#2124](https://github.com/nicholas-fedor/watchtower/pull/2124)
 - Recover orphaned Watchtower containers on startup by @nicholas-fedor in [#2110](https://github.com/nicholas-fedor/watchtower/pull/2110)
 - Remove orphaned Watchtower containers stuck in created state by @nicholas-fedor in [#2109](https://github.com/nicholas-fedor/watchtower/pull/2109)
 - Increase create/start timeout and use fresh contexts for recovery by @nicholas-fedor in [#2108](https://github.com/nicholas-fedor/watchtower/pull/2108)
