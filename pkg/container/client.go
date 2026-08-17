@@ -41,6 +41,9 @@ const (
 	// maxListRetries is the maximum number of retry attempts for transient Docker
 	// connection failures when listing containers.
 	maxListRetries = 3
+
+	// maxExecOutputSize is the maximum captured exec stdout/stderr size (1 MiB).
+	maxExecOutputSize = 1 << 20
 )
 
 // baseListRetryDelay is the base delay for exponential backoff between retries.
@@ -614,6 +617,14 @@ func (c *client) GetContainer(ctx context.Context, containerID types.ContainerID
 		return nil, err
 	}
 
+	if !container.HasImageInfo() {
+		c.logger().Warn().
+			Str("container", container.Name()).
+			Str("container_id", string(containerID)).
+			Str("image", container.ImageName()).
+			Msg("Failed to retrieve image info")
+	}
+
 	c.logger().Debug().
 		Str("container_id", string(containerID)).
 		Msg("Retrieved container details")
@@ -691,6 +702,10 @@ func (c *client) StopContainer(ctx context.Context, container types.Container, t
 }
 
 // StopAndRemoveContainer stops and removes a specified container.
+//
+// AutoRemove containers that were running are left for Docker to delete after
+// stop. Non-running AutoRemove containers are removed explicitly so the name
+// is available for recreation.
 //
 // Parameters:
 //   - ctx: Context for cancellation and timeout control.
@@ -1765,13 +1780,18 @@ func (c *client) captureExecOutput(ctx context.Context, execID string) (string, 
 
 	defer response.Close()
 
-	// Read output into a buffer with timeout.
+	// Read output into a buffer with timeout and a size cap.
 	var writer bytes.Buffer
 
 	done := make(chan error, 1)
 
 	go func() {
-		_, err := io.Copy(&writer, response.Reader)
+		_, err := io.Copy(
+			&writer,
+			io.LimitReader(
+				response.Reader,
+				maxExecOutputSize,
+			))
 		done <- err
 	}()
 

@@ -8,12 +8,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add JSON porcelain output format by @nicholas-fedor in [#2158](https://github.com/nicholas-fedor/watchtower/pull/2158)
+
 ### Changed
 
+- Extract a standalone preview module by @nicholas-fedor in [#2154](https://github.com/nicholas-fedor/watchtower/pull/2154)
+- Reduce scan-cycle memory allocations by @nicholas-fedor in [#2152](https://github.com/nicholas-fedor/watchtower/pull/2152)
 - Replace logrus with zerolog by @nicholas-fedor in [#2128](https://github.com/nicholas-fedor/watchtower/pull/2128)
 
 ### Chores
 
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.46 by @renovate[bot] in [#2184](https://github.com/nicholas-fedor/watchtower/pull/2184)
+- Update golang:alpine3.24 docker digest to 3889b42 by @renovate[bot] in [#2181](https://github.com/nicholas-fedor/watchtower/pull/2181)
+- Update golang:1.26.6-alpine docker digest to 3889b42 by @renovate[bot] in [#2180](https://github.com/nicholas-fedor/watchtower/pull/2180)
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.45 by @renovate[bot] in [#2178](https://github.com/nicholas-fedor/watchtower/pull/2178)
+- Update step-security/harden-runner action to v2.21.0 by @renovate[bot] in [#2174](https://github.com/nicholas-fedor/watchtower/pull/2174)
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.44 by @renovate[bot] in [#2173](https://github.com/nicholas-fedor/watchtower/pull/2173)
+- Update cimg/go docker tag to v1.26.6 by @renovate[bot] in [#2171](https://github.com/nicholas-fedor/watchtower/pull/2171)
+- Update module golang.org/x/tools to v0.49.0 by @renovate[bot] in [#2170](https://github.com/nicholas-fedor/watchtower/pull/2170)
+- Update module golang.org/x/mod to v0.40.0 by @renovate[bot] in [#2169](https://github.com/nicholas-fedor/watchtower/pull/2169)
+- Update nicholas-fedor/go-proxy-pull-action action to v1.1.43 by @renovate[bot] in [#2167](https://github.com/nicholas-fedor/watchtower/pull/2167)
+- Update golang docker tag to v1.26.6 by @renovate[bot] in [#2166](https://github.com/nicholas-fedor/watchtower/pull/2166)
+- Update go module directive to v1.26.6 by @renovate[bot] in [#2163](https://github.com/nicholas-fedor/watchtower/pull/2163)
+- Update golang:alpine3.24 docker digest to 70b4654 by @renovate[bot] in [#2162](https://github.com/nicholas-fedor/watchtower/pull/2162)
+- Update module github.com/sirupsen/logrus to v1.10.0 by @renovate[bot] in [#2160](https://github.com/nicholas-fedor/watchtower/pull/2160)
+- Update github/codeql-action action to v4.37.7 by @renovate[bot] in [#2159](https://github.com/nicholas-fedor/watchtower/pull/2159)
+- Update module github.com/gofiber/fiber/v3 to v3.5.0 by @renovate[bot] in [#2156](https://github.com/nicholas-fedor/watchtower/pull/2156)
+- Update module golang.org/x/net to v0.58.0 by @renovate[bot] in [#2150](https://github.com/nicholas-fedor/watchtower/pull/2150)
+- Update docker/dockerfile:1 docker digest to ecfaec9 by @renovate[bot] in [#2148](https://github.com/nicholas-fedor/watchtower/pull/2148)
+- Update module golang.org/x/text to v0.41.0 by @renovate[bot] in [#2143](https://github.com/nicholas-fedor/watchtower/pull/2143)
+- Update module golang.org/x/crypto to v0.55.0 by @renovate[bot] in [#2142](https://github.com/nicholas-fedor/watchtower/pull/2142)
 - Update module github.com/gofiber/schema to v1.8.4 by @renovate[bot] in [#2138](https://github.com/nicholas-fedor/watchtower/pull/2138)
 - Update nicholas-fedor/go-proxy-pull-action action to v1.1.42 by @renovate[bot] in [#2134](https://github.com/nicholas-fedor/watchtower/pull/2134)
 - Update module github.com/onsi/ginkgo/v2 to v2.32.1 by @renovate[bot] in [#2133](https://github.com/nicholas-fedor/watchtower/pull/2133)
@@ -30,12 +56,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Only warn about missing image info for monitored containers by @ncrosty58 in [#2140](https://github.com/nicholas-fedor/watchtower/pull/2140)
+- Remove redundant type field from deprecation warnings by @nicholas-fedor in [#2146](https://github.com/nicholas-fedor/watchtower/pull/2146)
+- Remove non-running AutoRemove containers explicitly by @nicholas-fedor in [#2141](https://github.com/nicholas-fedor/watchtower/pull/2141)
 - Respect label-enable setting for container details by @nicholas-fedor in [#2137](https://github.com/nicholas-fedor/watchtower/pull/2137)
 - Validate required fields and standardize error messages by @nicholas-fedor in [#2124](https://github.com/nicholas-fedor/watchtower/pull/2124)
 - Recover orphaned Watchtower containers on startup by @nicholas-fedor in [#2110](https://github.com/nicholas-fedor/watchtower/pull/2110)
 - Remove orphaned Watchtower containers stuck in created state by @nicholas-fedor in [#2109](https://github.com/nicholas-fedor/watchtower/pull/2109)
 - Increase create/start timeout and use fresh contexts for recovery by @nicholas-fedor in [#2108](https://github.com/nicholas-fedor/watchtower/pull/2108)
 - Clear engine-generated MACs on container recreation by @nicholas-fedor in [#2106](https://github.com/nicholas-fedor/watchtower/pull/2106)
+
+### New Contributors
+
+- @ncrosty58 made their first contribution in [#2140](https://github.com/nicholas-fedor/watchtower/pull/2140)
 
 ## [1.20.3] - 2026-08-05
 

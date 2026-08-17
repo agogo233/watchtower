@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -203,20 +205,36 @@ var _ = ginkgo.Describe("the client", func() {
 		})
 
 		ginkgo.When("stopping a container with AutoRemove enabled", func() {
-			ginkgo.It("should skip removal after stopping", func() {
-				// Create a mock container with AutoRemove enabled.
+			ginkgo.It("should skip removal after stopping a running container", func() {
 				mockedContainer := MockContainer(
 					WithContainerState(dockerContainer.State{Running: true}),
 					WithAutoRemove(true),
 				)
 				cid := mockedContainer.ContainerInfo().ID
-				// Set up mock server handler for stop only (no remove call expected).
 				mockServer.AppendHandlers(
 					StopContainerHandler(cid, mockContainer.Found),
 				)
-				// Execute StopAndRemoveContainer and verify no error occurs.
+
 				err := (&client{log: testLog(), api: docker}).StopAndRemoveContainer(context.Background(), mockedContainer, time.Second)
 				gomega.Expect(err).ToNot(gomega.HaveOccurred())
+				// API version ping + stop. No DELETE. Docker AutoRemove handles cleanup after stop.
+				gomega.Expect(mockServer.ReceivedRequests()).To(gomega.HaveLen(2))
+			})
+
+			ginkgo.It("should remove a non-running AutoRemove container explicitly", func() {
+				mockedContainer := MockContainer(
+					WithContainerState(dockerContainer.State{Running: false, Status: "created"}),
+					WithAutoRemove(true),
+				)
+				cid := mockedContainer.ContainerInfo().ID
+				mockServer.AppendHandlers(
+					mockContainer.RemoveContainerHandler(cid, mockContainer.Found),
+				)
+
+				err := (&client{log: testLog(), api: docker}).StopAndRemoveContainer(context.Background(), mockedContainer, time.Second)
+				gomega.Expect(err).ToNot(gomega.HaveOccurred())
+				// API version ping + DELETE. AutoRemove does not apply to never-started containers.
+				gomega.Expect(mockServer.ReceivedRequests()).To(gomega.HaveLen(2))
 			})
 		})
 	})
@@ -513,6 +531,34 @@ var _ = ginkgo.Describe("the client", func() {
 				gomega.Expect(err).NotTo(gomega.HaveOccurred())
 				// Should return empty since no container can be both "portainer" and "watchtower-running" named
 				gomega.Expect(containers).To(gomega.BeEmpty())
+			})
+		})
+
+		ginkgo.When(`the image of a container cannot be inspected`, func() {
+			ginkgo.It("should warn, naming the container and its image", func() {
+				// GetContainer is only reached for containers already being acted
+				// upon, so missing image metadata is worth a warning here even
+				// though GetSourceContainer logs it at debug level.
+				mockServer.AppendHandlers(missingImageHandlers(testContainerID)...)
+
+				log, logBuf := captureLog(zerolog.WarnLevel)
+				client := &client{
+					api:           docker,
+					log:           log,
+					ClientOptions: ClientOptions{},
+				}
+
+				container, err := client.GetContainer(
+					context.Background(),
+					types.ContainerID(testContainerID),
+				)
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				gomega.Expect(container.HasImageInfo()).To(gomega.BeFalse())
+
+				logged := string(logBuf.Contents())
+				gomega.Expect(logged).To(gomega.ContainSubstring("Failed to retrieve image info"))
+				gomega.Expect(logged).To(gomega.ContainSubstring("test-container"))
+				gomega.Expect(logged).To(gomega.ContainSubstring("test-image:latest"))
 			})
 		})
 
@@ -1240,6 +1286,48 @@ var _ = ginkgo.Describe("the client", func() {
 
 			_, err := client.captureExecOutput(ctx, "exec-id")
 			gomega.Expect(err).To(gomega.HaveOccurred())
+		})
+
+		ginkgo.It("should truncate output that exceeds the size cap", func() {
+			mockServer.AppendHandlers(ghttp.CombineHandlers(
+				ghttp.VerifyRequest("POST", gomega.MatchRegexp(`^/v[0-9.]+/exec/exec-id/start$`)),
+				func(writer http.ResponseWriter, req *http.Request) {
+					_, _ = io.Copy(io.Discard, req.Body)
+
+					hijacker, ok := writer.(http.Hijacker)
+					gomega.Expect(ok).To(gomega.BeTrue())
+
+					conn, bufWriter, err := hijacker.Hijack()
+					gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+					defer conn.Close()
+
+					_, _ = bufWriter.WriteString("HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n")
+					_, _ = bufWriter.WriteString(strings.Repeat("x", maxExecOutputSize+4096))
+					_ = bufWriter.Flush()
+
+					if tcpConn, ok := conn.(*net.TCPConn); ok {
+						_ = tcpConn.CloseWrite()
+					}
+				},
+			))
+
+			// ExecAttach hijacks the TCP connection. The suite client uses an http://
+			// host, which the Docker dialer cannot hijack. Use tcp:// against the same
+			// ghttp server.
+			serverURL, err := url.Parse(mockServer.URL())
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+			hijackClient, err := dockerClient.New(
+				dockerClient.WithHost("tcp://"+serverURL.Host),
+				dockerClient.WithHTTPClient(mockServer.HTTPTestServer.Client()),
+			)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+			client := &client{log: testLog(), api: hijackClient}
+			out, err := client.captureExecOutput(context.Background(), "exec-id")
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(out).To(gomega.HaveLen(maxExecOutputSize))
 		})
 	})
 

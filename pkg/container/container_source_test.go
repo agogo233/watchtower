@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/netip"
+	"testing"
 	"time"
 
+	"github.com/moby/moby/api/types/storage"
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 	"github.com/onsi/gomega/gbytes"
@@ -15,10 +17,12 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
 
+	dockerspec "github.com/moby/docker-image-spec/specs-go/v1"
 	dockerContainer "github.com/moby/moby/api/types/container"
 	dockerImage "github.com/moby/moby/api/types/image"
 	dockerNetwork "github.com/moby/moby/api/types/network"
 	dockerClient "github.com/moby/moby/client"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/nicholas-fedor/watchtower/pkg/filters"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
@@ -214,6 +218,51 @@ var _ = ginkgo.Describe("ListSourceContainers", func() {
 			)
 			gomega.Expect(err).ToNot(gomega.HaveOccurred())
 			gomega.Expect(containers).To(gomega.BeEmpty())
+		})
+	})
+
+	ginkgo.When("image inspection fails", func() {
+		ginkgo.It("should not warn for containers excluded by the filter", func() {
+			mockServer.AppendHandlers(verifyFilters([]string{"running"}))
+			mockServer.AppendHandlers(missingImageHandlers(testContainerID)...)
+
+			log, logBuf := captureLog(zerolog.WarnLevel)
+			excludeAll := filters.FilterByDisableNames(
+				log,
+				[]string{"test-container"},
+				filters.NoFilter,
+			)
+
+			containers, err := ListSourceContainers(log, context.Background(),
+				docker,
+				ClientOptions{},
+				excludeAll,
+			)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			gomega.Expect(containers).To(gomega.BeEmpty())
+			gomega.Expect(string(logBuf.Contents())).
+				ToNot(gomega.ContainSubstring("Failed to retrieve image info"))
+		})
+
+		ginkgo.It("should warn for containers that pass the filter", func() {
+			mockServer.AppendHandlers(verifyFilters([]string{"running"}))
+			mockServer.AppendHandlers(missingImageHandlers(testContainerID)...)
+
+			log, logBuf := captureLog(zerolog.WarnLevel)
+
+			containers, err := ListSourceContainers(log, context.Background(),
+				docker,
+				ClientOptions{},
+				nil,
+			)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			gomega.Expect(containers).To(gomega.HaveLen(1))
+
+			logged := string(logBuf.Contents())
+			gomega.Expect(logged).To(gomega.ContainSubstring("Failed to retrieve image info"))
+			// The warning must identify the container by name and image, not just by ID.
+			gomega.Expect(logged).To(gomega.ContainSubstring("test-container"))
+			gomega.Expect(logged).To(gomega.ContainSubstring("test-image:latest"))
 		})
 	})
 })
@@ -738,7 +787,7 @@ var _ = ginkgo.Describe("StopAndRemoveSourceContainer", func() {
 	})
 
 	ginkgo.When("container has AutoRemove enabled", func() {
-		ginkgo.It("should stop but skip removal", func() {
+		ginkgo.It("should stop but skip removal when running", func() {
 			container := MockContainer(
 				WithContainerState(dockerContainer.State{Running: true}),
 				WithAutoRemove(true),
@@ -762,7 +811,38 @@ var _ = ginkgo.Describe("StopAndRemoveSourceContainer", func() {
 				true,
 			)
 			gomega.Expect(err).ToNot(gomega.HaveOccurred())
-			// Should not have made a DELETE request since AutoRemove is true
+			// API version ping + stop. No DELETE. Docker AutoRemove handles cleanup after stop.
+			gomega.Expect(mockServer.ReceivedRequests()).To(gomega.HaveLen(2))
+		})
+
+		ginkgo.It("should remove explicitly when not running", func() {
+			container := MockContainer(
+				WithContainerState(dockerContainer.State{Running: false, Status: "created"}),
+				WithAutoRemove(true),
+			)
+			cid := container.ContainerInfo().ID
+
+			mockServer.AppendHandlers(
+				ghttp.CombineHandlers(
+					ghttp.VerifyRequest(
+						"DELETE",
+						gomega.MatchRegexp(fmt.Sprintf("^/v[0-9.]+/containers/%s$", cid)),
+					),
+					func(w http.ResponseWriter, r *http.Request) {
+						gomega.Expect(r.URL.Query().Get("force")).To(gomega.Equal("1"))
+						w.WriteHeader(http.StatusNoContent)
+					},
+				),
+			)
+
+			err := StopAndRemoveSourceContainer(testLog(), context.Background(),
+				docker,
+				container,
+				10*time.Second,
+				false,
+			)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			// API version ping + DELETE. AutoRemove does not apply to never-started containers.
 			gomega.Expect(mockServer.ReceivedRequests()).To(gomega.HaveLen(2))
 		})
 	})
@@ -2757,4 +2837,60 @@ func getStatusFilterKeys(f dockerClient.Filters) []string {
 	}
 
 	return keys
+}
+
+func TestCloneImageInspect_IsolatesMutations(t *testing.T) {
+	t.Parallel()
+
+	src := &dockerImage.InspectResponse{
+		ID:          "sha256:abc",
+		RepoDigests: []string{"app@sha256:abc"},
+		RepoTags:    []string{"app:latest"},
+		Config: &dockerspec.DockerOCIImageConfig{
+			ImageConfig: ocispec.ImageConfig{
+				Env:        []string{"PATH=/usr/bin"},
+				Cmd:        []string{"app"},
+				Entrypoint: []string{"/bin/sh"},
+				Labels:     map[string]string{"app": "web"},
+				Volumes:    map[string]struct{}{"/data": {}},
+				ExposedPorts: map[string]struct{}{
+					"80/tcp": {},
+				},
+			},
+			DockerOCIImageConfigExt: dockerspec.DockerOCIImageConfigExt{
+				Healthcheck: &dockerspec.HealthcheckConfig{Test: []string{"CMD", "true"}},
+			},
+		},
+		GraphDriver: &storage.DriverData{
+			Name: "overlay2",
+			Data: map[string]string{"MergedDir": "/var/lib/docker/overlay2/abc"},
+		},
+	}
+
+	cloned := cloneImageInspect(src)
+	require.NotNil(t, cloned)
+	require.NotSame(t, src, cloned)
+
+	cloned.RepoDigests[0] = "app@sha256:mutated"
+	cloned.RepoTags = append(cloned.RepoTags, "app:dev")
+	cloned.Config.Env[0] = "PATH=/mutated"
+	cloned.Config.Cmd[0] = "mutated"
+	cloned.Config.Entrypoint[0] = "/bin/mutated"
+	cloned.Config.Labels["app"] = "mutated"
+	cloned.Config.Volumes["/tmp"] = struct{}{}
+	delete(cloned.Config.ExposedPorts, "80/tcp")
+	cloned.Config.Healthcheck.Test[0] = "NONE"
+	cloned.GraphDriver.Data["MergedDir"] = "/mutated"
+
+	require.Equal(t, []string{"app@sha256:abc"}, src.RepoDigests)
+	require.Equal(t, []string{"app:latest"}, src.RepoTags)
+	require.Equal(t, []string{"PATH=/usr/bin"}, src.Config.Env)
+	require.Equal(t, []string{"app"}, src.Config.Cmd)
+	require.Equal(t, []string{"/bin/sh"}, src.Config.Entrypoint)
+	require.Equal(t, map[string]string{"app": "web"}, src.Config.Labels)
+	require.Equal(t, map[string]struct{}{"/data": {}}, src.Config.Volumes)
+	require.Equal(t, map[string]struct{}{"80/tcp": {}}, src.Config.ExposedPorts)
+	require.Equal(t, []string{"CMD", "true"}, src.Config.Healthcheck.Test)
+	require.Equal(t, "/var/lib/docker/overlay2/abc", src.GraphDriver.Data["MergedDir"])
+	require.Nil(t, cloneImageInspect(nil))
 }
