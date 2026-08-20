@@ -10,6 +10,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add ncrosty58 as a contributor for code by @allcontributors[bot] in [#2194](https://github.com/nicholas-fedor/watchtower/pull/2194)
+- Add llc1123 as a contributor for code by @allcontributors[bot] in [#2193](https://github.com/nicholas-fedor/watchtower/pull/2193)
+
+### Chores
+
+- Update golang:alpine3.24 docker digest to 4c9fe60 by @renovate[bot] in [#2201](https://github.com/nicholas-fedor/watchtower/pull/2201)
+- Update cimg/go docker tag to v1.26.7 by @renovate[bot] in [#2199](https://github.com/nicholas-fedor/watchtower/pull/2199)
+- Update golang:alpine3.24 docker digest to 28d89ee by @renovate[bot] in [#2198](https://github.com/nicholas-fedor/watchtower/pull/2198)
+- Update docker/setup-buildx-action action to v4.3.0 by @renovate[bot] in [#2196](https://github.com/nicholas-fedor/watchtower/pull/2196)
+- Update module github.com/sirupsen/logrus to v1.10.1 by @renovate[bot] in [#2195](https://github.com/nicholas-fedor/watchtower/pull/2195)
+
+## [1.21.0] - 2026-08-18
+
+### Added
+
 - Add JSON porcelain output format by @nicholas-fedor in [#2158](https://github.com/nicholas-fedor/watchtower/pull/2158)
 
 ### Changed
@@ -20,6 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Chores
 
+- Update module github.com/nicholas-fedor/shoutrrr to v0.17.1 by @renovate[bot] in [#2191](https://github.com/nicholas-fedor/watchtower/pull/2191)
+- Update module github.com/stretchr/testify to v1.12.0 by @renovate[bot] in [#2185](https://github.com/nicholas-fedor/watchtower/pull/2185)
 - Update nicholas-fedor/go-proxy-pull-action action to v1.1.46 by @renovate[bot] in [#2184](https://github.com/nicholas-fedor/watchtower/pull/2184)
 - Update golang:alpine3.24 docker digest to 3889b42 by @renovate[bot] in [#2181](https://github.com/nicholas-fedor/watchtower/pull/2181)
 - Update golang:1.26.6-alpine docker digest to 3889b42 by @renovate[bot] in [#2180](https://github.com/nicholas-fedor/watchtower/pull/2180)
@@ -56,6 +73,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Support cleanup flag in ephemeral self-update orchestrator by @nicholas-fedor in [#2189](https://github.com/nicholas-fedor/watchtower/pull/2189)
+- Handle registry 429 rate limits with backoff and token bucket by @nicholas-fedor in [#2187](https://github.com/nicholas-fedor/watchtower/pull/2187)
 - Only warn about missing image info for monitored containers by @ncrosty58 in [#2140](https://github.com/nicholas-fedor/watchtower/pull/2140)
 - Remove redundant type field from deprecation warnings by @nicholas-fedor in [#2146](https://github.com/nicholas-fedor/watchtower/pull/2146)
 - Remove non-running AutoRemove containers explicitly by @nicholas-fedor in [#2141](https://github.com/nicholas-fedor/watchtower/pull/2141)
@@ -3449,7 +3468,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Compare Releases
 
-- [unreleased](https://github.com/nicholas-fedor/watchtower/compare/v1.20.3...HEAD)
+- [unreleased](https://github.com/nicholas-fedor/watchtower/compare/v1.21.0...HEAD)
+- [1.21.0](https://github.com/nicholas-fedor/watchtower/compare/v1.20.3...v1.21.0)
 - [1.20.3](https://github.com/nicholas-fedor/watchtower/compare/v1.20.2...v1.20.3)
 - [1.20.2](https://github.com/nicholas-fedor/watchtower/compare/v1.20.1...v1.20.2)
 - [1.20.1](https://github.com/nicholas-fedor/watchtower/compare/v1.20.0...v1.20.1)
