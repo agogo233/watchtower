@@ -57,7 +57,7 @@ var _ = ginkgo.Describe("the client", func() {
 		containerKnown := MockContainer(WithImageName("docker.io/prefix/imagename:latest"))
 
 		ginkgo.When(`warn on head failure is set to "always"`, func() {
-			c := &client{ClientOptions: ClientOptions{WarnOnHeadFailed: WarnAlways}}
+			c := &client{WarnOnHeadFailed: WarnAlways}
 
 			ginkgo.It("should always return true", func() {
 				gomega.Expect(c.WarnOnHeadPullFailed(containerUnknown)).To(gomega.BeTrue())
@@ -65,7 +65,7 @@ var _ = ginkgo.Describe("the client", func() {
 			})
 		})
 		ginkgo.When(`warn on head failure is set to "auto"`, func() {
-			c := &client{ClientOptions: ClientOptions{WarnOnHeadFailed: WarnAuto}}
+			c := &client{WarnOnHeadFailed: WarnAuto}
 
 			ginkgo.It("should return false for unknown repos", func() {
 				gomega.Expect(c.WarnOnHeadPullFailed(containerUnknown)).To(gomega.BeFalse())
@@ -75,7 +75,7 @@ var _ = ginkgo.Describe("the client", func() {
 			})
 		})
 		ginkgo.When(`warn on head failure is set to "never"`, func() {
-			c := &client{ClientOptions: ClientOptions{WarnOnHeadFailed: WarnNever}}
+			c := &client{WarnOnHeadFailed: WarnNever}
 
 			ginkgo.It("should never return true", func() {
 				gomega.Expect(c.WarnOnHeadPullFailed(containerUnknown)).To(gomega.BeFalse())
@@ -601,17 +601,20 @@ var _ = ginkgo.Describe("the client", func() {
 			})
 		})
 		ginkgo.Describe("RemoveImageByID", func() {
-			ginkgo.It("should return context.Canceled error", func() {
+			ginkgo.It("should return context.Canceled error without warning", func() {
 				imageID := util.GenerateRandomSHA256()
 
 				// Create a canceled context
 				ctx, cancel := context.WithCancel(context.Background())
 				cancel() // Cancel immediately
 
-				c := &client{log: testLog(), api: mockClient}
+				log, logbuf := captureLog(zerolog.WarnLevel)
+				c := &client{log: log, api: mockClient}
 
 				err := c.RemoveImageByID(ctx, types.ImageID(imageID), "test-image")
 				gomega.Expect(err).To(gomega.MatchError(context.Canceled))
+				gomega.Expect(string(logbuf.Contents())).
+					NotTo(gomega.ContainSubstring("Failed to list containers for image usage check"))
 			})
 		})
 	})

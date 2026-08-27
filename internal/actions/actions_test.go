@@ -894,7 +894,7 @@ var _ = ginkgo.Describe("Actions", func() {
 	ginkgo.Describe("performImageCleanup", func() {
 		ginkgo.It("should return empty slice when cleanup is disabled", func() {
 			client := mockActions.CreateMockClient(&mockActions.TestData{}, false, false)
-			cleanedImages := performImageCleanup(testLogger(), context.Background(), client, false, []types.RemovedImageInfo{})
+			cleanedImages := performImageCleanup(testLogger(), context.Background(), client, false, []types.RemovedImageInfo{}, 0)
 			gomega.Expect(cleanedImages).To(gomega.BeEmpty())
 		})
 
@@ -906,7 +906,7 @@ var _ = ginkgo.Describe("Actions", func() {
 					ImageName:     "test-image:v1.0",
 					ImageID:       types.ImageID("sha256:123"),
 				},
-			})
+			}, 0)
 			// The function should return the cleaned images when cleanup is enabled
 			gomega.Expect(cleanedImages).To(gomega.HaveLen(1))
 			gomega.Expect(cleanedImages[0].ContainerName).To(gomega.Equal("test-container"))
@@ -914,9 +914,25 @@ var _ = ginkgo.Describe("Actions", func() {
 
 		ginkgo.It("should return a valid slice when cleanup input is empty", func() {
 			client := mockActions.CreateMockClient(&mockActions.TestData{}, false, false)
-			cleanedImages := performImageCleanup(testLogger(), context.Background(), client, true, []types.RemovedImageInfo{})
+			cleanedImages := performImageCleanup(testLogger(), context.Background(), client, true, []types.RemovedImageInfo{}, 0)
 			// Should return a valid slice even with empty input
 			gomega.Expect(cleanedImages).NotTo(gomega.BeNil())
+		})
+
+		ginkgo.It("should still remove images when the parent context is already canceled", func() {
+			client := mockActions.CreateMockClient(&mockActions.TestData{}, false, false)
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+
+			cleanedImages := performImageCleanup(testLogger(), ctx, client, true, []types.RemovedImageInfo{
+				{
+					ContainerName: "test-container",
+					ImageName:     "test-image:v1.0",
+					ImageID:       types.ImageID("sha256:123"),
+				},
+			}, 0)
+			gomega.Expect(cleanedImages).To(gomega.HaveLen(1))
+			gomega.Expect(client.TestData.TriedToRemoveImageCount.Load()).To(gomega.Equal(int32(1)))
 		})
 	})
 
@@ -986,6 +1002,41 @@ var _ = ginkgo.Describe("Actions", func() {
 				found = true
 
 				gomega.Expect(entry["notify"]).To(gomega.Equal("no"))
+			}
+
+			gomega.Expect(found).To(gomega.BeTrue())
+		})
+
+		ginkgo.It("should log skipped count on the session completion line", func() {
+			mockReport := mockTypes.NewMockReport(ginkgo.GinkgoT())
+			skippedA := mockTypes.NewMockContainerReport(ginkgo.GinkgoT())
+			skippedB := mockTypes.NewMockContainerReport(ginkgo.GinkgoT())
+
+			mockReport.EXPECT().Scanned().Return(make([]types.ContainerReport, 23))
+			mockReport.EXPECT().Updated().Return([]types.ContainerReport{})
+			mockReport.EXPECT().Failed().Return([]types.ContainerReport{})
+			mockReport.EXPECT().Restarted().Return([]types.ContainerReport{})
+			mockReport.EXPECT().Skipped().Return([]types.ContainerReport{skippedA, skippedB})
+
+			log, buf := newCaptureLogger()
+			metric := generateAndLogMetric(log, mockReport)
+
+			gomega.Expect(metric.Skipped).To(gomega.Equal(2))
+			gomega.Expect(metric.Scanned).To(gomega.Equal(23))
+
+			var found bool
+
+			for _, entry := range parseJSONLogEntries(buf) {
+				if entry["message"] != "Update session completed" {
+					continue
+				}
+
+				found = true
+
+				gomega.Expect(entry["skipped"]).To(gomega.BeEquivalentTo(2))
+				gomega.Expect(entry["scanned"]).To(gomega.BeEquivalentTo(23))
+				gomega.Expect(entry["updated"]).To(gomega.BeEquivalentTo(0))
+				gomega.Expect(entry["failed"]).To(gomega.BeEquivalentTo(0))
 			}
 
 			gomega.Expect(found).To(gomega.BeTrue())
