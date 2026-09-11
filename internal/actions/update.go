@@ -20,6 +20,7 @@ import (
 	"github.com/nicholas-fedor/watchtower/pkg/container"
 	"github.com/nicholas-fedor/watchtower/pkg/filters"
 	"github.com/nicholas-fedor/watchtower/pkg/lifecycle"
+	"github.com/nicholas-fedor/watchtower/pkg/registry/ratelimit"
 	"github.com/nicholas-fedor/watchtower/pkg/session"
 	"github.com/nicholas-fedor/watchtower/pkg/sorter"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
@@ -525,7 +526,11 @@ func Update(log *zerolog.Logger, ctx context.Context,
 					parallelStaleCheckFailed++
 				}
 
-				progress.AddSkipped(log, sourceContainer, checkErr, config)
+				if ratelimit.Is(checkErr) {
+					progress.AddFailed(log, sourceContainer, checkErr, config)
+				} else {
+					progress.AddSkipped(log, sourceContainer, checkErr, config)
+				}
 
 				// Restore rich cooldown metadata for reports/notifications (preserves the
 				// structured CooldownAge/Delay/Remaining/Passed fields that the removed
@@ -851,11 +856,12 @@ func UpdateImplicitRestart(log *zerolog.Logger, allContainers,
 	byID := make(map[types.ContainerID]types.Container, len(allContainers))
 
 	// Key restart tracking by the canonical identifier (ResolveContainerIdentifier)
-	// so that links produced by c.Links() can be matched directly. We also record
-	// the bare .Name() as an alias to improve exact-match resilience across
-	// different naming conventions (explicit container_name vs. Compose defaults,
-	// with or without replica suffixes).
-	restartByIdentifier := make(map[string]bool, len(allContainers)+len(allContainers))
+	// so that links produced by c.Links() can be matched directly. Also record
+	// the bare Name() and the Docker ID. Inspect stores network_mode as
+	// container:<id> until list rewrite turns that into a name.
+	const restartIndexCapacityFactor = 3
+
+	restartByIdentifier := make(map[string]bool, len(allContainers)*restartIndexCapacityFactor)
 
 	for _, c := range allContainers {
 		byID[c.ID()] = c
@@ -880,12 +886,17 @@ func UpdateImplicitRestart(log *zerolog.Logger, allContainers,
 
 		restartByIdentifier[resolvedID] = c.ToRestart()
 
-		// Also index by bare name for better exact matching in mixed scenarios
 		bareName := c.Name()
 		if bareName != "" && bareName != resolvedID {
-			_, exists := restartByIdentifier[bareName]
-			if !exists {
+			if _, exists := restartByIdentifier[bareName]; !exists {
 				restartByIdentifier[bareName] = c.ToRestart()
+			}
+		}
+
+		containerID := string(c.ID())
+		if containerID != "" && containerID != resolvedID && containerID != bareName {
+			if _, exists := restartByIdentifier[containerID]; !exists {
+				restartByIdentifier[containerID] = c.ToRestart()
 			}
 		}
 	}
@@ -1040,7 +1051,7 @@ func linkedIdentifierMarkedForRestart(log *zerolog.Logger, links []string,
 		}
 	}
 
-	dependentProject := getProject(log, dependentContainer)
+	dependentProject := getProject(dependentContainer)
 
 	// Collect known projects so we can distinguish bare service-name references
 	// (which may contain hyphens) from explicit project-qualified identifiers
@@ -1048,7 +1059,7 @@ func linkedIdentifierMarkedForRestart(log *zerolog.Logger, links []string,
 	knownProjects := map[string]bool{}
 
 	for _, c := range allContainers {
-		p := getProject(log, c)
+		p := getProject(c)
 		if p != "" {
 			knownProjects[p] = true
 		}
@@ -1089,12 +1100,19 @@ func linkedIdentifierMarkedForRestart(log *zerolog.Logger, links []string,
 			}
 		}
 
-		if restartByIdentifier[link] {
-			log.Debug().
-				Str("found_restarting_identifier", link).
-				Msg("Found restarting linked container via exact match")
+		if restarting, exists := restartByIdentifier[link]; exists {
+			if restarting {
+				log.Debug().
+					Str("found_restarting_identifier", link).
+					Msg("Found restarting linked container via exact match")
 
-			return link
+				return link
+			}
+
+			// The named container exists and is not restarting. Do not
+			// suffix-match a different container that happens to end with
+			// this name.
+			continue
 		}
 
 		// Collect only the identifiers that are currently marked for restart.
@@ -1109,7 +1127,7 @@ func linkedIdentifierMarkedForRestart(log *zerolog.Logger, links []string,
 		matches := sorter.FindMatchingIdentifiers(link, restartingNames)
 
 		if len(matches) > 0 {
-			dependentProject := getProject(log, dependentContainer)
+			dependentProject := getProject(dependentContainer)
 
 			// Prefer any candidate that shares the dependent's project (from labels).
 			for _, matchedID := range matches {
@@ -1118,7 +1136,7 @@ func linkedIdentifierMarkedForRestart(log *zerolog.Logger, links []string,
 					continue
 				}
 
-				if getProject(log, matchedContainer) == dependentProject && dependentProject != "" {
+				if getProject(matchedContainer) == dependentProject && dependentProject != "" {
 					log.Debug().
 						Str("link", link).
 						Str("matched", matchedID).
@@ -1178,7 +1196,7 @@ func linkedIdentifierMarkedForRestart(log *zerolog.Logger, links []string,
 			continue
 		}
 
-		dependentProject := getProject(log, dependentContainer)
+		dependentProject := getProject(dependentContainer)
 		linkService := sorter.ExtractServiceName(link)
 
 		// Build the list of currently restarting containers that match on service name alone.
@@ -1198,7 +1216,7 @@ func linkedIdentifierMarkedForRestart(log *zerolog.Logger, links []string,
 					continue
 				}
 
-				if getProject(log, c) == dependentProject &&
+				if getProject(c) == dependentProject &&
 					dependentProject != "" {
 					log.Debug().
 						Str("link", link).
@@ -1239,12 +1257,12 @@ func linkedIdentifierMarkedForRestart(log *zerolog.Logger, links []string,
 //
 // Returns:
 //   - string: Project name, or "" if none can be determined.
-func getProject(log *zerolog.Logger, c types.Container) string {
+func getProject(c types.Container) string {
 	monitoredContainer, ok := c.(*container.Container)
 	if ok {
 		info := monitoredContainer.ContainerInfo()
 		if info != nil && info.Config != nil {
-			project := compose.GetProjectName(log, info.Config.Labels)
+			project := compose.GetProjectName(info.Config.Labels)
 			if project != "" {
 				return project
 			}
