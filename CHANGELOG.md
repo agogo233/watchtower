@@ -10,10 +10,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Copy labeled files across container recreate by @nicholas-fedor in [#2387](https://github.com/nicholas-fedor/watchtower/pull/2387)
+
+### Chores
+
+- Update orhun/git-cliff-action action to v4.9.1 by @renovate[bot] in [#2414](https://github.com/nicholas-fedor/watchtower/pull/2414)
+- Update module github.com/molecule-man/go-brrr to v1.1.1 by @renovate[bot] in [#2413](https://github.com/nicholas-fedor/watchtower/pull/2413)
+- Update github/codeql-action action to v4.38.1 by @renovate[bot] in [#2411](https://github.com/nicholas-fedor/watchtower/pull/2411)
+- Update alpine docker tag to v3.24.2 by @renovate[bot] in [#2410](https://github.com/nicholas-fedor/watchtower/pull/2410)
+- Update golang:alpine3.24 docker digest to 4cb7ac9 by @renovate[bot] in [#2407](https://github.com/nicholas-fedor/watchtower/pull/2407)
+- Update golang:1.27.1-alpine docker digest to 4cb7ac9 by @renovate[bot] in [#2406](https://github.com/nicholas-fedor/watchtower/pull/2406)
+- Update golang:alpine3.24 docker digest to e9bbdf2 by @renovate[bot] in [#2401](https://github.com/nicholas-fedor/watchtower/pull/2401)
+- Update golang:1.27.1-alpine docker digest to e9bbdf2 by @renovate[bot] in [#2400](https://github.com/nicholas-fedor/watchtower/pull/2400)
+- Update module github.com/onsi/ginkgo/v2 to v2.33.0 by @renovate[bot] in [#2398](https://github.com/nicholas-fedor/watchtower/pull/2398)
+- Update module github.com/onsi/gomega to v1.43.1 by @renovate[bot] in [#2397](https://github.com/nicholas-fedor/watchtower/pull/2397)
+- Update codecov/codecov-action action to v7.1.1 by @renovate[bot] in [#2396](https://github.com/nicholas-fedor/watchtower/pull/2396)
+- Update docker/setup-buildx-action action to v4.4.1 by @renovate[bot] in [#2394](https://github.com/nicholas-fedor/watchtower/pull/2394)
+- Update module github.com/docker/cli to v29.8.1+incompatible by @renovate[bot] in [#2391](https://github.com/nicholas-fedor/watchtower/pull/2391)
+- Update module github.com/gofiber/schema to v1.8.7 by @renovate[bot] in [#2388](https://github.com/nicholas-fedor/watchtower/pull/2388)
+
+## [1.22.2] - 2026-09-15
+
+### Added
+
+- Add NotaInutilis as a contributor for doc by @allcontributors[bot] in [#2374](https://github.com/nicholas-fedor/watchtower/pull/2374)
+
+### Changed
+
+- Replace SetNoRestartPolicy with SetRestartPolicy by @nicholas-fedor in [#2385](https://github.com/nicholas-fedor/watchtower/pull/2385)
+- Improve docker connection and socket proxy info by @NotaInutilis in [#2352](https://github.com/nicholas-fedor/watchtower/pull/2352)
 - Replace untyped maps with concrete types by @nicholas-fedor in [#2371](https://github.com/nicholas-fedor/watchtower/pull/2371)
 
 ### Chores
 
+- Update module github.com/nicholas-fedor/shoutrrr to v0.21.0 by @renovate[bot] in [#2384](https://github.com/nicholas-fedor/watchtower/pull/2384)
+- Update docker/setup-qemu-action action to v4.4.0 by @renovate[bot] in [#2382](https://github.com/nicholas-fedor/watchtower/pull/2382)
+- Update docker/setup-buildx-action action to v4.4.0 by @renovate[bot] in [#2381](https://github.com/nicholas-fedor/watchtower/pull/2381)
+- Update codecov/codecov-action action to v7.1.0 by @renovate[bot] in [#2379](https://github.com/nicholas-fedor/watchtower/pull/2379)
+- Update module github.com/gofiber/utils/v2 to v2.5.2 by @renovate[bot] in [#2376](https://github.com/nicholas-fedor/watchtower/pull/2376)
 - Update module github.com/gofiber/contrib/v3/zerolog to v1.1.5 by @renovate[bot] in [#2369](https://github.com/nicholas-fedor/watchtower/pull/2369)
 - Update module github.com/gofiber/contrib/v3/swaggo to v1.0.11 by @renovate[bot] in [#2368](https://github.com/nicholas-fedor/watchtower/pull/2368)
 - Update module github.com/molecule-man/go-brrr to v1.1.0 by @renovate[bot] in [#2364](https://github.com/nicholas-fedor/watchtower/pull/2364)
@@ -24,6 +58,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Reuse anonymous GHCR tokens across public images by @nicholas-fedor in [#2366](https://github.com/nicholas-fedor/watchtower/pull/2366)
+
+### New Contributors
+
+- @NotaInutilis made their first contribution in [#2352](https://github.com/nicholas-fedor/watchtower/pull/2352)
 
 ## [1.22.1] - 2026-09-09
 
@@ -3622,7 +3660,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Compare Releases
 
-- [unreleased](https://github.com/nicholas-fedor/watchtower/compare/v1.22.1...HEAD)
+- [unreleased](https://github.com/nicholas-fedor/watchtower/compare/v1.22.2...HEAD)
+- [1.22.2](https://github.com/nicholas-fedor/watchtower/compare/v1.22.1...v1.22.2)
 - [1.22.1](https://github.com/nicholas-fedor/watchtower/compare/v1.22.0...v1.22.1)
 - [1.22.0](https://github.com/nicholas-fedor/watchtower/compare/v1.21.2...v1.22.0)
 - [1.21.2](https://github.com/nicholas-fedor/watchtower/compare/v1.21.1...v1.21.2)

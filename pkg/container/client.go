@@ -324,17 +324,23 @@ type Client interface {
 	//   - error: Non-nil if update fails, nil on success.
 	UpdateContainer(ctx context.Context, container types.Container, config dockerContainer.UpdateConfig) error
 
-	// SetNoRestartPolicy updates the restart policy of a container to "no" to prevent
-	// restart loops after fatal startup failures.
+	// SetRestartPolicy updates a container's restart policy.
 	//
-	// It is a convenience wrapper around UpdateContainer that constructs the restart
-	// policy configuration and logs a warning if the update fails, ensuring the
-	// failure does not block the exit path.
+	// An empty policy name is treated as no automatic restart (Docker "no").
+	// MaximumRetryCount is cleared in that case because retry counts apply only
+	// to on-failure policies. Only the restart policy is sent to the Engine.
+	// Resource limits are left unchanged. Failures are logged and do not abort
+	// the caller.
 	//
 	// Parameters:
 	//   - ctx: Context for cancellation and timeout control.
 	//   - container: Container whose restart policy should be updated.
-	SetNoRestartPolicy(ctx context.Context, container types.Container)
+	//   - policy: Restart policy to apply. Empty Name disables automatic restart.
+	SetRestartPolicy(
+		ctx context.Context,
+		container types.Container,
+		policy dockerContainer.RestartPolicy,
+	)
 
 	// RemoveContainer removes a container from the Docker host.
 	//
@@ -396,6 +402,15 @@ type client struct {
 	runtimeOnce sync.Once
 	// isPodman caches the result of Podman runtime detection.
 	isPodman bool
+
+	// copyFileMu protects copyFiles between stop and create of a recreation.
+	copyFileMu sync.Mutex
+	// copyFiles stores labeled file snapshots keyed by the source container ID.
+	copyFiles map[types.ContainerID]copyFileSnapshot
+	// copyFileBytes is the total size of archives currently held in copyFiles.
+	copyFileBytes int64
+	// copyAPI overrides api for copy-file snapshot and inject tests.
+	copyAPI ArchiveAPI
 }
 
 // ClientOptions configures container management behavior for the Docker client.
@@ -767,6 +782,8 @@ func (c *client) StopAndRemoveContainer(ctx context.Context, container types.Con
 //   - types.ContainerID: ID of the new container.
 //   - error: Non-nil if creation fails, nil on success.
 func (c *client) CreateContainer(ctx context.Context, container types.Container) (types.ContainerID, error) {
+	defer c.DiscardCopyFiles(container.ID())
+
 	clogVal := c.logger().With().
 		Str("container", container.Name()).
 		Str("image", container.ImageName()).
@@ -804,6 +821,18 @@ func (c *client) CreateContainer(ctx context.Context, container types.Container)
 		return "", err
 	}
 
+	err = c.injectStoredCopyFiles(ctx, container, newID)
+	if err != nil {
+		clog.Debug().
+			Err(err).
+			Str("new_id", newID.ShortID()).
+			Msg("Failed to copy files into new container")
+
+		cleanupFailedStartContainer(ctx, c.api, clog, newID)
+
+		return "", err
+	}
+
 	clog.Debug().
 		Str("new_id", newID.ShortID()).
 		Msg("Created new container")
@@ -828,31 +857,7 @@ func (c *client) StartContainer(ctx context.Context, container types.Container) 
 		Logger()
 	clog := &clogVal
 
-	// Determine if the container runtime is Podman to handle runtime-specific differences.
-	//
-	//nolint:contextcheck // getRuntime uses context.Background() internally for cached detection
-	isPodman := c.getRuntime()
-
-	clientVersion := c.GetVersion()
-
-	clog.Debug().
-		Str("client_version", clientVersion).
-		Msg("Obtaining source container network configuration")
-
-	networkConfig := getNetworkConfig(c.logger(), container, clientVersion)
-
-	newID, err := StartTargetContainer(c.logger(),
-		ctx,
-		c.api,
-		container,
-		networkConfig,
-		c.ReviveStopped,
-		clientVersion,
-		flags.DockerAPIMinVersion, // Docker API Version 1.24
-		c.DisableMemorySwappiness,
-		c.CPUCopyMode,
-		isPodman,
-	)
+	newID, err := c.CreateContainer(ctx, container)
 	if err != nil {
 		clog.Debug().
 			Err(err).
@@ -861,9 +866,38 @@ func (c *client) StartContainer(ctx context.Context, container types.Container) 
 		return "", err
 	}
 
+	if !container.IsRunning() && !c.ReviveStopped {
+		clog.Debug().
+			Str("new_id", string(newID)).
+			Msg("Created container, not starting due to stopped state")
+
+		return newID, nil
+	}
+
+	_, err = c.api.ContainerStart(
+		ctx,
+		string(newID),
+		dockerClient.ContainerStartOptions{},
+	)
+	if err != nil {
+		clog.Debug().
+			Err(err).
+			Str("new_id", string(newID)).
+			Msg("Failed to start new container")
+
+		cleanupFailedStartContainer(ctx, c.api, clog, newID)
+
+		return "", fmt.Errorf("%w: %w", errStartContainerFailed, err)
+	}
+
+	message := "Started new container"
+	if container.IsLinkedToRestarting() {
+		message = "Started linked container"
+	}
+
 	clog.Debug().
 		Str("new_id", newID.ShortID()).
-		Msg("Started new container")
+		Msg(message)
 
 	return newID, nil
 }
@@ -956,41 +990,51 @@ func (c *client) UpdateContainer(
 	return nil
 }
 
-// SetNoRestartPolicy updates the restart policy of a container to "no" to prevent
-// restart loops after fatal startup failures.
+// SetRestartPolicy updates a container's restart policy.
 //
-// It is a convenience wrapper around UpdateContainer that constructs the restart
-// policy configuration and logs a warning if the update fails, ensuring the
-// failure does not block the exit path.
+// An empty policy name is treated as no automatic restart (Docker "no").
+// MaximumRetryCount is cleared in that case because retry counts apply only
+// to on-failure policies. Only the restart policy is sent to the Engine.
+// Resource limits are left unchanged. Failures are logged and do not abort
+// the caller.
 //
 // Parameters:
 //   - ctx: Context for cancellation and timeout control.
 //   - container: Container whose restart policy should be updated.
-func (c *client) SetNoRestartPolicy(ctx context.Context, container types.Container) {
+//   - policy: Restart policy to apply. Empty Name disables automatic restart.
+func (c *client) SetRestartPolicy(
+	ctx context.Context,
+	container types.Container,
+	policy dockerContainer.RestartPolicy,
+) {
 	if container == nil {
 		return
 	}
 
+	if policy.Name == "" {
+		policy.Name = dockerContainer.RestartPolicyDisabled
+		policy.MaximumRetryCount = 0
+	}
+
 	clogVal := c.logger().With().
 		Str("container_id", string(container.ID())).
+		Str("restart_policy", string(policy.Name)).
 		Logger()
 	clog := &clogVal
 
-	clog.Debug().Msg("Setting restart policy to 'no'")
+	clog.Debug().Msg("Setting container restart policy")
 
 	_, err := c.api.ContainerUpdate(
 		ctx,
 		string(container.ID()),
 		dockerClient.ContainerUpdateOptions{
-			RestartPolicy: &dockerContainer.RestartPolicy{
-				Name: "no",
-			},
+			RestartPolicy: &policy,
 		},
 	)
 	if err != nil {
-		clog.Warn().
+		clog.Debug().
 			Err(err).
-			Msg("Failed to set restart policy to 'no'")
+			Msg("Failed to set container restart policy")
 	}
 }
 

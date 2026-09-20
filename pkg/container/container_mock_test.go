@@ -234,6 +234,36 @@ func WithMounts(mounts []dockerMount.Mount) MockContainerUpdate {
 	}
 }
 
+// WithInspectMounts sets runtime mount points on the mock container inspect response.
+//
+// Parameters:
+//   - mounts: Runtime mount points reported by container inspect.
+//
+// Returns:
+//   - MockContainerUpdate: Function to set inspect Mounts.
+func WithInspectMounts(mounts []dockerContainer.MountPoint) MockContainerUpdate {
+	return func(c *dockerContainer.InspectResponse, _ *dockerImage.InspectResponse) {
+		c.Mounts = mounts
+	}
+}
+
+// WithReadonlyRootfs sets HostConfig.ReadonlyRootfs on the mock container.
+//
+// Parameters:
+//   - readOnly: Whether the container root filesystem is read-only.
+//
+// Returns:
+//   - MockContainerUpdate: Function to set ReadonlyRootfs.
+func WithReadonlyRootfs(readOnly bool) MockContainerUpdate {
+	return func(c *dockerContainer.InspectResponse, _ *dockerImage.InspectResponse) {
+		if c.HostConfig == nil {
+			c.HostConfig = &dockerContainer.HostConfig{}
+		}
+
+		c.HostConfig.ReadonlyRootfs = readOnly
+	}
+}
+
 // WithNetworks adds multiple networks to the mock container.
 //
 // Parameters:
@@ -573,27 +603,25 @@ func APIVersionPingHandler() http.HandlerFunc {
 }
 
 // ContainerUpdateHandler returns a handler that responds to the Docker API's
-// POST /containers/{id}/update endpoint. It optionally verifies that the request
-// body contains a restart policy with Name set to "no" when verifyRestartPolicy
-// is true.
+// POST /containers/{id}/update endpoint. When expectedPolicy is non-empty, it
+// verifies RestartPolicy.Name matches that value.
 //
 // Parameters:
 //   - containerID: The container ID for the update endpoint.
 //   - status: HTTP status code to return (204 for success, 500 for error).
-//   - verifyRestartPolicy: When true, the handler verifies the request body
-//     contains RestartPolicy.Name == "no".
+//   - expectedPolicy: Restart policy name to verify. Empty skips body checks.
 //
 // Returns:
 //   - http.HandlerFunc: Handler for the container update endpoint.
 func ContainerUpdateHandler(
 	containerID string,
 	status int,
-	verifyRestartPolicy bool,
+	expectedPolicy string,
 ) http.HandlerFunc {
 	return ghttp.CombineHandlers(
 		ghttp.VerifyRequest("POST", gomega.HaveSuffix(fmt.Sprintf("containers/%s/update", containerID))),
 		func(w http.ResponseWriter, r *http.Request) {
-			if verifyRestartPolicy {
+			if expectedPolicy != "" {
 				var body map[string]any
 
 				err := json.NewDecoder(r.Body).Decode(&body)
@@ -606,10 +634,23 @@ func ContainerUpdateHandler(
 
 				name, ok := restartPolicy["Name"].(string)
 				gomega.Expect(ok).To(gomega.BeTrue(), "RestartPolicy.Name should be a string")
-				gomega.Expect(name).To(gomega.Equal("no"), "RestartPolicy.Name should be 'no'")
+				gomega.Expect(name).To(gomega.Equal(expectedPolicy), "RestartPolicy.Name should match")
+
+				if expectedPolicy == "no" {
+					retryCount, hasRetryCount := restartPolicy["MaximumRetryCount"]
+					if hasRetryCount {
+						gomega.Expect(retryCount).To(gomega.BeNumerically("==", 0),
+							"disabled policy should not keep a retry count")
+					}
+				}
 			}
 
-			ghttp.RespondWith(status, nil)(w, r)
+			body := []byte(nil)
+			if status < http.StatusBadRequest {
+				body = []byte("{}")
+			}
+
+			ghttp.RespondWith(status, body)(w, r)
 		},
 	)
 }
