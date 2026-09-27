@@ -18,9 +18,9 @@ require (
 	github.com/moby/docker-image-spec v1.3.1
 	github.com/moby/moby/api v1.56.0
 	github.com/moby/moby/client v0.6.0
-	github.com/nicholas-fedor/shoutrrr v0.21.0
+	github.com/nicholas-fedor/shoutrrr v0.21.1
 	github.com/onsi/ginkgo/v2 v2.33.0
-	github.com/onsi/gomega v1.43.1
+	github.com/onsi/gomega v1.44.0
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/prometheus/client_golang v1.24.1
@@ -53,8 +53,8 @@ require (
 	github.com/fsnotify/fsnotify v1.10.1 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
-	github.com/go-openapi/jsonpointer v1.0.1 // indirect
-	github.com/go-openapi/jsonreference v1.0.2 // indirect
+	github.com/go-openapi/jsonpointer v1.0.2 // indirect
+	github.com/go-openapi/jsonreference v1.0.3 // indirect
 	github.com/go-openapi/spec v1.0.1 // indirect
 	github.com/go-openapi/swag/conv v0.29.2 // indirect
 	github.com/go-openapi/swag/jsonutils v0.29.2 // indirect
@@ -65,14 +65,14 @@ require (
 	github.com/go-openapi/swag/yamlutils v0.29.2 // indirect
 	github.com/go-task/slim-sprig/v3 v3.0.0 // indirect
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
-	github.com/gofiber/schema v1.8.7 // indirect
-	github.com/gofiber/utils/v2 v2.5.2 // indirect
+	github.com/gofiber/schema v1.8.8 // indirect
+	github.com/gofiber/utils/v2 v2.6.1 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
-	github.com/google/pprof v0.0.0-20260906184651-6331bc6350fe // indirect
+	github.com/google/pprof v0.0.0-20260926063103-aaccee046517 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
-	github.com/klauspost/compress v1.20.0 // indirect
+	github.com/klauspost/compress v1.20.1 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
 	github.com/molecule-man/go-brrr v1.1.1 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
