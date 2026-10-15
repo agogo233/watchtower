@@ -2,12 +2,14 @@ package actions
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
 
 	"github.com/nicholas-fedor/watchtower/internal/api/handlers/events"
+	"github.com/nicholas-fedor/watchtower/internal/git"
 	"github.com/nicholas-fedor/watchtower/internal/metrics"
 	"github.com/nicholas-fedor/watchtower/pkg/container"
 	"github.com/nicholas-fedor/watchtower/pkg/session"
@@ -42,6 +44,8 @@ type RunUpdatesWithNotificationsParams struct {
 	Logger *zerolog.Logger
 	// Client is the Docker client for container operations.
 	Client container.Client
+	// GitClient inspects remotes and clones repositories when the Git watcher is used.
+	GitClient *git.Client
 	// Notifier sends update status messages to configured channels.
 	Notifier types.Notifier
 	// NotificationSplitByContainer enables a separate notification per updated container.
@@ -52,6 +56,10 @@ type RunUpdatesWithNotificationsParams struct {
 	EventBroadcaster *events.Broadcaster
 	// Update is the complete update policy for this invocation (filter, cleanup, timeouts, etc.).
 	Update types.UpdateParams
+	// OnOldSelfDetected is called when Watchtower finds that it runs in an old
+	// instance's container, after that container's restart policy is disabled.
+	// The caller should stop the process. Nil means the session simply ends.
+	OnOldSelfDetected func()
 }
 
 // RunUpdatesWithNotifications performs container updates and sends notifications about the results.
@@ -93,29 +101,34 @@ func RunUpdatesWithNotifications(
 		ctx,
 		params.Client,
 		updateConfig,
+		params.GitClient,
 	)
-	// Process update result, return metric on failure
-	metric := handleUpdateResult(log, result, err, params.Notifier)
-	if metric != nil {
-		if params.EventBroadcaster != nil {
-			errMsg := "unknown error"
-			if err != nil {
-				errMsg = err.Error()
-			}
+	// An old instance stops instead of reporting a failed update, since nothing failed.
+	if errors.Is(err, errOldSelfDetected) {
+		// Process log only. Nothing failed, so this is not a notification.
+		log.Info().
+			Str("notify", "no").
+			Msg("Watchtower is running in an old instance's container, stopping this instance")
 
+		// End the scan for event subscribers, with nothing scanned.
+		if params.EventBroadcaster != nil {
 			params.EventBroadcaster.Publish(events.Event{
-				Type:      "scan_failed",
+				Type:      "scan_completed",
 				Timestamp: time.Now().UTC(),
-				Data: events.ScanFailedData{
-					Error: errMsg,
-				},
+				Data:      events.ScanCompletedData{},
 			})
 		}
 
-		return metric
+		if params.OnOldSelfDetected != nil {
+			params.OnOldSelfDetected()
+		}
+
+		return &metrics.Metric{}
 	}
 
-	// Perform image cleanup if enabled.
+	// Perform image cleanup if enabled. This runs before the result is checked,
+	// so the old images of containers replaced before an update error are
+	// still removed.
 	cleanedImages := performImageCleanup(log,
 		ctx,
 		params.Client,
@@ -143,6 +156,27 @@ func RunUpdatesWithNotifications(
 				Images: entries,
 			},
 		})
+	}
+
+	// Process update result, return metric on failure
+	metric := handleUpdateResult(log, result, err, params.Notifier)
+	if metric != nil {
+		if params.EventBroadcaster != nil {
+			errMsg := "unknown error"
+			if err != nil {
+				errMsg = err.Error()
+			}
+
+			params.EventBroadcaster.Publish(events.Event{
+				Type:      "scan_failed",
+				Timestamp: time.Now().UTC(),
+				Data: events.ScanFailedData{
+					Error: errMsg,
+				},
+			})
+		}
+
+		return metric
 	}
 
 	// Log update report details for debugging
@@ -205,17 +239,19 @@ func (emptyReport) All() []types.ContainerReport       { return nil }
 // handleUpdateResult processes the result of an update operation and returns an appropriate metric.
 //
 // It checks for errors or nil results, logging accordingly. If an error occurred, it sends a
-// notification via the provided notifier (if not nil) to alert about the failure. On error or
-// nil result, it returns a zero metric to indicate the failure state. On success, it returns nil
-// to indicate continuation of the update process.
+// notification via the provided notifier (if not nil) to alert about the failure. An update that
+// fails partway still returns the report of the work done before the error, so that report is
+// notified and counted. On error or nil result, it returns a non-nil metric to indicate the
+// failure state. On success, it returns nil to indicate continuation of the update process.
 //
 // Parameters:
-//   - result: The report from the update operation.
+//   - result: The report from the update operation. It may be partial when err is non-nil.
 //   - err: Any error encountered during the update.
 //   - notifier: The notification system for sending error alerts. It may be nil.
 //
 // Returns:
-//   - *metrics.Metric: A zero metric if an error occurred or result is nil, nil otherwise.
+//   - *metrics.Metric: A metric marked as a failed scan, with the counts of the partial report
+//     on error, or zero counts when there is no report. Nil on success.
 func handleUpdateResult(log *zerolog.Logger, result types.Report, err error, notifier types.Notifier) *metrics.Metric {
 	// Check for errors during update execution
 	if err != nil {
@@ -223,27 +259,28 @@ func handleUpdateResult(log *zerolog.Logger, result types.Report, err error, not
 			Err(err).
 			Msg("Update execution failed")
 
-		// Send notification about the error
-		if notifier != nil {
-			notifier.SendNotification(emptyReport{})
+		// Without a partial report, the notification still carries the error.
+		report := result
+		if report == nil {
+			report = emptyReport{}
 		}
 
-		return &metrics.Metric{
-			Scanned: 0,
-			Updated: 0,
-			Failed:  0,
+		// Send notification about the error
+		if notifier != nil {
+			notifier.SendNotification(report)
 		}
+
+		metric := metrics.NewMetric(report)
+		metric.ScanFailed = true
+
+		return metric
 	}
 
 	// Check if update result is nil
 	if result == nil {
-		log.Debug().Msg("Update result is nil, returning zero metric")
+		log.Debug().Msg("Update result is nil, returning a failed zero metric")
 
-		return &metrics.Metric{
-			Scanned: 0,
-			Updated: 0,
-			Failed:  0,
-		}
+		return &metrics.Metric{ScanFailed: true}
 	}
 
 	return nil
@@ -318,26 +355,31 @@ func startNotifications(log *zerolog.Logger, notifier types.Notifier, notificati
 
 // executeUpdate performs the container update operation and handles errors.
 //
-// It calls the Update function with the provided parameters, captures the results,
-// and returns them along with any error encountered.
+// It calls Update with the provided parameters, including the optional Git
+// monitor client used for associated containers.
 //
 // Parameters:
+//   - log: Process logger.
 //   - ctx: Context for cancellation and timeouts.
-//   - client: The Docker client instance used for container operations.
-//   - config: The UpdateParams struct containing all update configuration parameters.
+//   - client: Docker client used for container operations.
+//   - config: Update parameters.
+//   - gitClient: Git monitor client. Nil when Git monitoring is unused.
 //
 // Returns:
-//   - types.Report: The report containing the results of the update operation.
-//   - []types.CleanedImageInfo: Slice of cleaned image info to be cleaned up.
-//   - error: Any error encountered during the update execution.
-func executeUpdate(log *zerolog.Logger, ctx context.Context,
+//   - types.Report: Results of the update operation.
+//   - []types.RemovedImageInfo: Images eligible for cleanup.
+//   - error: Non-nil when Update fails.
+func executeUpdate(
+	log *zerolog.Logger,
+	ctx context.Context,
 	client container.Client,
 	config types.UpdateParams,
+	gitClient *git.Client,
 ) (types.Report, []types.RemovedImageInfo, error) {
 	// Log before calling the Update function
 	log.Debug().Msg("About to call Update function")
 
-	result, cleanupImageInfos, err := Update(log, ctx, client, config)
+	result, cleanupImageInfos, err := Update(log, ctx, client, config, gitClient)
 
 	// Log after Update function returns
 	log.Debug().Msg("Update function returned, about to check cleanup")

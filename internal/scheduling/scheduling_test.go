@@ -3,6 +3,9 @@ package scheduling_test
 import (
 	"context"
 	"net/netip"
+	"os"
+	"os/signal"
+	"runtime"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -219,6 +222,36 @@ func TestRunUpgradesOnSchedule_UpdateOnStart(t *testing.T) {
 	}
 }
 
+// TestRunUpgradesOnSchedule_UpdateOnStartSkippedWhenCanceled verifies that the
+// update at startup does not run when the process context is already canceled,
+// for example by a stop signal during startup, so no canceled update is
+// reported as a failure.
+func TestRunUpgradesOnSchedule_UpdateOnStartSkippedWhenCanceled(t *testing.T) {
+	client := mockActions.CreateMockClient(&mockActions.TestData{}, false, false)
+
+	updateCalled := false
+	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, _ types.UpdateParams) *metrics.Metric {
+		updateCalled = true
+
+		return &metrics.Metric{}
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	deps := testDeps(client, runUpdatesWithNotifications, func(logging.StartupParams) {})
+	deps.UpdateOnStart = true
+
+	err := scheduling.RunUpgradesOnSchedule(ctx, deps)
+	if err != nil {
+		t.Errorf("expected no error, got %v", err)
+	}
+
+	if updateCalled {
+		t.Error("expected the update at startup to be skipped")
+	}
+}
+
 func TestWaitForRunningUpdate_NoUpdateRunning(t *testing.T) {
 	ctx := context.Background()
 
@@ -351,6 +384,63 @@ func TestRunUpgradesOnSchedule_ContextCancellation(t *testing.T) {
 	err := scheduling.RunUpgradesOnSchedule(canceledCtx, deps)
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
+	}
+}
+
+// TestRunUpgradesOnSchedule_StopsOnlyOnCancellation verifies that the scheduler
+// leaves signal handling to its caller. An interrupt sent to the process does
+// not stop it, and canceling its context does.
+//
+// The interrupt goes to the whole test process, so this test must not run in
+// parallel with tests that register or depend on signal handlers. It does not
+// call t.Parallel, and neither does any other test in this package.
+func TestRunUpgradesOnSchedule_StopsOnlyOnCancellation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sends an interrupt signal to the test process")
+	}
+
+	// Hold the interrupt so it does not end the test process.
+	interrupts := make(chan os.Signal, 1)
+	signal.Notify(interrupts, os.Interrupt)
+	t.Cleanup(func() { signal.Stop(interrupts) })
+
+	client := mockActions.CreateMockClient(&mockActions.TestData{}, false, false)
+	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, _ types.UpdateParams) *metrics.Metric {
+		return &metrics.Metric{}
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- scheduling.RunUpgradesOnSchedule(ctx, testDeps(client, runUpdatesWithNotifications, func(logging.StartupParams) {}))
+	}()
+
+	process, err := os.FindProcess(os.Getpid())
+	require.NoError(t, err)
+	require.NoError(t, process.Signal(os.Interrupt))
+
+	select {
+	case <-interrupts:
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "the interrupt was not delivered")
+	}
+
+	select {
+	case err := <-done:
+		require.FailNow(t, "the scheduler stopped on the interrupt", "error: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	cancel()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "the scheduler did not stop after cancellation")
 	}
 }
 
@@ -703,6 +793,32 @@ func TestRunUpgradesOnSchedule_EphemeralSelfUpdateWithExposedPorts(t *testing.T)
 		"self-update should NOT be skipped when ephemeralSelfUpdate=true, "+
 			"even with exposed ports",
 	)
+}
+
+// TestRunUpgradesOnSchedule_KeepsBaseSkipSelfUpdate verifies that a run cannot
+// enable self-updates that the base parameters disable.
+func TestRunUpgradesOnSchedule_KeepsBaseSkipSelfUpdate(t *testing.T) {
+	client := mockActions.CreateMockClient(&mockActions.TestData{}, false, false)
+
+	var capturedParams types.UpdateParams
+
+	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, params types.UpdateParams) *metrics.Metric {
+		capturedParams = params
+
+		return &metrics.Metric{Scanned: 1, Updated: 0, Failed: 0}
+	}
+
+	timeoutCtx, timeoutCancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+	defer timeoutCancel()
+
+	// The run at startup does not skip self-updates on its own.
+	deps := testDeps(client, runUpdatesWithNotifications, func(logging.StartupParams) {})
+	deps.UpdateOnStart = true
+	deps.BaseParams.SkipSelfUpdate = true
+	err := scheduling.RunUpgradesOnSchedule(timeoutCtx, deps)
+	require.NoError(t, err)
+
+	assert.True(t, capturedParams.SkipSelfUpdate)
 }
 
 // TestRunUpgradesOnSchedule_PortConflictGuard_SkipsSelfUpdate verifies that when

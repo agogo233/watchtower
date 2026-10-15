@@ -20,8 +20,8 @@ const docTemplate = `{
             "url": "https://github.com/nicholas-fedor/watchtower"
         },
         "license": {
-            "name": "MIT",
-            "url": "https://opensource.org/licenses/MIT"
+            "name": "Apache-2.0",
+            "url": "https://www.apache.org/licenses/LICENSE-2.0"
         },
         "version": "{{.Version}}"
     },
@@ -96,12 +96,7 @@ const docTemplate = `{
         },
         "/v1/check": {
             "post": {
-                "security": [
-                    {
-                        "BearerAuth": []
-                    }
-                ],
-                "description": "Checks each watched container for available updates by querying the registry for the latest digest without pulling image layers.",
+                "description": "Checks each watched container for available updates. Associated Git-watched containers compare the hosted Git ref (no clone or build). Other containers query the registry for the",
                 "consumes": [
                     "application/json"
                 ],
@@ -136,8 +131,7 @@ const docTemplate = `{
                     "200": {
                         "description": "Container update availability results",
                         "schema": {
-                            "type": "object",
-                            "additionalProperties": true
+                            "$ref": "#/definitions/check.CheckResponse"
                         }
                     },
                     "401": {
@@ -152,16 +146,16 @@ const docTemplate = `{
                             "type": "string"
                         }
                     }
-                }
-            }
-        },
-        "/v1/config": {
-            "get": {
+                },
                 "security": [
                     {
                         "BearerAuth": []
                     }
-                ],
+                ]
+            }
+        },
+        "/v1/config": {
+            "get": {
                 "description": "Returns the active Watchtower configuration settings. Sensitive values (notification URLs, tokens) are redacted.",
                 "consumes": [
                     "application/json"
@@ -193,16 +187,16 @@ const docTemplate = `{
                             "type": "string"
                         }
                     }
-                }
-            }
-        },
-        "/v1/containers": {
-            "get": {
+                },
                 "security": [
                     {
                         "BearerAuth": []
                     }
-                ],
+                ]
+            }
+        },
+        "/v1/containers": {
+            "get": {
                 "description": "Returns the current image identity and digest for every watched container. Optionally filter by container name or image name.",
                 "consumes": [
                     "application/json"
@@ -248,16 +242,16 @@ const docTemplate = `{
                             "type": "string"
                         }
                     }
-                }
-            }
-        },
-        "/v1/containers/details": {
-            "get": {
+                },
                 "security": [
                     {
                         "BearerAuth": []
                     }
-                ],
+                ]
+            }
+        },
+        "/v1/containers/details": {
+            "get": {
                 "description": "Returns detailed information about each watched container, including running state, image identity, and configuration flags. Optionally filter by container name or image name.",
                 "consumes": [
                     "application/json"
@@ -303,16 +297,16 @@ const docTemplate = `{
                             "type": "string"
                         }
                     }
-                }
+                },
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ]
             }
         },
         "/v1/events": {
             "get": {
-                "security": [
-                    {
-                        "EventsToken": []
-                    }
-                ],
                 "description": "Streams Watchtower operational events (scan started/completed, update started/completed/failed) via Server-Sent Events (SSE).\n\n**SSE is not supported by \"Try it out\"**.",
                 "produces": [
                     "text/event-stream"
@@ -334,16 +328,16 @@ const docTemplate = `{
                             "type": "string"
                         }
                     }
-                }
+                },
+                "security": [
+                    {
+                        "EventsToken": []
+                    }
+                ]
             }
         },
         "/v1/history": {
             "get": {
-                "security": [
-                    {
-                        "BearerAuth": []
-                    }
-                ],
                 "description": "Returns historical scan results from the in-memory ring buffer (up to 500 entries). Optionally filter by time range and limit the number of results.",
                 "consumes": [
                     "application/json"
@@ -395,16 +389,16 @@ const docTemplate = `{
                             "type": "string"
                         }
                     }
-                }
-            }
-        },
-        "/v1/images": {
-            "get": {
+                },
                 "security": [
                     {
                         "BearerAuth": []
                     }
-                ],
+                ]
+            }
+        },
+        "/v1/images": {
+            "get": {
                 "description": "Returns the current image identity and digest for every image tracked by Watchtower. Optionally filter by image name or image ID.",
                 "consumes": [
                     "application/json"
@@ -450,16 +444,16 @@ const docTemplate = `{
                             "type": "string"
                         }
                     }
-                }
-            }
-        },
-        "/v1/metrics": {
-            "get": {
+                },
                 "security": [
                     {
                         "BearerAuth": []
                     }
-                ],
+                ]
+            }
+        },
+        "/v1/metrics": {
+            "get": {
                 "description": "Returns Watchtower scan metrics in Prometheus exposition format.",
                 "produces": [
                     "text/plain"
@@ -481,16 +475,16 @@ const docTemplate = `{
                             "type": "string"
                         }
                     }
-                }
-            }
-        },
-        "/v1/status": {
-            "get": {
+                },
                 "security": [
                     {
                         "BearerAuth": []
                     }
-                ],
+                ]
+            }
+        },
+        "/v1/status": {
+            "get": {
                 "description": "Returns the summary of the most recent Watchtower scan, including counts of scanned, updated, failed, restarted, and skipped containers.",
                 "consumes": [
                     "application/json"
@@ -519,16 +513,16 @@ const docTemplate = `{
                             "type": "string"
                         }
                     }
-                }
-            }
-        },
-        "/v1/update": {
-            "post": {
+                },
                 "security": [
                     {
                         "BearerAuth": []
                     }
-                ],
+                ]
+            }
+        },
+        "/v1/update": {
+            "post": {
                 "description": "Scans watched containers for image updates and applies them. Supports both full scans and targeted updates filtered by image name or container name. Container patterns support Go",
                 "consumes": [
                     "application/json"
@@ -598,6 +592,101 @@ const docTemplate = `{
                             "type": "string"
                         }
                     }
+                },
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ]
+            }
+        }
+    },
+    "definitions": {
+        "check.CheckResponse": {
+            "type": "object",
+            "properties": {
+                "api_version": {
+                    "type": "string"
+                },
+                "containers": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/check.ContainerCheck"
+                    }
+                },
+                "count": {
+                    "type": "integer"
+                },
+                "timestamp": {
+                    "type": "string"
+                }
+            }
+        },
+        "check.ContainerCheck": {
+            "type": "object",
+            "properties": {
+                "changelog": {
+                    "type": "string"
+                },
+                "current_image_version": {
+                    "type": "string"
+                },
+                "current_revision": {
+                    "type": "string"
+                },
+                "digest": {
+                    "type": "string"
+                },
+                "documentation": {
+                    "type": "string"
+                },
+                "error": {
+                    "type": "string"
+                },
+                "git_commit": {
+                    "type": "string"
+                },
+                "git_ref": {
+                    "type": "string"
+                },
+                "git_repo": {
+                    "type": "string"
+                },
+                "image": {
+                    "type": "string"
+                },
+                "image_id": {
+                    "type": "string"
+                },
+                "image_url": {
+                    "type": "string"
+                },
+                "latest_digest": {
+                    "type": "string"
+                },
+                "latest_image_id": {
+                    "type": "string"
+                },
+                "latest_image_version": {
+                    "type": "string"
+                },
+                "latest_revision": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "oci_source": {
+                    "type": "string"
+                },
+                "timestamp": {
+                    "type": "string"
+                },
+                "update_available": {
+                    "type": "boolean"
+                },
+                "update_source": {
+                    "type": "string"
                 }
             }
         }

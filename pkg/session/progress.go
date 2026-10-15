@@ -5,6 +5,8 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"github.com/nicholas-fedor/watchtower/pkg/container"
+	"github.com/nicholas-fedor/watchtower/pkg/container/oci"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
@@ -38,6 +40,7 @@ func UpdateFromContainer(log *zerolog.Logger,
 		monitorOnly:    container.IsMonitorOnly(params),
 		newContainerID: "",
 	}
+	applyReportMeta(update, container, params)
 	log.Debug().
 		Str("container_id", container.ID().ShortID()).
 		Str("name", container.Name()).
@@ -124,6 +127,131 @@ func (m Progress) UpdateFailed(log *zerolog.Logger, failures map[types.Container
 			Str("name", update.Name()).
 			Msg("Updated container state to failed")
 	}
+}
+
+// UpdateSkipped marks containers as skipped, with the reason for each. A
+// container already marked as failed keeps its failure and error, so a later
+// phase skipping it cannot hide why it failed.
+//
+// Parameters:
+//   - log: Process logger.
+//   - skips: Map of container IDs to skip reasons.
+func (m Progress) UpdateSkipped(log *zerolog.Logger, skips map[types.ContainerID]error) {
+	for containerID, reason := range skips {
+		update, exists := m[containerID]
+		if !exists {
+			log.Debug().
+				Str("container_id", containerID.ShortID()).
+				Msg("Container not found in progress map, cannot mark as skipped")
+
+			continue
+		}
+
+		if update.state == FailedState {
+			log.Debug().
+				Err(reason).
+				Str("container_id", containerID.ShortID()).
+				Str("name", update.Name()).
+				Msg("Container already failed, keeping its failure")
+
+			continue
+		}
+
+		update.containerError = reason
+		update.state = SkippedState
+		log.Debug().
+			Err(reason).
+			Str("container_id", containerID.ShortID()).
+			Str("name", update.Name()).
+			Msg("Updated container state to skipped")
+	}
+}
+
+// applyReportMeta copies Git and OCI fields onto a scanned container status.
+//
+// Parameters:
+//   - status: Status to update.
+//   - c: Source container.
+//   - params: Update parameters used to resolve report metadata.
+func applyReportMeta(status *ContainerStatus, c types.Container, params types.UpdateParams) {
+	if status == nil {
+		return
+	}
+
+	if _, ok := c.(*container.Container); !ok {
+		return
+	}
+
+	meta := container.ResolveReportMeta(c, params, container.ChangelogVars{}, oci.Annotations{})
+	status.SetGitMetadata(meta)
+}
+
+// SetLatestImage updates the latest image ID recorded for a container.
+//
+// Parameters:
+//   - log: Process logger.
+//   - containerID: Container identity.
+//   - image: Newest image ID, including a Git-built image.
+//
+// Returns:
+//   - none.
+func (m Progress) SetLatestImage(log *zerolog.Logger, containerID types.ContainerID, image types.ImageID) {
+	update, exists := m[containerID]
+	if !exists {
+		return
+	}
+
+	update.newImage = image
+	log.Debug().
+		Str("container_id", containerID.ShortID()).
+		Str("image", image.ShortID()).
+		Msg("Updated latest image on container status")
+}
+
+// SetLatestImageMeta re-resolves report metadata for a known new image and
+// applies it to a container's status.
+//
+// It serves both update paths. A registry update passes the pulled image's
+// annotations and, when the changelog feature is enabled, a probed release
+// tag. A Git rebuild passes its resolved tag and commit with no latest
+// annotations, so LatestImageVersion stays empty.
+//
+// Parameters:
+//   - log: Process logger.
+//   - c: Container whose report should be updated.
+//   - params: Update parameters.
+//   - vars: New-version values for changelog placeholders.
+//   - latest: OCI annotations from a newly pulled image, or empty for none.
+//
+// Returns:
+//   - container.ReportMeta: The applied metadata, or empty when nothing changed.
+func (m Progress) SetLatestImageMeta(
+	log *zerolog.Logger,
+	c types.Container,
+	params types.UpdateParams,
+	vars container.ChangelogVars,
+	latest oci.Annotations,
+) container.ReportMeta {
+	if c == nil {
+		return container.ReportMeta{}
+	}
+
+	update, exists := m[c.ID()]
+	if !exists {
+		return container.ReportMeta{}
+	}
+
+	meta := container.ResolveReportMeta(c, params, vars, latest)
+	update.SetGitMetadata(meta)
+
+	log.Debug().
+		Str("container_id", c.ID().ShortID()).
+		Str("name", update.Name()).
+		Str("latest_version", meta.LatestVersion).
+		Str("changelog", meta.Changelog).
+		Msg("Applied latest image metadata to container status")
+
+	return meta
 }
 
 // Add inserts a container status into the progress map.

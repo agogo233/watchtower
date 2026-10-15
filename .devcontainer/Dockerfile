@@ -1,10 +1,12 @@
-# syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
-FROM golang:1.27.1-alpine@sha256:8a5910f31396cd4d89662f56c68b3ae31d374308270a1c3bd96672ee5ed43414
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+FROM golang:1.27.2-alpine@sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d
 ARG GOOS=linux
-ARG TARGETARCH
 
+# gcc and musl-dev provide the cgo toolchain that the race detector requires.
 RUN apk add --no-cache \
+    gcc \
     git \
+    musl-dev \
     nano \
     openssh
 
@@ -21,21 +23,11 @@ RUN adduser $USERNAME -s /bin/sh -D -u $USER_UID $USER_GID && \
     chmod 0440 /etc/sudoers.d/$USERNAME
 
 # Install golangci-lint
-RUN wget -O- https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b /usr/local/bin/ v2.5.0
-
-# Install mockery
-# Map Docker's TARGETARCH (amd64/arm64) to Mockery's naming (x86_64/arm64)
-RUN case ${TARGETARCH} in \
-    amd64) ARCH="x86_64" ;; \
-    arm64) ARCH="arm64" ;; \
-    *) ARCH=${TARGETARCH} ;; \
-    esac && \
-    wget -O /tmp/mockery.tar.gz https://github.com/vektra/mockery/releases/download/v3.7.2/mockery_3.7.2_Linux_${ARCH}.tar.gz && \
-    tar -xzf /tmp/mockery.tar.gz -C /tmp && \
-    mv /tmp/mockery /usr/local/bin/mockery
+RUN wget -O- https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b /usr/local/bin/
 
 USER $USERNAME
 
+RUN go install -v github.com/go-task/task/v3/cmd/task@v3.54.0
 RUN go install -v golang.org/x/tools/gopls@latest
 RUN go install -v github.com/go-delve/delve/cmd/dlv@latest
 RUN go install -v honnef.co/go/tools/cmd/staticcheck@latest

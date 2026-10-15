@@ -1,14 +1,17 @@
 package container
 
 import (
+	"bytes"
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	dockerContainer "github.com/moby/moby/api/types/container"
 
+	"github.com/nicholas-fedor/watchtower/pkg/container/git"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
@@ -444,6 +447,46 @@ func TestContainer_IsMonitorOnly(t *testing.T) {
 	}
 }
 
+func TestContainer_IsGitWatch(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		label   string
+		present bool
+		global  bool
+		want    bool
+	}{
+		{name: "missing uses process true", global: true, want: true},
+		{name: "missing uses process false"},
+		{name: "label true", label: "true", present: true, want: true},
+		{name: "label false", label: "false", present: true, global: true},
+		{name: "invalid uses process", label: "maybe", present: true, global: true, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			labels := map[string]string{}
+			if tt.present {
+				labels[git.WatchLabel] = tt.label
+			}
+
+			c := &Container{
+				containerInfo: &dockerContainer.InspectResponse{
+					Name: "/test-container",
+					Config: &dockerContainer.Config{
+						Labels: labels,
+					},
+				},
+			}
+
+			assert.Equal(t, tt.want, c.IsGitWatch(types.UpdateParams{EnableGitMonitoring: tt.global}))
+		})
+	}
+}
+
 func TestContainer_IsNoPull(t *testing.T) {
 	type args struct {
 		params types.UpdateParams
@@ -609,6 +652,18 @@ func TestContainer_IsWatchtower(t *testing.T) {
 						Labels: map[string]string{},
 					},
 				},
+			},
+			want: false,
+		},
+		{
+			name: "NoContainerInfo",
+			c:    &Container{},
+			want: false,
+		},
+		{
+			name: "NoConfig",
+			c: &Container{
+				containerInfo: &dockerContainer.InspectResponse{Name: "/test-container"},
 			},
 			want: false,
 		},
@@ -1637,6 +1692,43 @@ func TestGetEffectiveScope_NoneScopeEdgeCases(t *testing.T) {
 			}
 
 			assert.Equal(t, tt.expectedScope, result, tt.description)
+		})
+	}
+}
+
+// TestContainer_IsWatchtower_DoesNotLog verifies that checking whether a
+// container is Watchtower writes no log entries, even at debug level, since
+// a scan checks every container many times.
+func TestContainer_IsWatchtower_DoesNotLog(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		labels map[string]string
+		want   bool
+	}{
+		{name: "label true", labels: map[string]string{watchtowerLabel: "true"}, want: true},
+		{name: "label false", labels: map[string]string{watchtowerLabel: "false"}},
+		{name: "label missing", labels: map[string]string{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var out bytes.Buffer
+
+			log := zerolog.New(&out).Level(zerolog.DebugLevel)
+			c := NewContainer(&log, &dockerContainer.InspectResponse{
+				Name:   "/app",
+				Config: &dockerContainer.Config{Labels: tt.labels},
+			}, nil)
+
+			// Measure only the IsWatchtower call, not the container's creation.
+			out.Reset()
+
+			assert.Equal(t, tt.want, c.IsWatchtower())
+			assert.Empty(t, out.String())
 		})
 	}
 }

@@ -19,7 +19,6 @@ import (
 	"github.com/rs/zerolog"
 
 	shoutrrrTypes "github.com/nicholas-fedor/shoutrrr/pkg/types"
-	stdlog "log"
 
 	"github.com/nicholas-fedor/watchtower/pkg/session"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
@@ -208,15 +207,18 @@ func createNotifier(
 	if err != nil {
 		localLog.Error().Err(err).
 			Msg("Could not use configured notification template, falling back to default")
+
+		// An empty template string selects the built-in default, which always parses.
+		tpl, _ = getShoutrrrTemplate(localLog, "", legacy)
 	}
 
 	// Set logger based on stdout flag.
 	var logger shoutrrrTypes.StdLogger
 	if stdout {
-		logger = stdlog.New(os.Stdout, ``, 0)
+		logger = newStdLogger(os.Stdout, "")
 	} else {
 		// Bridge shoutrrr's stdlib logger into the process zerolog (notify=no).
-		logger = stdlog.New(localLog, "Shoutrrr: ", 0)
+		logger = newStdLogger(localLog, "Shoutrrr: ")
 	}
 
 	// Initialize sender with default options.
@@ -748,6 +750,10 @@ func deduplicateEntries(entries []*notificationEntry) []*notificationEntry {
 			image, _ := entry.Data["image"].(string)
 			newID, _ := entry.Data["new_id"].(string)
 			key = dedupKey{message: entry.Message, data: image + "\x00" + newID}
+		case "Found new Git revision":
+			revision, _ := entry.Data["revision"].(string)
+			shortCommit, _ := entry.Data["short_commit"].(string)
+			key = dedupKey{message: entry.Message, data: revision + "\x00" + shortCommit}
 		case "Removing image":
 			// Deduplicate by image ID.
 			imageID, _ := entry.Data["image_id"].(string)

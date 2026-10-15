@@ -8,6 +8,9 @@ To contribute code changes to this project you will need the following developme
 
 * [Go](https://go.dev/doc/install)
 * [Docker](https://docs.docker.com/engine/installation/)
+* [Task](https://taskfile.dev/installation/) (runs the project tasks defined in `Taskfile.yml`)
+
+Run `task` from the repository root to list the available tasks.
 
 It is highly recommended to have the latest version of Go installed.
 You can check for your current Go version as follows:
@@ -53,23 +56,39 @@ Watchtower uses [Golangci-lint](https://golangci-lint.run/) to help maintain cod
 The configuration file can be found at `build/golangci-lint/golangci-lint.yaml`.
 It can be installed locally using the following [instructions](https://golangci-lint.run/docs/welcome/install/local/).
 
-The preferred method of using the linter is via the Makefile using the following command:
+The preferred method of using the linter is the following task:
 
 ```bash
-make lint
+task lint
 ```
 
-This runs Golangci-lint while also invoking the following flags:
+This runs Golangci-lint with the project configuration and applies automatic fixes where possible (for example, `modernize` rewrites).
+To check for issues without modifying any files, run:
 
-* `--fix` - automatically fixes issues where possible
-* `--config build/golangci-lint/golangci-lint.yaml` - specifies the configuration file to use
+```bash
+task lint:check
+```
 
 ## Formatting
 
-Golangci-lint can also be used to format the codebase using the following Makefile target:
+Golangci-lint can also be used to format the codebase:
 
 ```bash
-make fmt
+task fmt
+```
+
+Swagger annotation comments are formatted separately with the [swag](https://github.com/swaggo/swag) CLI, which is pinned as a Go tool in `go.mod`:
+
+```bash
+task swag:fmt
+```
+
+After changing API annotations, regenerate the Swagger documents in `internal/api/swagger/` and commit them.
+CI fails when the committed documents differ from freshly generated ones, which `task swag:check` reproduces locally:
+
+```bash
+task swag:gen
+task swag:check
 ```
 
 ## Testing
@@ -77,20 +96,23 @@ make fmt
 ### Mocking
 
 [Mockery](https://vektra.github.io/mockery/latest/) is used to generate mock implementations of interfaces.
-It is configured using the `build/mockery/mockery.yaml` file.
+It is pinned as a Go tool in `go.mod` and configured using the `build/mockery/mockery.yaml` file.
 
 To generate new mock implementations of Watchtower's interfaces, run the following from the root directory:
 
 ```bash
-make mocks
+task mocks
 ```
+
+`task mocks:check` regenerates the mocks and fails if they differ from the committed ones.
+It leaves the regenerated files in place so you can review and commit them.
 
 ### Executing Unit Tests
 
-To execute Watchtower's unit tests, run the following Makefile target from the root directory:
+To execute Watchtower's unit tests, run the following task from the root directory:
 
 ```bash
-make test
+task test
 ```
 
 This will run the `go test` command with the following flags:
@@ -99,6 +121,25 @@ This will run the `go test` command with the following flags:
 * `-v` - enables verbose output
 * `-coverprofile coverage.out` - generates a coverage profile
 * `-covermode atomic` - sets the cover mode to atomic
+
+Two further tasks help catch concurrency and test-isolation bugs:
+
+* `task test:race` - runs the tests with the race detector
+* `task test:repeat` - runs the repeat-safe packages twice in shuffled order to catch state leaking between tests
+
+### Golden Files
+
+Some tests compare output against golden files in `testdata/` directories, such as the `--help` output, the flag manifest, and the inventory of environment variables and container labels.
+These guard Watchtower's user-facing configuration surface, so a failing golden test means a user-visible change.
+If the change is intended, regenerate the files and review the diff before committing:
+
+```bash
+task test:update-golden
+```
+
+The template preview module in `tools/tplprev` cannot import Watchtower, so it keeps a generated copy of the built-in notification templates, along with generated lists of the container report methods templates can call and the container keys in the JSON output.
+A test fails when these copies differ from `pkg/notifications`, and the preview module's own tests check its report type and JSON output against the lists.
+After changing a built-in template, the container report, or the JSON output, regenerate the copies with `task tplprev:gen` (or `task test:update-golden`), update the preview module to match, and commit both.
 
 ## Building
 
@@ -112,7 +153,7 @@ go test ./... -v                       # runs tests with verbose output
 ./watchtower                           # runs the application (outside of a container)
 ```
 
-If you don't have it enabled, you'll either have to prefix each command with `GO111MODULE=on` or run `export GO111MODULE=on` before running the commands. [You can read more about modules here.](https://github.com/golang/go/wiki/Modules)
+The equivalent tasks are `task build` (writes `bin/watchtower`) and `task run` (pass flags after `--`, for example `task run -- --help`).
 
 For cross-compiling to other architectures (e.g., amd64, arm64, arm/v7, 386, riscv64), set environment variables like `GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0` before running `go build`. Example for arm/v7:
 
@@ -122,15 +163,17 @@ GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -o watchtower-armhf
 
 #### Using GoReleaser
 
-To build the Watchtower binary and archives for production releases, use GoReleaser with the `prod.yml` configuration. This handles cross-compilation, versioning, and packaging for multiple architectures (amd64, i386, armhf, arm64v8, riscv64) and OS (Linux, Windows).
+To build the Watchtower binary and archives for production releases, use GoReleaser with the `build/goreleaser/stable.yaml` configuration. This handles cross-compilation, versioning, and packaging for multiple architectures (amd64, i386, armhf, arm64v8, riscv64) and OS (Linux, Windows).
 
-Trigger the `release-prod.yaml` workflow manually via GitHub Actions or on a tag push (e.g., `v1.2.3`) for full builds with SBOM and provenance attestations.
+The `release-stable.yaml` workflow runs on a tag push (e.g., `v1.2.3`) or manually via GitHub Actions, producing full builds with SBOM and provenance attestations.
 
 For local testing, run GoReleaser in snapshot mode:
 
 ```bash
-goreleaser release --config build/goreleaser/prod.yml --snapshot --clean
+task release:snapshot
 ```
+
+This runs `goreleaser release --config build/goreleaser/stable.yaml --snapshot --clean`.
 
 This produces binaries in `dist/` (e.g., `dist/watchtower_linux_amd64/watchtower`) and archives (e.g., `watchtower_linux_amd64_1.11.6.tar.gz` if versioned).
 
@@ -138,10 +181,10 @@ This produces binaries in `dist/` (e.g., `dist/watchtower_linux_amd64/watchtower
 
 To build Watchtower images, use GoReleaser for multi-architecture support with attestations.
 
-For dev images, trigger the `release-dev.yaml` workflow manually or on main pushes to core files. Locally:
+Nightly images are built by the `release-nightly.yaml` workflow, which runs on a daily schedule or manually via GitHub Actions. Locally:
 
 ```bash
-goreleaser release --config build/goreleaser/dev.yml --snapshot --clean
+task release:snapshot CONFIG=nightly
 ```
 
 To build a Watchtower image of your own, use the self-contained Dockerfiles in /build/docker/:
@@ -150,12 +193,12 @@ To build a Watchtower image of your own, use the self-contained Dockerfiles in /
 * `/build/docker/Dockerfile.self-github` will build an image based on current Watchtower's repository on GitHub.
 
 ```bash
-docker build . -f build/docker/Dockerfile.self-local -t nickfedor/watchtower # to build an image from local files
+task docker:build # builds an image named watchtower from local files using Dockerfile.self-local
 ```
 
-For multi-architecture dev images (amd64, i386, armhf, arm64v8, riscv64), use Docker Buildx after cross-compiling binaries to `dist/watchtower_linux_{GOARCH}/watchtower` (matching the dev workflow structure). Alternatively, trigger the `release-dev.yaml` workflow manually via GitHub Actions for dev image builds with SBOM and provenance attestations.
+For multi-architecture nightly images (amd64, i386, armhf, arm64v8, riscv64), use Docker Buildx after cross-compiling binaries to `dist/watchtower_linux_{GOARCH}/watchtower` (matching the nightly workflow structure). Alternatively, trigger the `release-nightly.yaml` workflow manually via GitHub Actions for image builds with SBOM and provenance attestations.
 
-For prod images (with binaries/archives), use the prod config as above.
+For stable images (with binaries/archives), use the stable config as above.
 
 The shared `build/docker/Dockerfile` is used for both, with COPY watchtower /watchtower matching GoReleaser's binary placement.
 

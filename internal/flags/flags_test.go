@@ -773,8 +773,6 @@ func runProcessFlagAliasesHelper(t *testing.T, caseName string) (string, error) 
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
-	// Codacy: static argv only (os.Args[0] is this test binary, case names are fixed literals).
-	// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestProcessFlagAliases_FatalCases$", "-test.v=false")
 
 	cmd.Env = append(os.Environ(), processFlagAliasesHelperEnv+"="+caseName)
@@ -950,6 +948,7 @@ func TestFlagsArePresentInDocumentation(t *testing.T) {
 		"../../docs/configuration/registry-and-authentication/index.md",
 		"../../docs/configuration/scheduling/index.md",
 		"../../docs/configuration/update-behavior/index.md",
+		"../../docs/configuration/git-monitoring/index.md",
 	}
 	allDocs := ""
 
@@ -999,38 +998,6 @@ func TestSetEnvOptStr_Error(t *testing.T) {
 	err := setEnvOptStr(testLogger(), "TEST_ENV", "value")
 	assert.NoError(t, err) // Normally succeeds; mock needed for failure
 	// To truly test setenv failure, use a system where Setenv fails (e.g., read-only env)
-}
-
-// TestGetSecretFromFile_OpenError tests file opening errors in getSecretFromFile.
-func TestGetSecretFromFile_OpenError(t *testing.T) {
-	cmd := new(cobra.Command)
-
-	SetDefaults()
-	RegisterNotificationFlags(cmd)
-
-	fileName := t.TempDir() + "/nonexistent-file"
-
-	err := cmd.ParseFlags([]string{"--notification-email-server-password", fileName})
-	require.NoError(t, err)
-
-	// Custom getSecret to explicitly hit os.Open failure
-	getSecret := func(flags *pflag.FlagSet, secret string) error {
-		flag := flags.Lookup(secret)
-
-		value := flag.Value.String()
-		if value != "" && true { // Force path without mocking isFilePath
-			_, err := os.Open(value)
-			if err != nil {
-				return fmt.Errorf("%w: %w", errOpenFileFailed, err)
-			}
-		}
-
-		return nil
-	}
-
-	err = getSecret(cmd.PersistentFlags(), "notification-email-server-password")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "failed to open secret file")
 }
 
 // TestGetSecretFromFile_SkipCommentsAndEmptyLines verifies that comment and empty

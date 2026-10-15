@@ -18,7 +18,11 @@ var commonTemplates = map[string]string{
 	// "Docker image usage exceeds configured maximum" (session blocked by image-usage budget),
 	// "Docker image usage exceeds configured warning threshold" (image-usage budget warning),
 	// "Failed to query Docker image disk usage" (image-usage query failed),
-	// "Docker image usage budget enabled" (startup budget configuration).
+	// "Docker image usage budget enabled" (startup budget configuration),
+	// "Registry rate limit retries exhausted. Container failed for this cycle" (update failed on a registry rate limit),
+	// "Ignoring depends-on entry that names no container" (depends-on label entry matched nothing),
+	// "Skipping container update (self-dependency)" (container depends on itself),
+	// "Skipping container update (circular dependency)" (container is in a dependency cycle).
 	// For unrecognized messages, displays the message with key=value data pairs if Data exists, otherwise just the message.
 	// Expects .Entries []Entry where each Entry has Message string and Data map[string]interface{}.
 	"default-legacy": `
@@ -45,6 +49,8 @@ var commonTemplates = map[string]string{
     Skipped image cleanup: {{with (index $e.Data "image_name")}}{{.}}{{else}}unknown{{end}} ({{with (index $e.Data "image_id")}}{{.}}{{else}}unknown{{end}}){{with (index $e.Data "error")}}: {{.}}{{end}}
 {{- else if eq $msg "Container updated" -}}
     Updated container: {{with (index $e.Data "container")}}{{.}}{{else}}unknown{{end}} ({{with (index $e.Data "image")}}{{.}}{{else}}unknown{{end}}): {{with (index $e.Data "old_id")}}{{.}}{{else}}unknown{{end}} updated to {{with (index $e.Data "new_id")}}{{.}}{{else}}unknown{{end}}
+{{- else if eq $msg "Changelog" -}}
+    Changelog: {{with (index $e.Data "changelog")}}{{.}}{{else}}unknown{{end}}
 {{- else if eq $msg "Skipping Watchtower self-update in run-once mode" -}}
     Run once mode: Watchtower self-update skipped
 {{- else if eq $msg "Detected multiple Watchtower instances - initiating cleanup" -}}
@@ -71,6 +77,46 @@ var commonTemplates = map[string]string{
     Failed to query Docker image disk usage{{with (index $e.Data "error")}}: {{.}}{{end}}
 {{- else if eq $msg "Docker image usage budget enabled" -}}
     Docker image usage budget enabled: maximum {{if HasKey $e.Data "disk_space_max"}}{{FormatDiskSpace (index $e.Data "disk_space_max")}}{{else}}0 B{{end}}, warning at {{if HasKey $e.Data "disk_space_warn"}}{{FormatDiskSpace (index $e.Data "disk_space_warn")}}{{else}}0 B{{end}}
+{{- else if eq $msg "Found new Git revision" -}}
+    Found new Git revision: {{with (index $e.Data "revision")}}{{.}}{{else}}unknown{{end}} ({{with (index $e.Data "short_commit")}}{{.}}{{else}}unknown{{end}})
+{{- else if eq $msg "Built image from Git URL context" -}}
+    Built image: {{with (index $e.Data "image")}}{{.}}{{else}}unknown{{end}} ({{with (index $e.Data "image_id")}}{{.}}{{else}}unknown{{end}})
+{{- else if eq $msg "Built Compose project" -}}
+    Built Compose project: {{with (index $e.Data "project")}}{{.}}{{else}}unknown{{end}} ({{with (index $e.Data "service")}}{{.}}{{else}}unknown{{end}})
+{{- else if eq $msg "Compose apply finished with unconfirmed service results" -}}
+    Compose update finished with unconfirmed results for {{with (index $e.Data "service")}}{{.}}{{else}}unknown{{end}}
+{{- else if eq $msg "Git build failed. Leaving running container untouched" -}}
+    Git update failed for {{with (index $e.Data "container")}}{{.}}{{else}}unknown{{end}}. The running container was left in place{{with (index $e.Data "error")}}: {{.}}{{end}}
+{{- else if eq $msg "Compose apply failed. Docker Compose may have partially recreated services" -}}
+    Compose update failed for {{with (index $e.Data "container")}}{{.}}{{else}}unknown{{end}}. Docker Compose may have partially recreated services{{with (index $e.Data "error")}}: {{.}}{{end}}
+{{- else if eq $msg "Compose update failed before container replacement" -}}
+    Compose update failed for {{with (index $e.Data "container")}}{{.}}{{else}}unknown{{end}}. The running container was left in place{{with (index $e.Data "error")}}: {{.}}{{end}}
+{{- else if eq $msg "Compose project directory is not readable. Leaving the running container untouched" -}}
+    Skipped {{with (index $e.Data "container")}}{{.}}{{else}}container{{end}}: compose directory is not readable
+{{- else if eq $msg "Compose apply skipped. Container has no compose service label" -}}
+    Skipped {{with (index $e.Data "container")}}{{.}}{{else}}container{{end}}: container has no compose service label
+{{- else if eq $msg "Compose apply result omitted this service. Runtime state is unknown" -}}
+    Skipped {{with (index $e.Data "container")}}{{.}}{{else}}container{{end}}: compose result did not include {{with (index $e.Data "service")}}{{.}}{{else}}the service{{end}}
+{{- else if eq $msg "Compose apply did not return an identifiable instance for this replica. Runtime state is unknown" -}}
+    Skipped {{with (index $e.Data "container")}}{{.}}{{else}}container{{end}}: compose result did not identify this replica
+{{- else if eq $msg "Could not dependency-sort Compose batches. Using the existing container order" -}}
+    Compose dependency order is unavailable. Using the current container order
+{{- else if eq $msg "Could not order Compose batches by dependencies. Using first-seen order" -}}
+    Compose dependency order is unavailable. Using the current container order
+{{- else if eq $msg "Compose batch dependencies are cyclic. Appending unresolved batches in first-seen order" -}}
+    Compose dependency order is unavailable. Using the current container order
+{{- else if eq $msg "Skipped container with an invalid git semver policy" -}}
+    Skipped {{with (index $e.Data "container")}}{{.}}{{else}}container{{end}}: invalid git semver policy
+{{- else if eq $msg "Skipped container with an invalid git-host" -}}
+    Skipped {{with (index $e.Data "container")}}{{.}}{{else}}container{{end}}: invalid git-host
+{{- else if eq $msg "Registry rate limit retries exhausted. Container failed for this cycle" -}}
+    Update failed for {{with (index $e.Data "container")}}{{.}}{{else}}container{{end}} ({{with (index $e.Data "image")}}{{.}}{{else}}unknown{{end}}){{with (index $e.Data "error")}}: {{.}}{{end}}
+{{- else if eq $msg "Ignoring depends-on entry that names no container" -}}
+    Ignored depends-on {{with (index $e.Data "depends_on")}}{{.}}{{else}}entry{{end}} for {{with (index $e.Data "container")}}{{.}}{{else}}container{{end}}: no container has that name
+{{- else if eq $msg "Skipping container update (self-dependency)" -}}
+    Skipped {{with (index $e.Data "container")}}{{.}}{{else}}container{{end}}: depends on itself
+{{- else if eq $msg "Skipping container update (circular dependency)" -}}
+    Skipped {{with (index $e.Data "container")}}{{.}}{{else}}container{{end}}: circular dependency
 {{- else if $e.Data -}}
     {{- /* For messages with data, show message and key=value pairs */ -}}
     {{$msg}} | {{range $k, $v := $e.Data}}{{$k}}={{$v}} {{end}}
@@ -97,7 +143,7 @@ var commonTemplates = map[string]string{
     {{len .Scanned}} Scanned, {{len .Updated}} Updated, {{len .Restarted}} Restarted, {{len .Failed}} Failed, {{len .Fresh}} Fresh, {{len .Skipped}} Skipped
       {{- /* List successfully updated containers */ -}}
       {{- range .Updated}}
-- {{.Name}} ({{.ImageName}}): {{.CurrentImageID.ShortID}} updated to {{.LatestImageID.ShortID}}
+- {{.Name}} ({{.ImageName}}): {{.CurrentImageID.ShortID}} updated to {{.LatestImageID.ShortID}}{{with .GitRef}} ref {{.}}{{end}}{{with .Changelog}} {{.}}{{end}}
       {{- end -}}
       {{- /* List restarted containers */ -}}
       {{- range .Restarted}}

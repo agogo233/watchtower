@@ -14,6 +14,11 @@ type Update struct {
 	// NoPull skips pulling new images from the registry
 	// (--no-pull / WATCHTOWER_NO_PULL).
 	NoPull bool
+	// EnableChangelog turns on the changelog notification line and the versioned
+	// release link. It is off by default because resolving the exact release tag
+	// costs one or two extra registry manifest requests per updated container
+	// (--enable-changelog / WATCHTOWER_ENABLE_CHANGELOG).
+	EnableChangelog bool
 	// NoRestart prevents containers from being restarted after an update
 	// (--no-restart / WATCHTOWER_NO_RESTART).
 	NoRestart bool
@@ -39,7 +44,7 @@ type Update struct {
 	// EphemeralSelfUpdate uses a short-lived orchestrator container for Watchtower self-update
 	// (--ephemeral-self-update / WATCHTOWER_EPHEMERAL_SELF_UPDATE).
 	EphemeralSelfUpdate bool
-	// PullFailureDelay is the delay after a failed Watchtower self-update pull.
+	// PullFailureDelay is the delay after a failed Watchtower self-update pull in run-once mode.
 	PullFailureDelay time.Duration
 	// DiskSpaceMax is the raw --disk-space-max / WATCHTOWER_DISK_SPACE_MAX value.
 	DiskSpaceMax string

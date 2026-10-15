@@ -1,12 +1,21 @@
 package container
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io/fs"
 	"os"
+	"strings"
+	"testing"
 
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
+	"github.com/rs/zerolog"
+	"github.com/spf13/afero"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	dockerContainer "github.com/moby/moby/api/types/container"
 	dockerImage "github.com/moby/moby/api/types/image"
@@ -639,3 +648,194 @@ var _ = ginkgo.Describe("GetCurrentContainerID", func() {
 		}, types.ContainerID(""), true, "failed to detect current container ID"),
 	)
 })
+
+// statErrorFs is a filesystem whose Stat fails with err for every path.
+type statErrorFs struct {
+	afero.Fs
+
+	// err is returned by every Stat call.
+	err error
+}
+
+// Stat returns the configured error.
+func (f statErrorFs) Stat(string) (os.FileInfo, error) {
+	return nil, f.err
+}
+
+// TestInContainer verifies that the container marker files decide whether
+// Watchtower runs in a container, and that an unreadable marker counts as
+// present.
+func TestInContainer(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		// files are created before the check.
+		files []string
+		// statErr, when set, fails every Stat call.
+		statErr error
+		want    bool
+	}{
+		{name: "no marker", want: false},
+		{name: "docker marker", files: []string{"/.dockerenv"}, want: true},
+		{name: "podman marker", files: []string{"/run/.containerenv"}, want: true},
+		{name: "marker cannot be checked", statErr: fs.ErrPermission, want: true},
+		{name: "markers do not exist", statErr: fs.ErrNotExist, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fsys := afero.NewMemMapFs()
+			for _, name := range tt.files {
+				require.NoError(t, afero.WriteFile(fsys, name, nil, 0o600))
+			}
+
+			if tt.statErr != nil {
+				fsys = statErrorFs{Fs: fsys, err: tt.statErr}
+			}
+
+			assert.Equal(t, tt.want, InContainer(fsys))
+		})
+	}
+}
+
+// TestInContainer_WrappedNotExist verifies that a wrapped not-exist error
+// still counts as a missing marker.
+func TestInContainer_WrappedNotExist(t *testing.T) {
+	t.Parallel()
+
+	fsys := statErrorFs{Fs: afero.NewMemMapFs(), err: errors.Join(errors.New("stat"), fs.ErrNotExist)}
+
+	assert.False(t, InContainer(fsys))
+}
+
+// TestGetCurrentContainerID_FailureLogsAtDebug verifies that failing to find
+// the container ID is not logged as an error. A Watchtower binary on the host
+// has no container ID, and callers report a missing ID themselves. It replaces
+// the file readers and sets environment variables, so it runs sequentially.
+func TestGetCurrentContainerID_FailureLogsAtDebug(t *testing.T) {
+	t.Setenv("HOSTNAME", "")
+
+	savedMountinfo, savedCgroup := ReadMountinfoFunc, ReadCgroupFunc
+
+	t.Cleanup(func() { ReadMountinfoFunc, ReadCgroupFunc = savedMountinfo, savedCgroup })
+
+	notFound := func(string) ([]byte, error) { return nil, os.ErrNotExist }
+	ReadMountinfoFunc, ReadCgroupFunc = notFound, notFound
+
+	var out bytes.Buffer
+
+	log := zerolog.New(&out).Level(zerolog.TraceLevel)
+
+	id, err := GetCurrentContainerID(&log, t.Context(), nil)
+	require.Error(t, err)
+	assert.Empty(t, id)
+	assert.NotContains(t, out.String(), `"level":"error"`)
+	assert.NotContains(t, out.String(), `"level":"warn"`)
+
+	// Find the summary record and check its level.
+	var levels []string
+
+	for line := range strings.Lines(out.String()) {
+		var record map[string]any
+
+		require.NoError(t, json.Unmarshal([]byte(line), &record))
+
+		if record["message"] == "All container ID detection methods failed" {
+			levels = append(levels, record["level"].(string))
+		}
+	}
+
+	assert.Equal(t, []string{"debug"}, levels)
+}
+
+// TestParseContainerIDFromMountinfo_Layouts verifies that the container ID is
+// read from the mount roots Docker and Podman use, and that paths which only
+// resemble them are ignored.
+func TestParseContainerIDFromMountinfo_Layouts(t *testing.T) {
+	t.Parallel()
+
+	const id = "867e908db86764ddc4898108f1ffc69c7cdaa903079cfe71d27d3f78278be03c"
+
+	tests := []struct {
+		name string
+		root string
+		want types.ContainerID
+	}{
+		{name: "Docker", root: "/var/lib/docker/containers/" + id + "/hostname", want: id},
+		{name: "rootless Podman", root: "/containers/overlay-containers/" + id + "/userdata/hostname", want: id},
+		{
+			name: "rootful Podman",
+			root: "/var/lib/containers/storage/overlay-containers/" + id + "/userdata/hostname",
+			want: id,
+		},
+		{name: "a directory that only ends in containers", root: "/srv/notcontainers/" + id + "/hostname"},
+		{name: "a prefixed overlay directory", root: "/srv/my-overlay-containers/" + id + "/hostname"},
+		{name: "a longer hexadecimal directory name", root: "/containers/overlay-containers/" + id + "a/userdata/hostname"},
+		{name: "an ID that ends the path", root: "/var/lib/docker/containers/" + id, want: id},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			mountinfo := "1234 24 0:52 " + tt.root + " /etc/hostname rw,relatime - ext4 /dev/sda1 rw\n"
+
+			got, err := ParseContainerIDFromMountinfo(testLog(), mountinfo)
+			if tt.want == "" {
+				require.ErrorIs(t, err, errNoValidContainerID)
+
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestParseContainerIDFromCgroupString_Layouts verifies the container ID is
+// read from cgroup paths under both the cgroupfs and the systemd cgroup
+// drivers, for Docker and Podman, and not from paths without a full ID.
+func TestParseContainerIDFromCgroupString_Layouts(t *testing.T) {
+	t.Parallel()
+
+	const id = "3f4e2b1a9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f"
+
+	tests := []struct {
+		name   string
+		cgroup string
+		want   types.ContainerID
+	}{
+		{name: "cgroupfs driver", cgroup: "12:memory:/docker/" + id, want: id},
+		{name: "systemd driver on cgroup v1", cgroup: "1:name=systemd:/system.slice/docker-" + id + ".scope", want: id},
+		{name: "systemd driver on cgroup v2", cgroup: "0::/system.slice/docker-" + id + ".scope", want: id},
+		{name: "Podman under systemd", cgroup: "0::/machine.slice/libpod-" + id + ".scope", want: id},
+		{
+			name:   "Podman under systemd with a nested container cgroup",
+			cgroup: "0::/machine.slice/libpod-" + id + ".scope/container",
+			want:   id,
+		},
+		{name: "namespaced cgroup v2", cgroup: "0::/"},
+		{name: "scope without a full ID", cgroup: "0::/system.slice/docker-compose-app.scope"},
+		{name: "short ID in a scope", cgroup: "0::/system.slice/docker-" + id[:12] + ".scope"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := ParseContainerIDFromCgroupString(testLog(), tt.cgroup)
+			if tt.want == "" {
+				require.ErrorIs(t, err, errNoValidContainerID)
+
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}

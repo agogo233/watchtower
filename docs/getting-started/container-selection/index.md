@@ -150,6 +150,9 @@ Watchtower can filter containers based on their container name using [Go regex p
 Pass container names as positional arguments to Watchtower.
 When provided, only containers matching at least one name are monitored.
 
+!!! Warning
+    - Dependencies on containers that are not named are ignored. See [Dependencies on Unmonitored Containers](../../advanced-features/linked-containers/index.md#dependencies_on_unmonitored_containers).
+
 <!-- markdownlint-disable -->
 === "Docker Compose"
     ```yaml
@@ -529,15 +532,23 @@ This applies to the [`monitor-only`](../../configuration/update-behavior/index.m
 
 ### Container Labels
 
-| Label                                                                                     | Values                | Effect                                          |
-|-------------------------------------------------------------------------------------------|-----------------------|-------------------------------------------------|
-| `com.centurylinklabs.watchtower.enable`                                                   | true / false          | Enable or disable management                    |
-| `com.centurylinklabs.watchtower.monitor-only`                                             | true / false          | Monitor without updating                        |
-| `com.centurylinklabs.watchtower.no-pull`                                                  | true / false          | Skip image pulls                                |
-| `com.centurylinklabs.watchtower.scope`                                                    | any string            | Assign to a monitoring scope                    |
-| `com.centurylinklabs.watchtower.depends-on`                                               | comma-separated names | Declare container dependencies                  |
-| `com.centurylinklabs.watchtower.cooldown-delay`                                           | duration string       | Minimum image age before updating               |
-| [`com.centurylinklabs.watchtower.copy-file`](../../advanced-features/copy-files/index.md) | comma-separated paths | Copy named files onto the replacement container |
+| Label                                                                                     | Values                          | Effect                                                                                                                     |
+|-------------------------------------------------------------------------------------------|---------------------------------|----------------------------------------------------------------------------------------------------------------------------|
+| `com.centurylinklabs.watchtower.enable`                                                   | true / false                    | Enable or disable management                                                                                               |
+| `com.centurylinklabs.watchtower.monitor-only`                                             | true / false                    | Monitor without updating                                                                                                   |
+| `com.centurylinklabs.watchtower.no-pull`                                                  | true / false                    | Skip image pulls                                                                                                           |
+| `com.centurylinklabs.watchtower.scope`                                                    | any string                      | Assign to a monitoring scope                                                                                               |
+| `com.centurylinklabs.watchtower.depends-on`                                               | comma-separated names           | Declare container dependencies                                                                                             |
+| `com.centurylinklabs.watchtower.cooldown-delay`                                           | duration string                 | Minimum image age before updating                                                                                          |
+| [`com.centurylinklabs.watchtower.copy-file`](../../advanced-features/copy-files/index.md) | comma-separated paths           | Copy named files onto the replacement container                                                                            |
+| `com.centurylinklabs.watchtower.git-repo`                                                 | Git clone URL                   | Associate a Git repository. See [Git Monitoring](../../advanced-features/git-monitoring/index.md#labels).                  |
+| `com.centurylinklabs.watchtower.git-ref`                                                  | branch or tag                   | Git ref to watch. `com.centurylinklabs.watchtower.git-branch` is an alias                                                  |
+| `com.centurylinklabs.watchtower.git-host`                                                 | HTTP API base URL               | HTTP API origin when it is not the clone URL. See [Git Monitoring](../../advanced-features/git-monitoring/index.md#hosts)  |
+| `com.centurylinklabs.watchtower.git-semver-policy`                                        | none / patch / minor / major    | Git semver tag advancement policy                                                                                          |
+| `com.centurylinklabs.watchtower.git-watch`                                                | true / false / yes / no / 1 / 0 | Enable or disable the Git watcher for this container                                                                       |
+| `com.centurylinklabs.watchtower.git-dockerfile`                                           | relative path                   | Dockerfile path relative to the build context                                                                              |
+| `com.centurylinklabs.watchtower.git-context`                                              | relative path                   | Subdirectory of a Git URL context used as the Docker build context                                                         |
+| `com.centurylinklabs.watchtower.compose-dir`                                              | path inside Watchtower          | Opt in to a local path context. See [Git Monitoring](../../advanced-features/git-monitoring/index.md#local_path_context). |
 
 ## Common Patterns
 

@@ -1,6 +1,8 @@
 package sorter
 
 import (
+	"maps"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -134,6 +136,31 @@ func sortByDependencies(log *zerolog.Logger, containers []types.Container, useCo
 		return nil, err
 	}
 
+	return kahnSort(log, containers, containerMap, indegree, adjacency, normalizedMap)
+}
+
+// kahnSort orders the containers of a dependency graph with Kahn's algorithm,
+// dependencies first. Ties are broken in reverse alphabetical order of the
+// container identifiers, so the order is deterministic.
+//
+// Parameters:
+//   - log: Process logger.
+//   - containers: The containers of the graph.
+//   - containerMap: Container for each identifier.
+//   - indegree: Number of dependencies of each identifier. Consumed by the sort.
+//   - adjacency: Dependents of each identifier.
+//   - normalizedMap: Identifier of each container.
+//
+// Returns:
+//   - []types.Container: Sorted list in dependency order (dependencies first).
+//   - error: A CircularReferenceError when not every container can be ordered.
+func kahnSort(log *zerolog.Logger,
+	containers []types.Container,
+	containerMap map[string]types.Container,
+	indegree map[string]int,
+	adjacency map[string][]string,
+	normalizedMap map[types.Container]string,
+) ([]types.Container, error) {
 	// Phase 2: Initialize processing queue with containers that have no dependencies
 	queue := initializeQueue(indegree)
 
@@ -166,7 +193,7 @@ func sortByDependencies(log *zerolog.Logger, containers []types.Container, useCo
 	}
 
 	// Phase 4: Cycle detection
-	err = detectAndReportCycle(log,
+	err := detectAndReportCycle(log,
 		sorted,
 		containers,
 		containerMap,
@@ -215,18 +242,41 @@ func buildDependencyGraph(log *zerolog.Logger,
 	containers []types.Container,
 	useComposeDependsOn bool,
 ) (map[string]types.Container, map[string]int, map[string][]string, map[types.Container]string, error) {
-	containerMap := make(map[string]types.Container)
-	indegree := make(map[string]int)
-	adjacency := make(map[string][]string)
-	normalizedMap := make(map[types.Container]string)
+	graph, err := newDependencyGraph(
+		log,
+		containers,
+		nil,
+		nil,
+		useComposeDependsOn,
+		false,
+	)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
 
+	return graph.subgraph(containers)
+}
+
+// identifierIndex maps each container's normalized dependency identifier to
+// the container.
+//
+// Parameters:
+//   - log: Process logger.
+//   - containers: Containers to index.
+//
+// Returns:
+//   - map[string]types.Container: Container for each normalized identifier.
+//   - error: IdentifierCollisionError if containers share an identifier.
+func identifierIndex(log *zerolog.Logger, containers []types.Container) (map[string]types.Container, error) {
 	// Use temporary map to collect all containers per normalized identifier
-	tempMap := make(map[string][]types.Container)
+	tempMap := make(map[string][]types.Container, len(containers))
 
 	for _, c := range containers {
 		normalizedIdentifier := util.NormalizeContainerName(container.ResolveContainerIdentifier(c))
 		tempMap[normalizedIdentifier] = append(tempMap[normalizedIdentifier], c)
 	}
+
+	index := make(map[string]types.Container, len(tempMap))
 
 	// Check for identifier collisions
 	for identifier, dupContainers := range tempMap {
@@ -237,49 +287,81 @@ func buildDependencyGraph(log *zerolog.Logger,
 				dupContainers,
 			)
 
-			return nil, nil, nil, nil, IdentifierCollisionError{
+			return nil, IdentifierCollisionError{
 				DuplicateIdentifier: identifier,
 				AffectedContainers:  dupContainers,
 			}
 		}
-		// No collision, populate maps
-		containerMap[identifier] = dupContainers[0]
-		indegree[identifier] = 0
-		normalizedMap[dupContainers[0]] = identifier
+
+		index[identifier] = dupContainers[0]
 	}
 
-	// Lookup identifiers for link resolution: canonical keys plus unique bare names.
-	// Docs specify Watchtower depends-on and network_mode targets use container names,
-	// while Compose depends_on uses service names. Aliases bridge those forms to the
-	// canonical project-service graph keys without inventing extra Kahn nodes.
-	// The identifier set is built once and reused for every link in this graph.
-	matchIDSet, aliasToCanonical := buildLinkMatchIndexes(log, containerMap)
+	return index, nil
+}
 
-	// Build the graph by processing container links (dependencies).
-	// Edges always use canonical identifiers so Kahn's algorithm can traverse them.
-	for _, c := range containers {
-		normalizedIdentifier := normalizedMap[c]
-		// c.Links() already returns normalized container names
-		for _, normalizedLink := range c.Links(useComposeDependsOn) {
-			matchedKeys := resolveLinkToCanonicalKeys(
-				normalizedLink,
-				matchIDSet,
-				aliasToCanonical,
-			)
+// ContainerDependencies maps each container to the containers in the set that it depends on.
+//
+// Link matching is the same graph used by SortByDependencies. Callers that group
+// containers into larger units can order those units from this map.
+//
+// Parameters:
+//   - log: Process logger. Required and must be non-nil.
+//   - containers: Containers to inspect.
+//   - useComposeDependsOn: Whether Links() should include Compose depends_on labels.
+//
+// Returns:
+//   - map[types.ContainerID][]types.ContainerID: Dependent ID to dependency IDs.
+//   - error: Non-nil when dependency identifiers collide.
+func ContainerDependencies(
+	log *zerolog.Logger,
+	containers []types.Container,
+	useComposeDependsOn bool,
+) (map[types.ContainerID][]types.ContainerID, error) {
+	if len(containers) == 0 {
+		return map[types.ContainerID][]types.ContainerID{}, nil
+	}
 
-			for _, key := range matchedKeys {
-				if key == normalizedIdentifier {
-					// Self-reference: skip so the container stays indegree 0 for this link.
-					continue
-				}
+	containerMap, _, adjacency, _, err := buildDependencyGraph(log, containers, useComposeDependsOn)
+	if err != nil {
+		return nil, err
+	}
 
-				indegree[normalizedIdentifier]++
-				adjacency[key] = append(adjacency[key], normalizedIdentifier)
+	dependencies := make(map[types.ContainerID][]types.ContainerID, len(containers))
+	seen := make(map[types.ContainerID]map[types.ContainerID]struct{}, len(containers))
+
+	for dependencyKey, dependents := range adjacency {
+		dependency, ok := containerMap[dependencyKey]
+		if !ok || dependency == nil {
+			continue
+		}
+
+		dependencyID := dependency.ID()
+
+		for _, dependentKey := range dependents {
+			dependent, ok := containerMap[dependentKey]
+			if !ok || dependent == nil {
+				continue
 			}
+
+			dependentID := dependent.ID()
+			if dependentID == "" || dependentID == dependencyID {
+				continue
+			}
+
+			if seen[dependentID] == nil {
+				seen[dependentID] = make(map[types.ContainerID]struct{})
+			}
+
+			if _, exists := seen[dependentID][dependencyID]; exists {
+				continue
+			}
+
+			seen[dependentID][dependencyID] = struct{}{}
+			dependencies[dependentID] = append(dependencies[dependentID], dependencyID)
 		}
 	}
 
-	return containerMap, indegree, adjacency, normalizedMap, nil
+	return dependencies, nil
 }
 
 // buildLinkMatchIndexes builds the identifier set and alias→canonical map used when
@@ -377,21 +459,21 @@ func buildLinkMatchIndexes(log *zerolog.Logger,
 //
 // Parameters:
 //   - link: Normalized link from Container.Links().
-//   - matchIDSet: Precomputed set of matchable identifiers (canonical + unique bare names).
+//   - matchIDSet: Indexed set of matchable identifiers (canonical + unique bare names).
 //   - aliasToCanonical: Maps match hits to canonical graph keys.
 //
 // Returns:
 //   - []string: Sorted unique canonical identifiers the link refers to (empty if none).
 func resolveLinkToCanonicalKeys(
 	link string,
-	matchIDSet map[string]bool,
+	matchIDSet *matchSet,
 	aliasToCanonical map[string]string,
 ) []string {
 	if link == "" {
 		return nil
 	}
 
-	matches := findMatchingIdentifiersInSet(link, matchIDSet)
+	matches := matchIDSet.match(link)
 	if len(matches) == 0 {
 		return nil
 	}
@@ -465,17 +547,19 @@ func ExtractServiceName(identifier string) string {
 		return identifier
 	}
 
-	parts := strings.Split(identifier, "-")
+	last := strings.LastIndex(identifier, "-")
 
 	// Check if the last part is a replica number (positive integer)
 	// If so, we need to skip it and take the second-to-last part as service name
-	if IsPositiveInteger(parts[len(parts)-1]) {
+	if IsPositiveInteger(identifier[last+1:]) {
 		// Return the part before the replica number (e.g., "service" from "project-service-1")
-		return parts[len(parts)-2]
+		rest := identifier[:last]
+
+		return rest[strings.LastIndex(rest, "-")+1:]
 	}
 
 	// No replica number, service name is the last part
-	return parts[len(parts)-1]
+	return identifier[last+1:]
 }
 
 // FindMatchingIdentifiers returns the identifiers from the given list that match
@@ -485,11 +569,13 @@ func ExtractServiceName(identifier string) string {
 //  1. Exact match.
 //  2. Replica prefix match: the identifier starts with "<link>-" and the suffix
 //     after the hyphen is a positive integer (Docker Compose replica numbering).
-//  3. Project-qualified suffix match (identifier ends with "-"+link), and for
-//     unhyphenated links only, ExtractServiceName equality on both sides.
-//     This strategy only succeeds when exactly one candidate matches. Multiple
-//     matches (e.g. the same service name in different projects) are treated as
-//     ambiguous and return no results.
+//  3. Project-qualified suffix match (the identifier, without a replica
+//     number, ends with "-"+link), and for unhyphenated links only,
+//     ExtractServiceName equality on both sides. This strategy only succeeds
+//     when every candidate belongs to the same service, and then returns all
+//     of its replicas. Candidates from more than one service (e.g. the same
+//     service name in different projects) are treated as ambiguous and return
+//     no results.
 //
 // Parameters:
 //   - link: Dependency link to resolve (typically from Container.Links()).
@@ -497,7 +583,7 @@ func ExtractServiceName(identifier string) string {
 //
 // Returns:
 //   - []string: Matching identifiers. Returns nil or an empty slice when there
-//     is no match or when the service-only strategy finds multiple candidates.
+//     is no match or when the service-only strategy finds more than one service.
 func FindMatchingIdentifiers(link string, identifiers []string) []string {
 	if link == "" || len(identifiers) == 0 {
 		return nil
@@ -511,74 +597,149 @@ func FindMatchingIdentifiers(link string, identifiers []string) []string {
 	return findMatchingIdentifiersInSet(link, idSet)
 }
 
-// findMatchingIdentifiersInSet returns identifiers from a precomputed set that match
-// the provided link. See FindMatchingIdentifiers for matching strategy details.
+// findMatchingIdentifiersInSet returns identifiers from a set that match the
+// provided link. See FindMatchingIdentifiers for matching strategy details.
+// Callers that match many links against one set should build a matchSet once.
 //
 // Parameters:
 //   - link: Dependency link to resolve.
-//   - idSet: Precomputed set of known container identifiers.
+//   - idSet: Set of known container identifiers.
 //
 // Returns:
 //   - []string: Matching identifiers, or nil/empty when none or ambiguous.
 func findMatchingIdentifiersInSet(link string, idSet map[string]bool) []string {
-	if link == "" || len(idSet) == 0 {
+	return newMatchSet(idSet).match(link)
+}
+
+// matchSet is a set of container identifiers indexed for link matching.
+//
+// The identifiers are kept in sorted order, so the replicas of a link are one
+// contiguous range, together with the replica-free service and service name of
+// each identifier, so matching a link computes nothing per identifier.
+type matchSet struct {
+	// names holds every identifier.
+	names map[string]bool
+	// sorted lists the identifiers in sorted order.
+	sorted []string
+	// services holds the identifier of sorted[i] without its replica number.
+	services []string
+	// serviceNames holds ExtractServiceName of sorted[i].
+	serviceNames []string
+}
+
+// newMatchSet indexes a set of container identifiers for link matching.
+//
+// Parameters:
+//   - idSet: Set of known container identifiers.
+//
+// Returns:
+//   - *matchSet: The indexed set.
+func newMatchSet(idSet map[string]bool) *matchSet {
+	sorted := slices.Sorted(maps.Keys(idSet))
+	services := make([]string, len(sorted))
+	serviceNames := make([]string, len(sorted))
+
+	for i, identifier := range sorted {
+		services[i] = replicaService(identifier)
+		serviceNames[i] = ExtractServiceName(identifier)
+	}
+
+	return &matchSet{names: idSet, sorted: sorted, services: services, serviceNames: serviceNames}
+}
+
+// match returns the identifiers of the set that match the provided link. See
+// FindMatchingIdentifiers for matching strategy details.
+//
+// Parameters:
+//   - link: Dependency link to resolve.
+//
+// Returns:
+//   - []string: Matching identifiers in sorted order, or nil when none match or
+//     the service-only strategy finds more than one service.
+func (s *matchSet) match(link string) []string {
+	if s == nil || link == "" || len(s.sorted) == 0 {
 		return nil
 	}
 
-	var matches []string
-
 	// 1. Exact match
-	if idSet[link] {
-		matches = append(matches, link)
-
-		return matches
+	if s.names[link] {
+		return []string{link}
 	}
 
-	// 2. Replica prefix match (only if suffix is positive integer)
+	// 2. Replica prefix match (only if suffix is positive integer). Identifiers
+	// starting with the prefix are contiguous in sorted order.
+	prefix := link + "-"
+
 	var replicaMatches []string
 
-	for identifier := range idSet {
-		if strings.HasPrefix(identifier, link+"-") {
-			suffix := identifier[len(link)+1:]
-			if IsPositiveInteger(suffix) {
-				replicaMatches = append(replicaMatches, identifier)
-			}
+	for i := sort.SearchStrings(s.sorted, prefix); i < len(s.sorted); i++ {
+		identifier := s.sorted[i]
+		if !strings.HasPrefix(identifier, prefix) {
+			break
+		}
+
+		if IsPositiveInteger(identifier[len(prefix):]) {
+			replicaMatches = append(replicaMatches, identifier)
 		}
 	}
 
 	if len(replicaMatches) > 0 {
-		sort.Strings(replicaMatches)
-		matches = append(matches, replicaMatches...)
-
-		return matches
+		return replicaMatches
 	}
 
-	// 3. Project-qualified / service-only match (exactly one unambiguous candidate).
-	// Multi-segment links (containing "-") only use the precise "-"+link suffix so
-	// trailing-token ExtractServiceName equality cannot select an unrelated peer
-	// (e.g. link "net-proxy" must not match "myproject-other-proxy").
+	// 3. Project-qualified / service-only match: the link names exactly one
+	// service, and resolves to every replica of it. Candidates from more than
+	// one service are ambiguous and resolve to nothing.
+	// Multi-segment links (containing "-") only use the precise "-"+link suffix,
+	// ignoring a replica number, so trailing-token ExtractServiceName equality
+	// cannot select an unrelated peer (e.g. link "net-proxy" must not match
+	// "myproject-other-proxy").
 	// Unhyphenated bare service names may still match via ExtractServiceName
-	// (e.g. link "db" → "myproject-db").
-	var serviceMatches []string
-
+	// (e.g. link "db" → "myproject-db" or "myproject-db-1").
+	serviceSuffix := "-" + link
 	linkHasHyphen := strings.Contains(link, "-")
-	for identifier := range idSet {
-		if strings.HasSuffix(identifier, "-"+link) {
-			serviceMatches = append(serviceMatches, identifier)
 
+	var (
+		serviceMatches []string
+		matchedService string
+	)
+
+	for i, identifier := range s.sorted {
+		service := s.services[i]
+
+		if !strings.HasSuffix(identifier, serviceSuffix) && !strings.HasSuffix(service, serviceSuffix) &&
+			(linkHasHyphen || s.serviceNames[i] != link) {
 			continue
 		}
 
-		if !linkHasHyphen && ExtractServiceName(identifier) == link {
-			serviceMatches = append(serviceMatches, identifier)
+		if serviceMatches != nil && service != matchedService {
+			return nil
 		}
+
+		matchedService = service
+
+		serviceMatches = append(serviceMatches, identifier)
 	}
 
-	if len(serviceMatches) == 1 {
-		matches = append(matches, serviceMatches[0])
+	return serviceMatches
+}
+
+// replicaService returns the service an identifier belongs to: the identifier
+// without a trailing replica number (e.g. "project-db" for "project-db-2").
+//
+// Parameters:
+//   - identifier: A container identifier.
+//
+// Returns:
+//   - string: The identifier without its replica number, or the identifier
+//     itself when it has none.
+func replicaService(identifier string) string {
+	i := strings.LastIndex(identifier, "-")
+	if i > 0 && IsPositiveInteger(identifier[i+1:]) {
+		return identifier[:i]
 	}
 
-	return matches
+	return identifier
 }
 
 // initializeQueue creates the initial processing queue for Kahn's algorithm.

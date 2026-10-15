@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 
 	dockerContainer "github.com/moby/moby/api/types/container"
 
@@ -18,7 +20,9 @@ import (
 	"github.com/nicholas-fedor/watchtower/internal/api/config"
 	"github.com/nicholas-fedor/watchtower/internal/api/handlers/events"
 	appConfig "github.com/nicholas-fedor/watchtower/internal/config"
+	registryConfig "github.com/nicholas-fedor/watchtower/internal/config/registry"
 	"github.com/nicholas-fedor/watchtower/internal/flags"
+	"github.com/nicholas-fedor/watchtower/internal/git"
 	"github.com/nicholas-fedor/watchtower/internal/logging"
 	"github.com/nicholas-fedor/watchtower/internal/meta"
 	"github.com/nicholas-fedor/watchtower/internal/metrics"
@@ -74,6 +78,10 @@ var (
 	// to avoid repeated calls to GetCurrentContainerID. If retrieval fails, it is set to an empty string.
 	currentWatchtowerContainerID types.ContainerID
 
+	// currentWatchtowerContainerUnknown is true when Watchtower runs in a container
+	// whose ID could not be determined. Self-updates are then disabled.
+	currentWatchtowerContainerUnknown bool
+
 	// currentWatchtowerContainer holds the current Watchtower container instance.
 	//
 	// It is initialized in preRun by retrieving the container object using the currentWatchtowerContainerID,
@@ -92,6 +100,17 @@ var (
 	// It wraps signal.NotifyContext to allow overriding in tests for testing signal handling behavior.
 	// The function creates a context that is canceled when the specified signals (SIGINT, SIGTERM) are received.
 	createSignalContext = signal.NotifyContext
+
+	// newClient is a function variable for creating the Docker client, allowing it to be overridden in tests.
+	//
+	// It is initialized to container.NewClient by default. preRun calls it with the resolved client options,
+	// so tests can substitute a mock client without a Docker daemon.
+	newClient = container.NewClient
+
+	// processFs is the filesystem preRun checks for container marker files.
+	//
+	// Tests replace it to control whether Watchtower appears to run in a container.
+	processFs afero.Fs = afero.NewOsFs()
 
 	// runUpdatesWithNotifications is a function variable for performing container updates and sending notifications.
 	//
@@ -216,6 +235,8 @@ func (p *process) preRun(cmd *cobra.Command, _ []string) {
 		p.log.Fatal().Err(err).Msg("Failed to load configuration")
 	}
 
+	exportRegistrySettings(appCfg.Registry)
+
 	p.log.Debug().
 		Str("scheduleSpec", appCfg.Schedule.Spec).
 		Msg("Retrieved cron schedule specification from configuration")
@@ -228,7 +249,7 @@ func (p *process) preRun(cmd *cobra.Command, _ []string) {
 	}
 
 	// Initialize the Docker client from the resolved ClientOptions projection.
-	client = container.NewClient(p.log, appCfg.ClientOptions())
+	client = newClient(p.log, appCfg.ClientOptions())
 
 	// Check for orchestrator mode early. This is an internal mode where Watchtower
 	// runs as a one-shot orchestrator for self-update.
@@ -291,6 +312,11 @@ func (p *process) preRun(cmd *cobra.Command, _ []string) {
 		}
 	}
 
+	// Without its own ID, Watchtower cannot tell itself apart from other instances.
+	// A host binary has no container ID, so only a containerized run is unknown.
+	currentWatchtowerContainerUnknown = currentWatchtowerContainerID == "" &&
+		container.InContainer(processFs)
+
 	// Check if this is an old Watchtower container that should not run continuously.
 	// exitInvalidWatchtowerRestart calls os.Exit. Keep it in a helper so preRun
 	// defers (for example cancel) are not paired with os.Exit in this function
@@ -309,6 +335,13 @@ func (p *process) preRun(cmd *cobra.Command, _ []string) {
 	// hooked logger so subsequent application logging is captured for notifications.
 	notifier = notifications.NewNotifier(p.log, appCfg.Notify)
 	notifier.RegisterHook(p.log)
+
+	if currentWatchtowerContainerUnknown {
+		p.log.Warn().Msg(
+			"Could not identify Watchtower's own container. " +
+				"Self-updates are disabled and old instances will not be removed",
+		)
+	}
 
 	// Log deprecated notification configuration options, if set.
 	notifications.LogLegacyDeprecationWarnings(p.log, appCfg.Notify.LegacyTypes)
@@ -548,6 +581,24 @@ func (p *process) runMain(cfg types.RunConfig) int {
 	//
 	// Returns:
 	//   - *metrics.Metric: A pointer to a metric object summarizing the update session (scanned, updated, failed counts).
+	gitClient := git.New(p.log, git.Options{
+		Token:           appCfg.Git.Token,
+		Username:        appCfg.Git.Username,
+		Password:        appCfg.Git.Password,
+		SSHKeyPath:      appCfg.Git.SSHKeyPath,
+		SSHKnownHosts:   appCfg.Git.SSHKnownHosts,
+		Timeout:         appCfg.Git.Timeout,
+		CABundle:        appCfg.Git.CABundle,
+		InsecureSkipTLS: appCfg.Git.InsecureSkipTLS,
+	})
+
+	ctx, stop := createSignalContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer stop()
+
 	runUpdatesWithNotifications = func(ctx context.Context, filter types.Filter, params types.UpdateParams) *metrics.Metric {
 		update := params
 		if filter != nil {
@@ -561,24 +612,16 @@ func (p *process) runMain(cfg types.RunConfig) int {
 		return actions.RunUpdatesWithNotifications(ctx, actions.RunUpdatesWithNotificationsParams{
 			Logger:                       p.log,
 			Client:                       client,
+			GitClient:                    gitClient,
 			Notifier:                     notifier,
 			NotificationSplitByContainer: appCfg.Notify.SplitByContainer,
 			NotificationReport:           appCfg.Notify.Report,
 			EventBroadcaster:             eventsBroadcaster,
 			Update:                       update,
+			// Stop the process, as a signal would, when this is an old instance.
+			OnOldSelfDetected: stop,
 		})
 	}
-
-	// Create a context that is automatically canceled on SIGINT/SIGTERM signals,
-	// enabling graceful shutdown of the API, scheduler, and validation operations.
-	// The stop function is returned but not needed as the context automatically
-	// handles cleanup when the program exits.
-	ctx, stop := createSignalContext(
-		context.Background(),
-		os.Interrupt,
-		syscall.SIGTERM,
-	)
-	defer stop()
 
 	// If rolling restarts are enabled, validate that the containers being monitored for
 	// updates do not have linked dependencies.
@@ -616,6 +659,7 @@ func (p *process) runMain(cfg types.RunConfig) int {
 
 	baseParams := appCfg.UpdateParams(appConfig.RunOverrides{
 		Filter:             cfg.Filter,
+		SkipSelfUpdate:     currentWatchtowerContainerUnknown,
 		CurrentContainerID: currentWatchtowerContainerID,
 	})
 
@@ -667,7 +711,7 @@ func (p *process) runMain(cfg types.RunConfig) int {
 		client,
 		appCfg.Update.Cleanup,
 		appCfg.Filter.Scope,
-		&[]types.RemovedImageInfo{},
+		nil, // Remove the images of stopped instances right away.
 		currentWatchtowerContainer,
 	)
 	if err != nil {
@@ -775,6 +819,7 @@ func (p *process) runMain(cfg types.RunConfig) int {
 			IncludeRestarting:            appCfg.Client.IncludeRestarting,
 			LabelEnable:                  appCfg.Filter.LabelEnable,
 			Client:                       client,
+			GitClient:                    gitClient,
 			Notifier:                     notifier,
 			NotificationSplitByContainer: appCfg.Notify.SplitByContainer,
 			Scope:                        appCfg.Filter.Scope,
@@ -875,6 +920,19 @@ func (p *process) logNotify(msg string, err error) {
 	notifier.StartNotification(false)
 	notifier.SendNotification(nil)
 	notifier.Close()
+}
+
+// exportRegistrySettings makes the loaded registry TLS settings visible to the
+// registry client, which reads them from the process-wide Viper instance by
+// their environment variable names. This lets the registry-tls-skip and
+// registry-tls-min-version configuration options take effect, with flags
+// taking precedence over environment variables as for every other setting.
+//
+// Parameters:
+//   - settings: Registry TLS settings from the loaded configuration.
+func exportRegistrySettings(settings registryConfig.Registry) {
+	viper.Set("WATCHTOWER_REGISTRY_TLS_SKIP", settings.TLSSkip)
+	viper.Set("WATCHTOWER_REGISTRY_TLS_MIN_VERSION", settings.TLSMinVersion)
 }
 
 // awaitDockerClient introduces a brief delay to ensure the Docker client is fully initialized.

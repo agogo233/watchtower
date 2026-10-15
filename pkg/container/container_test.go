@@ -4,17 +4,19 @@ import (
 	"bytes"
 	"fmt"
 	"strings"
+	"testing"
 
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 	"github.com/rs/zerolog"
+	"github.com/stretchr/testify/assert"
 
 	dockerContainer "github.com/moby/moby/api/types/container"
 	dockerMount "github.com/moby/moby/api/types/mount"
 	dockerNetwork "github.com/moby/moby/api/types/network"
 
+	"github.com/nicholas-fedor/watchtower/internal/compose"
 	"github.com/nicholas-fedor/watchtower/internal/logging"
-	"github.com/nicholas-fedor/watchtower/pkg/compose"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 	mockTypes "github.com/nicholas-fedor/watchtower/pkg/types/mocks"
 )
@@ -1386,3 +1388,78 @@ var _ = ginkgo.Describe("Container", func() {
 		ginkgo.Entry("trailing colon is not a mode", "app:", "app:", ""),
 	)
 })
+
+// TestContainer_Links_NoConfig verifies that a container without inspect
+// config data still reports its host-config dependencies instead of panicking.
+func TestContainer_Links_NoConfig(t *testing.T) {
+	t.Parallel()
+
+	c := &Container{
+		normalizedName: "app",
+		containerInfo: &dockerContainer.InspectResponse{
+			Name: "/app",
+			HostConfig: &dockerContainer.HostConfig{
+				NetworkMode: "container:vpn",
+			},
+		},
+	}
+
+	assert.Equal(t, []string{"vpn"}, c.Links(false))
+}
+
+// TestContainer_Links_DoesNotLog verifies that reading a container's
+// dependencies writes no log entries, even at debug level. The dependency
+// graph logs each container's dependencies once per scan instead.
+func TestContainer_Links_DoesNotLog(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name                string
+		labels              map[string]string
+		networkMode         dockerContainer.NetworkMode
+		useComposeDependsOn bool
+		want                []string
+	}{
+		{
+			name:   "depends-on label",
+			labels: map[string]string{dependsOnLabel: "db, cache"},
+			want:   []string{"db", "cache"},
+		},
+		{
+			name: "compose depends_on label",
+			labels: map[string]string{
+				compose.ComposeDependsOnLabel: "db:service_started:false",
+				compose.ComposeProjectLabel:   "shop",
+			},
+			useComposeDependsOn: true,
+			want:                []string{"shop-db"},
+		},
+		{
+			name:                "network mode",
+			networkMode:         "container:vpn",
+			useComposeDependsOn: true,
+			want:                []string{"vpn"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var out bytes.Buffer
+
+			log := zerolog.New(&out).Level(zerolog.DebugLevel)
+			c := NewContainer(&log, &dockerContainer.InspectResponse{
+				Name:       "/app",
+				Config:     &dockerContainer.Config{Labels: tt.labels},
+				HostConfig: &dockerContainer.HostConfig{NetworkMode: tt.networkMode},
+			}, nil)
+
+			// Measure only the Links call, not the container's creation.
+			out.Reset()
+
+			assert.Equal(t, tt.want, c.Links(tt.useComposeDependsOn))
+			assert.Empty(t, out.String())
+		})
+	}
+}

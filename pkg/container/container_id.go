@@ -2,13 +2,16 @@ package container
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"iter"
 	"os"
 	"regexp"
 	"strings"
 
 	"github.com/rs/zerolog"
+	"github.com/spf13/afero"
 
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
@@ -22,8 +25,18 @@ const (
 
 // Regex patterns for container ID extraction.
 var (
+	// dockerContainerPattern matches a cgroup file line, in the form
+	// hierarchy-ID:controllers:path, whose path holds Docker's /docker/<id>.
 	dockerContainerPattern = regexp.MustCompile(`[0-9]+:.*:/docker/([a-f0-9]{64})`)
-	containerIDPattern     = regexp.MustCompile(`/containers/([a-f0-9]{64})`)
+	// scopeContainerPattern matches a cgroup file line whose path ends in the
+	// systemd scope of a container: docker-<id>.scope for Docker and
+	// libpod-<id>.scope for Podman, as used with the systemd cgroup driver.
+	// The scope may be followed by a nested cgroup.
+	scopeContainerPattern = regexp.MustCompile(`[0-9]+:.*:.*/(?:docker|libpod)-([a-f0-9]{64})\.scope(?:/|$)`)
+	// containerIDPattern matches the container directory in a mount root:
+	// /containers/<id> for Docker and /overlay-containers/<id> for Podman.
+	// The ID must end the directory name.
+	containerIDPattern = regexp.MustCompile(`/(?:overlay-)?containers/([a-f0-9]{64})(?:/|$)`)
 )
 
 // File reading functions for testing mocks.
@@ -31,6 +44,12 @@ var (
 	ReadMountinfoFunc = os.ReadFile
 	ReadCgroupFunc    = os.ReadFile
 )
+
+// containerMarkers are files that container runtimes create inside a container.
+var containerMarkers = []string{
+	"/run/.containerenv", // Podman
+	"/.dockerenv",        // Docker
+}
 
 // IsOldContainer reports whether the container's runtime name (from Name()
 // or raw inspect) indicates a predecessor renamed during Watchtower self-update.
@@ -123,13 +142,36 @@ func GetCurrentContainerID(log *zerolog.Logger, ctx context.Context, client Clie
 		Msg("Hostname matching failed")
 	errs = append(errs, err)
 
-	// All methods failed - return the last error with context
+	// All methods failed - return the last error with context. A binary on
+	// the host has no container ID, so callers decide whether this matters.
 	lastErr := errs[len(errs)-1]
-	log.Error().
+	log.Debug().
 		Err(lastErr).
 		Msg("All container ID detection methods failed")
 
 	return "", fmt.Errorf("failed to detect current container ID: %w", lastErr)
+}
+
+// InContainer reports whether the process runs in a container, based on the
+// marker files that Docker and Podman create.
+//
+// A marker that cannot be checked for a reason other than not existing counts
+// as present, so callers that protect other Watchtower containers fail closed.
+//
+// Parameters:
+//   - fsys: The filesystem to check.
+//
+// Returns:
+//   - bool: True if a container marker exists or cannot be checked.
+func InContainer(fsys afero.Fs) bool {
+	for _, marker := range containerMarkers {
+		_, err := fsys.Stat(marker)
+		if err == nil || !errors.Is(err, fs.ErrNotExist) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // GetContainerIDFromMountinfo retrieves the container ID from /proc/self/mountinfo.
@@ -211,7 +253,7 @@ func ExtractContainerIDFromPath(path string) types.ContainerID {
 }
 
 // GetContainerIDFromCgroupFile retrieves the container ID from /proc/<pid>/cgroup.
-// Uses the cgroup file to find Docker container paths.
+// Uses the cgroup file to find Docker and Podman container paths.
 func GetContainerIDFromCgroupFile(log *zerolog.Logger) (types.ContainerID, error) {
 	filePath := fmt.Sprintf("/proc/%d/cgroup", os.Getpid())
 
@@ -243,6 +285,10 @@ func GetContainerIDFromCgroupFile(log *zerolog.Logger) (types.ContainerID, error
 }
 
 // ParseContainerIDFromCgroupString parses the cgroup string to extract container ID.
+//
+// It reads the ID from a Docker path under the cgroupfs driver, /docker/<id>,
+// or from a container's systemd scope under the systemd driver,
+// docker-<id>.scope for Docker or libpod-<id>.scope for Podman.
 func ParseContainerIDFromCgroupString(log *zerolog.Logger, cgroupString string) (types.ContainerID, error) {
 	var lines iter.Seq[string]
 	if strings.Contains(cgroupString, "\n") {
@@ -257,11 +303,13 @@ func ParseContainerIDFromCgroupString(log *zerolog.Logger, cgroupString string) 
 		trimmedLine := strings.TrimRight(line, "\n")
 
 		matches := dockerContainerPattern.FindStringSubmatch(trimmedLine)
+		if len(matches) < minMatchGroups {
+			matches = scopeContainerPattern.FindStringSubmatch(trimmedLine)
+		}
 
 		log.Debug().
 			Str("line", trimmedLine).
 			Strs("matches", matches).
-			Str("pattern", dockerContainerPattern.String()).
 			Msg("Processed cgroup line for container ID")
 
 		if len(matches) >= minMatchGroups {

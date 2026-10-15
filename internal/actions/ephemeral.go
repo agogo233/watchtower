@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"time"
 
@@ -33,6 +34,8 @@ var (
 	errEphemeralOrchestratorFailed = errors.New("ephemeral orchestrator failed")
 	// errOrchestratorMissingEnv indicates a required environment variable is missing.
 	errOrchestratorMissingEnv = errors.New("missing orchestrator environment variable")
+	// errOrchestratorInvalidEnv indicates an environment variable holds a value Watchtower never writes.
+	errOrchestratorInvalidEnv = errors.New("invalid orchestrator environment variable")
 	// errOrchestratorOldContainerNotFound indicates the old container was not found.
 	errOrchestratorOldContainerNotFound = errors.New("old container not found")
 	// errOrchestratorStopFailed indicates a failure to stop the old container.
@@ -50,6 +53,10 @@ var (
 	// errNewContainerNotRunning indicates the new container is not running after start.
 	errNewContainerNotRunning = errors.New("new container is not running after start")
 )
+
+// fullContainerIDPattern matches a full container ID, the form the old
+// instance writes to WT_ORCHESTRATOR_OLD_ID.
+var fullContainerIDPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 // EphemeralSelfUpdate performs a self-update using an ephemeral orchestrator container.
 //
@@ -125,15 +132,6 @@ func EphemeralSelfUpdate(log *zerolog.Logger, ctx context.Context,
 
 	clog.Debug().Msg("Creating ephemeral orchestrator for self-update")
 
-	// Log "Stopping container" for notification template compatibility.
-	// The orchestrator will handle the actual stop/start/remove operations,
-	// but we emit these Info entries so notifications match the normal update flow.
-	log.Info().
-		Str("container", sourceContainer.Name()).
-		Str("id", sourceContainer.ID().ShortID()).
-		Str("old_image_id", sourceContainer.ImageID().ShortID()).
-		Msg("Stopping container")
-
 	// Create the ephemeral orchestrator container.
 	//nolint:contextcheck // detached context is intentional for orchestrator lifecycle
 	orchestratorID, err := client.CreateEphemeralOrchestrator(
@@ -151,7 +149,15 @@ func EphemeralSelfUpdate(log *zerolog.Logger, ctx context.Context,
 		return "", false, fmt.Errorf("%w: %w", errEphemeralOrchestratorFailed, err)
 	}
 
-	// Create and start the new container.
+	// The orchestrator is running and stops this container next. Log the same
+	// Info entries as the normal update flow, so notifications match it. They
+	// come after the orchestrator starts, so a failed handoff does not report
+	// a stop that never happens.
+	log.Info().
+		Str("container", sourceContainer.Name()).
+		Str("id", sourceContainer.ID().ShortID()).
+		Str("old_image_id", sourceContainer.ImageID().ShortID()).
+		Msg("Stopping container")
 	log.Info().Msg("Starting new Watchtower container")
 
 	// Log that the orchestrator has been started. The orchestrator ID identifies
@@ -269,14 +275,23 @@ func RunOrchestrator(log *zerolog.Logger, ctx context.Context, client container.
 //   - string: New image reference.
 //   - string: Original container name.
 //   - string: Container chain for lineage tracking.
-//   - bool: Whether old-image cleanup is enabled.
-//   - error: Non-nil if any required variable is missing.
+//   - bool: Whether old-image cleanup is enabled. An empty value means false.
+//   - error: Non-nil if a required variable is missing, the old ID is not a full
+//     container ID, or the cleanup value is not a boolean.
 func readOrchestratorEnv() (string, string, string, string, bool, error) {
 	oldID := os.Getenv("WT_ORCHESTRATOR_OLD_ID")
 	if oldID == "" {
 		return "", "", "", "", false, fmt.Errorf(
 			"%w: WT_ORCHESTRATOR_OLD_ID",
 			errOrchestratorMissingEnv,
+		)
+	}
+
+	if !fullContainerIDPattern.MatchString(oldID) {
+		return "", "", "", "", false, fmt.Errorf(
+			"%w: WT_ORCHESTRATOR_OLD_ID %q is not a full container ID",
+			errOrchestratorInvalidEnv,
+			oldID,
 		)
 	}
 
@@ -298,7 +313,20 @@ func readOrchestratorEnv() (string, string, string, string, bool, error) {
 
 	containerChain := os.Getenv("WT_ORCHESTRATOR_CONTAINER_CHAIN")
 
-	cleanup, _ := strconv.ParseBool(os.Getenv("WT_ORCHESTRATOR_CLEANUP"))
+	cleanup := false
+
+	if rawCleanup := os.Getenv("WT_ORCHESTRATOR_CLEANUP"); rawCleanup != "" {
+		parsed, err := strconv.ParseBool(rawCleanup)
+		if err != nil {
+			return "", "", "", "", false, fmt.Errorf(
+				"%w: WT_ORCHESTRATOR_CLEANUP: %w",
+				errOrchestratorInvalidEnv,
+				err,
+			)
+		}
+
+		cleanup = parsed
+	}
 
 	return oldID, newImage, originalName, containerChain, cleanup, nil
 }
@@ -317,8 +345,9 @@ func readOrchestratorEnv() (string, string, string, string, bool, error) {
 //  8. When cleanup is enabled, remove the unused predecessor image.
 //
 // Stop before create releases published host ports. Rename keeps the stopped
-// predecessor available for recovery. On create/start/verify failure after
-// rename, the original name is restored and the old container is started again.
+// predecessor available for recovery. When the rename fails, the old container
+// is started again. On create/start/verify failure after rename, the original
+// name is restored and the old container is started again.
 //
 // Parameters:
 //   - ctx: Context for cancellation and timeouts.
@@ -376,6 +405,10 @@ func orchestrateSelfUpdate(log *zerolog.Logger, ctx context.Context,
 		// that prefix from an earlier attempt is still restored and restarted.
 		_, err = renameOldContainerForHandoff(ctx, client, clog, oldContainer, originalName)
 		if err != nil {
+			// The old container keeps its name, so starting it again leaves
+			// a Watchtower instance running.
+			restartOldContainer(ctx, client, clog, oldContainer)
+
 			return err
 		}
 	}
@@ -551,6 +584,32 @@ func restoreAndStartOldContainer(
 		Msg("Restored and restarted old Watchtower container after handoff failure")
 }
 
+// restartOldContainer starts the predecessor again after a failed rename, so
+// a Watchtower instance remains running under its original name.
+//
+// Parameters:
+//   - ctx: Context for cancellation and timeouts.
+//   - client: Container client for Docker operations.
+//   - clog: Logger with container context fields.
+//   - oldContainer: Stopped predecessor to start.
+func restartOldContainer(
+	ctx context.Context,
+	client container.Client,
+	clog *zerolog.Logger,
+	oldContainer types.Container,
+) {
+	err := client.StartContainerByID(ctx, oldContainer.ID())
+	if err != nil {
+		clog.Error().
+			Err(err).
+			Msg("Failed to restart old Watchtower container after rename failure. Manual intervention required")
+
+		return
+	}
+
+	clog.Info().Msg("Restarted old Watchtower container after rename failure")
+}
+
 // cleanupFailedNewContainer best-effort removes a new container that failed
 // verification so the original name can be restored on the predecessor.
 //
@@ -580,7 +639,7 @@ func cleanupFailedNewContainer(
 	}
 
 	cleanupErr := client.StopAndRemoveContainer(ctx, failedNew, orchestratorStopTimeout)
-	if cleanupErr != nil {
+	if cleanupErr != nil && !cerrdefs.IsNotFound(cleanupErr) {
 		clog.Debug().
 			Err(cleanupErr).
 			Str("new_id", newContainerID.ShortID()).
@@ -637,24 +696,12 @@ func inspectOldContainer(
 		Str("old_name", oldContainer.Name()).
 		Msg("Inspected old container successfully")
 
-	// Propagate the container chain label to the old container's config.
-	// This intentionally mutates the cached container config in-place so that
-	// StartContainer's GetCreateConfig() will include the label on the new container.
-	//
-	// Note: This mutates the container object retrieved from GetContainer, which
-	// could affect other code paths holding a reference to the same object. This
-	// is safe here because the old container is about to be stopped and removed.
+	// Propagate the container chain label to the old container's config, so
+	// StartContainer's GetCreateConfig() includes the label on the new container.
 	if containerChain != "" {
-		containerInfo := oldContainer.ContainerInfo()
-		if containerInfo != nil && containerInfo.Config != nil {
-			if containerInfo.Config.Labels == nil {
-				containerInfo.Config.Labels = make(map[string]string)
-			}
-
-			// In-place mutation required: StartContainer reads labels from this
-			// config to build the new container. Any other references to this
-			// container object will also see this label after this assignment.
-			containerInfo.Config.Labels[container.ContainerChainLabel] = containerChain
+		concrete, ok := oldContainer.(*container.Container)
+		if ok {
+			concrete.SetLabel(container.ContainerChainLabel, containerChain)
 			clog.Debug().
 				Str("container_chain", containerChain).
 				Msg("Set container chain label on source container config")

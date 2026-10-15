@@ -6,7 +6,10 @@ import (
 	"strconv"
 	"time"
 
+	dockerContainer "github.com/moby/moby/api/types/container"
+
 	"github.com/nicholas-fedor/watchtower/internal/util"
+	"github.com/nicholas-fedor/watchtower/pkg/container/git"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
@@ -348,6 +351,42 @@ func (c *Container) IsNoPull(params types.UpdateParams) bool {
 	return c.getContainerOrGlobalBool(params.NoPull, noPullLabel, params.LabelPrecedence)
 }
 
+// IsChangelogEnabled reports whether the changelog notification line and the
+// versioned release link are enabled for this container.
+//
+// It uses UpdateParams.EnableChangelog and label precedence, with the same two
+// sources no-pull uses. A changelog-url label is a value, not a switch, so it
+// never enables the feature on its own.
+// A user who authorizes the extra
+// registry request must say so explicitly.
+//
+// Parameters:
+//   - params: Update parameters from types.UpdateParams.
+//
+// Returns:
+//   - bool: True when the changelog feature is enabled.
+func (c *Container) IsChangelogEnabled(params types.UpdateParams) bool {
+	return c.getContainerOrGlobalBool(
+		params.EnableChangelog,
+		git.EnableChangelogLabel,
+		params.LabelPrecedence,
+	)
+}
+
+// IsGitWatch reports whether the Git watcher is on for this container.
+//
+// A present git-watch label overrides --git-enable. When the label is absent
+// the process-wide --git-enable default is used.
+//
+// Parameters:
+//   - params: Update parameters from types.UpdateParams.
+//
+// Returns:
+//   - bool: True when the watcher should run for an associated container.
+func (c *Container) IsGitWatch(params types.UpdateParams) bool {
+	return git.WatchEnabled(c, params)
+}
+
 // CooldownDelay returns the effective cooldown delay for this container.
 //
 // If the container has the cooldown-delay label set, its value is used (parsed
@@ -471,16 +510,12 @@ func (c *Container) GetContainerChain() (string, bool) {
 // Returns:
 //   - bool: True if watchtower label is "true", false otherwise.
 func (c *Container) IsWatchtower() bool {
-	clogVal := c.logger().With().
-		Str("container", c.Name()).
-		Logger()
-	clog := &clogVal
-	isWatchtower := ContainsWatchtowerLabel(c.containerInfo.Config.Labels)
-	clog.Debug().
-		Bool("is_watchtower", isWatchtower).
-		Msg("Checked if container is Watchtower")
+	info := c.ContainerInfo()
+	if info == nil || info.Config == nil {
+		return false
+	}
 
-	return isWatchtower
+	return ContainsWatchtowerLabel(info.Config.Labels)
 }
 
 // StopSignal returns the custom stop signal from labels or HostConfig.
@@ -488,6 +523,8 @@ func (c *Container) IsWatchtower() bool {
 // Returns:
 //   - string: Signal value, defaulting to "SIGTERM" if unset.
 func (c *Container) StopSignal() string {
+	info := c.ContainerInfo()
+
 	clogVal := c.logger().With().
 		Str("container", c.Name()).
 		Logger()
@@ -505,9 +542,9 @@ func (c *Container) StopSignal() string {
 	}
 
 	// Check Config
-	if c.containerInfo != nil && c.containerInfo.Config != nil &&
-		c.containerInfo.Config.StopSignal != "" {
-		signal = c.containerInfo.Config.StopSignal
+	if info != nil && info.Config != nil &&
+		info.Config.StopSignal != "" {
+		signal = info.Config.StopSignal
 		clog.Debug().
 			Str("signal", signal).
 			Msg("Retrieved stop signal from Config")
@@ -526,15 +563,17 @@ func (c *Container) StopSignal() string {
 // Returns:
 //   - *int: Timeout in seconds if set, nil if unset.
 func (c *Container) StopTimeout() *int {
+	info := c.ContainerInfo()
+
 	clogVal := c.logger().With().
 		Str("container", c.Name()).
 		Logger()
 	clog := &clogVal
 
 	// Check Config
-	if c.containerInfo != nil && c.containerInfo.Config != nil &&
-		c.containerInfo.Config.StopTimeout != nil {
-		timeout := *c.containerInfo.Config.StopTimeout
+	if info != nil && info.Config != nil &&
+		info.Config.StopTimeout != nil {
+		timeout := *info.Config.StopTimeout
 		clog.Debug().
 			Int("timeout", timeout).
 			Msg("Retrieved stop timeout from Config")
@@ -560,11 +599,6 @@ func ContainsWatchtowerLabel(labels map[string]string) bool {
 	}
 
 	val, ok := labels[watchtowerLabel]
-	nopLog().Debug().
-		Str("label", watchtowerLabel).
-		Str("val", val).
-		Bool("ok", ok).
-		Msg("Checking watchtower label")
 
 	return ok && val == "true"
 }
@@ -578,12 +612,24 @@ func ContainsWatchtowerLabel(labels map[string]string) bool {
 //   - string: Label value if present.
 //   - bool: True if label exists and is accessible, false otherwise.
 func (c *Container) getRawLabelValue(label string) (string, bool) {
-	if c.containerInfo == nil || c.containerInfo.Config == nil ||
-		c.containerInfo.Config.Labels == nil {
+	return labelValue(c.ContainerInfo(), label)
+}
+
+// labelValue retrieves a raw label value from inspect data.
+//
+// Parameters:
+//   - info: Inspect data, or nil.
+//   - label: The label key to retrieve the value from.
+//
+// Returns:
+//   - string: Label value if present.
+//   - bool: True if label exists and is accessible, false otherwise.
+func labelValue(info *dockerContainer.InspectResponse, label string) (string, bool) {
+	if info == nil || info.Config == nil || info.Config.Labels == nil {
 		return "", false
 	}
 
-	val, ok := c.containerInfo.Config.Labels[label]
+	val, ok := info.Config.Labels[label]
 
 	return val, ok
 }

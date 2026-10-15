@@ -18,6 +18,7 @@ import (
 	"github.com/nicholas-fedor/watchtower/internal/flags/compat"
 	"github.com/nicholas-fedor/watchtower/internal/flags/docker"
 	"github.com/nicholas-fedor/watchtower/internal/flags/filter"
+	"github.com/nicholas-fedor/watchtower/internal/flags/git"
 	"github.com/nicholas-fedor/watchtower/internal/flags/lifecycle"
 	flagslogging "github.com/nicholas-fedor/watchtower/internal/flags/logging"
 	"github.com/nicholas-fedor/watchtower/internal/flags/mode"
@@ -83,6 +84,7 @@ func RegisterSystemFlags(rootCmd *cobra.Command) {
 	compat.Register(rootCmd)
 	api.Register(rootCmd)
 	flagslogging.Register(rootCmd)
+	git.Register(rootCmd)
 }
 
 // RegisterNotificationFlags adds notification flags to the root command.
@@ -255,6 +257,8 @@ func GetSecretsFromFiles(log *zerolog.Logger, rootCmd *cobra.Command) {
 		"notification-url",
 		"http-api-token",
 		"http-api-events-token",
+		"git-auth-token",
+		"git-password",
 	}
 
 	// Process each secret flag.
@@ -288,61 +292,12 @@ func getSecretFromFile(log *zerolog.Logger, flags *pflag.FlagSet, secret string)
 
 		for _, value := range oldValues {
 			if value != "" && isFilePath(value) {
-				file, err := os.Open(value)
+				lines, err := readSecretFileLines(log, secret, value)
 				if err != nil {
-					log.Debug().
-						Err(err).
-						Str("flag", secret).
-						Str("file", value).
-						Msg("Failed to open secret file")
-
-					return fmt.Errorf("%w: %w", errOpenFileFailed, err)
+					return err
 				}
 
-				defer func() { _ = file.Close() }()
-
-				scanner := bufio.NewScanner(file)
-				for scanner.Scan() {
-					line := strings.TrimSpace(scanner.Text())
-					if line == "" || strings.HasPrefix(line, "#") {
-						continue
-					}
-
-					if secret == "notification-url" {
-						if !strings.Contains(line, "://") {
-							return errInvalidSecretURL
-						}
-
-						parsedURL, err := url.Parse(line)
-						if err != nil || parsedURL.Scheme == "" {
-							return errInvalidSecretURL
-						}
-
-						if parsedURL.Opaque == "" && parsedURL.Host == "" && parsedURL.Path == "" {
-							if parsedURL.Scheme != "logger" && parsedURL.Scheme != "mock" {
-								return errInvalidSecretURL
-							}
-						}
-					}
-
-					values = append(values, line)
-				}
-
-				err = scanner.Err()
-				if err != nil {
-					log.Debug().
-						Err(err).
-						Str("flag", secret).
-						Str("file", value).
-						Msg("Failed to read secret file")
-
-					return fmt.Errorf("%w: %w", errReadFileFailed, err)
-				}
-
-				log.Debug().
-					Str("flag", secret).
-					Str("file", value).
-					Msg("Read secret from file into slice")
+				values = append(values, lines...)
 			} else {
 				values = append(values, value)
 			}
@@ -396,6 +351,81 @@ func getSecretFromFile(log *zerolog.Logger, flags *pflag.FlagSet, secret string)
 	}
 
 	return nil
+}
+
+// readSecretFileLines reads the values of a list secret from a file.
+//
+// Blank lines and lines starting with "#" are skipped. The file is closed
+// before returning, so a list secret holds at most one file open at a time.
+//
+// Parameters:
+//   - log: Logger for secret-loading diagnostics.
+//   - secret: Flag name. Lines of the notification-url secret must be valid notification URLs.
+//   - path: Path of the secret file.
+//
+// Returns:
+//   - []string: Values read from the file.
+//   - error: Non-nil if the file cannot be opened or read, or holds an invalid notification URL.
+func readSecretFileLines(log *zerolog.Logger, secret, path string) ([]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		log.Debug().
+			Err(err).
+			Str("flag", secret).
+			Str("file", path).
+			Msg("Failed to open secret file")
+
+		return nil, fmt.Errorf("%w: %w", errOpenFileFailed, err)
+	}
+
+	defer func() { _ = file.Close() }()
+
+	var lines []string
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		if secret == "notification-url" {
+			if !strings.Contains(line, "://") {
+				return nil, errInvalidSecretURL
+			}
+
+			parsedURL, err := url.Parse(line)
+			if err != nil || parsedURL.Scheme == "" {
+				return nil, errInvalidSecretURL
+			}
+
+			if parsedURL.Opaque == "" && parsedURL.Host == "" && parsedURL.Path == "" {
+				if parsedURL.Scheme != "logger" && parsedURL.Scheme != "mock" {
+					return nil, errInvalidSecretURL
+				}
+			}
+		}
+
+		lines = append(lines, line)
+	}
+
+	err = scanner.Err()
+	if err != nil {
+		log.Debug().
+			Err(err).
+			Str("flag", secret).
+			Str("file", path).
+			Msg("Failed to read secret file")
+
+		return nil, fmt.Errorf("%w: %w", errReadFileFailed, err)
+	}
+
+	log.Debug().
+		Str("flag", secret).
+		Str("file", path).
+		Msg("Read secret from file into slice")
+
+	return lines, nil
 }
 
 // isFilePath checks if a string is likely a file path.
@@ -697,15 +727,17 @@ func appendFlagValue(log *zerolog.Logger, flags *pflag.FlagSet, name string, val
 	return nil
 }
 
-// setFlagIfDefault sets a flag's default value if unchanged.
+// setFlagIfDefault sets a flag's value unless it was set by a flag or by an
+// environment variable. ApplyEnvToFlags leaves environment values unmarked, so
+// they are checked separately.
 //
 // Parameters:
 //   - log: Logger for set diagnostics.
 //   - flags: Flag set.
 //   - name: Flag name.
-//   - value: Default value.
+//   - value: Value to set.
 func setFlagIfDefault(log *zerolog.Logger, flags *pflag.FlagSet, name, value string) {
-	if flags.Changed(name) {
+	if flags.Changed(name) || setByEnv(name) {
 		return
 	}
 
@@ -722,4 +754,24 @@ func setFlagIfDefault(log *zerolog.Logger, flags *pflag.FlagSet, name, value str
 			Str("value", value).
 			Msg("Set default flag value")
 	}
+}
+
+// setByEnv reports whether an environment variable supplies the flag's value,
+// using the same rule as ApplyEnvToFlags.
+//
+// Parameters:
+//   - name: Flag name.
+//
+// Returns:
+//   - bool: True if one of the flag's environment variables is set.
+func setByEnv(name string) bool {
+	for _, flagSpec := range AllSpecs() {
+		if flagSpec.Name == name {
+			_, ok := firstEnv(flagSpec.EnvKeys)
+
+			return ok
+		}
+	}
+
+	return false
 }

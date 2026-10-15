@@ -21,6 +21,7 @@ import (
 	dockerClient "github.com/moby/moby/client"
 
 	"github.com/nicholas-fedor/watchtower/internal/flags"
+	"github.com/nicholas-fedor/watchtower/pkg/container/oci"
 	"github.com/nicholas-fedor/watchtower/pkg/registry"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
@@ -194,7 +195,7 @@ type Client interface {
 
 	// CheckContainerUpdate reports whether a newer image is available without
 	// pulling image layers. When NoPull is active it inspects the local cache
-	// only; otherwise, it compares registry digests. Cooldown is not applied.
+	// only. Otherwise, it compares registry digests. Cooldown is not applied.
 	//
 	// Parameters:
 	//   - ctx: Context for cancellation and timeout control.
@@ -211,6 +212,22 @@ type Client interface {
 		container types.Container,
 		params types.UpdateParams,
 	) (bool, types.ImageID, string, error)
+
+	// GetImageAnnotations reads the OCI annotations of an image by reference.
+	//
+	// The read is a local Docker daemon inspect, so it never counts against a
+	// registry rate limit. It resolves the new image's annotations after a pull,
+	// which the running container's inspect cannot provide. An unreadable image
+	// yields empty annotations rather than an error, because metadata must never
+	// fail a session.
+	//
+	// Parameters:
+	//   - ctx: Context for cancellation and timeout control.
+	//   - imageRef: Image reference, tag or digest, to inspect.
+	//
+	// Returns:
+	//   - oci.Annotations: Annotations from the image config labels, or empty.
+	GetImageAnnotations(ctx context.Context, imageRef string) oci.Annotations
 
 	// ExecuteCommand runs a command inside a container and returns whether
 	// to skip updates based on the result.
@@ -387,6 +404,21 @@ type Client interface {
 	// Returns:
 	//   - error: Non-nil if starting fails, nil on success.
 	StartContainerByID(ctx context.Context, containerID types.ContainerID) error
+
+	// BuildRemoteImage builds an image from a Git URL context.
+	//
+	// The daemon clones the repository. Watchtower does not.
+	//
+	// Parameters:
+	//   - ctx: Context for cancellation and timeout control.
+	//   - remote: Docker Git context URL (https://host/repo.git#commit[:subdir]).
+	//   - dockerfile: Dockerfile path relative to that context. Empty means Dockerfile.
+	//   - tags: Image tags to apply to the built image.
+	//
+	// Returns:
+	//   - types.ImageID: ID of the built image.
+	//   - error: Non-nil if the build fails, nil on success.
+	BuildRemoteImage(ctx context.Context, remote, dockerfile string, tags []string) (types.ImageID, error)
 }
 
 // client is the concrete implementation of the Client interface.
@@ -398,8 +430,10 @@ type client struct {
 	api dockerClient.APIClient
 	log *zerolog.Logger
 
-	// runtimeOnce ensures the container runtime is detected only once.
-	runtimeOnce sync.Once
+	// runtimeMu protects the cached runtime detection result.
+	runtimeMu sync.Mutex
+	// runtimeDetected is true once the container runtime was detected successfully.
+	runtimeDetected bool
 	// isPodman caches the result of Podman runtime detection.
 	isPodman bool
 
@@ -540,10 +574,9 @@ func negotiateDockerAPI(
 //   - []types.Container: List of matching containers.
 //   - error: Non-nil if listing fails, nil on success.
 func (c *client) ListContainers(ctx context.Context, filter ...types.Filter) ([]types.Container, error) {
-	// Determine if the container runtime is Podman to handle runtime-specific differences.
-	//
-	//nolint:contextcheck // getRuntime uses context.Background() internally for cached detection
-	isPodman := c.getRuntime()
+	// Podman has no restarting status, so the runtime only matters when
+	// restarting containers are included.
+	isPodman := c.IncludeRestarting && c.getRuntime(ctx)
 
 	var containerFilter types.Filter
 
@@ -789,10 +822,8 @@ func (c *client) CreateContainer(ctx context.Context, container types.Container)
 		Str("image", container.ImageName()).
 		Logger()
 	clog := &clogVal
-	// Determine if the container runtime is Podman to handle runtime-specific differences.
-	//
-	//nolint:contextcheck // getRuntime uses context.Background() internally for cached detection
-	isPodman := c.getRuntime()
+	// Only the auto CPU copy mode depends on the runtime.
+	isPodman := c.CPUCopyMode == CPUCopyModeAuto && c.getRuntime(ctx)
 
 	clientVersion := c.GetVersion()
 
@@ -1215,6 +1246,20 @@ func (c *client) CheckContainerUpdate(
 	}
 
 	return available, newestImage, latestDigest, err
+}
+
+// GetImageAnnotations reads the OCI annotations of an image by reference.
+//
+// Parameters:
+//   - ctx: Context for cancellation and timeout control.
+//   - imageRef: Image reference, tag or digest, to inspect.
+//
+// Returns:
+//   - oci.Annotations: Annotations from the image config labels, or empty.
+func (c *client) GetImageAnnotations(ctx context.Context, imageRef string) oci.Annotations {
+	imgClient := newImageClient(c.api, c.logger())
+
+	return imgClient.GetImageAnnotations(ctx, imageRef)
 }
 
 // ExecuteCommand runs a command inside a container and evaluates its result.
@@ -1720,17 +1765,22 @@ func (c *client) detectRuntimeByMarker() (Runtime, error) {
 	}
 }
 
-// It checks if the CONTAINER environment variable is set to "podman" or "oci",
-// both of which indicate Podman is the container runtime.
+// It checks if the container environment variable, which Podman sets, or its
+// uppercase form is "podman" or "oci", both of which indicate Podman is the
+// container runtime.
 //
 // Returns:
-//   - bool: True if CONTAINER env var indicates Podman, false otherwise.
+//   - bool: True if the environment variable indicates Podman, false otherwise.
 func (c *client) detectRuntimeByEnv() bool {
-	container := os.Getenv("CONTAINER")
-	if container == "podman" || container == "oci" {
-		c.logger().Debug().Msg("Detected Podman via CONTAINER environment variable")
+	for _, key := range []string{"container", "CONTAINER"} {
+		value := os.Getenv(key)
+		if value == "podman" || value == "oci" {
+			c.logger().Debug().
+				Str("variable", key).
+				Msg("Detected Podman via container environment variable")
 
-		return true
+			return true
+		}
 	}
 
 	return false
@@ -1739,7 +1789,9 @@ func (c *client) detectRuntimeByEnv() bool {
 // detectRuntimeByAPI uses the Docker API to detect if the runtime is Podman.
 //
 // It queries the system info endpoint and checks the Name and ServerVersion
-// fields for Podman indicators.
+// fields for Podman indicators. Current Podman versions report the host name
+// and a bare version there, so it then checks the version endpoint's
+// components, where Podman names itself "Podman Engine".
 //
 // Parameters:
 //   - ctx: Context for cancellation and timeout control.
@@ -1770,47 +1822,67 @@ func (c *client) detectRuntimeByAPI(ctx context.Context) (bool, error) {
 		return true, nil
 	}
 
+	// The components are informational and not part of the API contract, so
+	// they are checked only after the info fields.
+	version, err := c.api.ServerVersion(ctx, dockerClient.ServerVersionOptions{})
+	if err != nil {
+		c.logger().Debug().
+			Err(err).
+			Msg("Failed to get server version for Podman detection")
+
+		return false, fmt.Errorf("failed to get server version: %w", err)
+	}
+
+	for _, component := range version.Components {
+		if strings.Contains(strings.ToLower(component.Name), "podman") {
+			c.logger().Debug().
+				Str("component", component.Name).
+				Msg("Detected Podman via API version components")
+
+			return true, nil
+		}
+	}
+
 	c.logger().Debug().Msg("No Podman detection criteria met, assuming Docker")
 
 	return false, nil
 }
 
-// getRuntime determines if Podman detection is needed and performs it.
+// getRuntime reports whether the container runtime is Podman.
 //
-// The result is cached after the first detection to avoid repeated API calls
-// and filesystem checks on every ListContainers and StartContainer invocation.
-// The runtime is assumed to not change during the lifetime of the client.
+// Callers ask only when the answer changes their behavior: the container list
+// filter when restarting containers are included, and CPU handling in the auto
+// CPU copy mode. A successful detection is cached to avoid repeated API calls
+// and filesystem checks. The runtime is assumed to not change during the
+// lifetime of the client. A failed or canceled detection is not cached, so the
+// next call tries again.
+//
+// Parameters:
+//   - ctx: Context for the detection's API call.
 //
 // Returns:
 //   - bool: True if Podman is detected, false otherwise.
-func (c *client) getRuntime() bool {
-	// Only perform detection in auto mode. Otherwise, assume Docker
-	if c.CPUCopyMode != CPUCopyModeAuto {
+func (c *client) getRuntime(ctx context.Context) bool {
+	c.runtimeMu.Lock()
+	defer c.runtimeMu.Unlock()
+
+	if c.runtimeDetected {
+		return c.isPodman
+	}
+
+	isPodman, err := c.detectRuntime(ctx)
+	if err != nil {
+		c.logger().Debug().
+			Err(err).
+			Msg("Failed to detect container runtime, falling back to Docker")
+
 		return false
 	}
 
-	// Perform detection exactly once using sync.Once for thread safety.
-	// We use context.Background() for the detection to ensure the cached
-	// result doesn't depend on a potentially cancelled caller context.
-	c.runtimeOnce.Do(func() {
-		// Attempt to detect Podman using various methods
-		// (marker files, env vars, API info)
-		isPodman, err := c.detectRuntime(context.Background())
-		if err != nil {
-			// On detection failure, fall back to assuming Docker
-			c.logger().Debug().
-				Err(err).
-				Msg("Failed to detect container runtime, falling back to Docker")
+	c.isPodman = isPodman
+	c.runtimeDetected = true
 
-			c.isPodman = false
-
-			return
-		}
-
-		c.isPodman = isPodman
-	})
-
-	return c.isPodman
+	return isPodman
 }
 
 // captureExecOutput attaches to an exec instance and captures its output.
