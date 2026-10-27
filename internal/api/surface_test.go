@@ -1,4 +1,4 @@
-package api_test
+package api
 
 import (
 	"context"
@@ -15,12 +15,12 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
-	"github.com/nicholas-fedor/watchtower/internal/api"
-	"github.com/nicholas-fedor/watchtower/internal/api/config"
+	"github.com/nicholas-fedor/watchtower/internal/api/auth"
 	"github.com/nicholas-fedor/watchtower/internal/api/routes"
-	"github.com/nicholas-fedor/watchtower/internal/metrics"
+	mockContainerClient "github.com/nicholas-fedor/watchtower/internal/container/client/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/observability/metrics"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/golden"
-	mockContainer "github.com/nicholas-fedor/watchtower/pkg/container/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/update/schedule"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
@@ -36,16 +36,17 @@ var routeParamPattern = regexp.MustCompile(`:[A-Za-z0-9_]+`)
 func newFullSurfaceApp(t *testing.T) *fiber.App {
 	t.Helper()
 
-	client := mockContainer.NewMockClient(t)
+	client := mockContainerClient.NewMockClient(t)
 	client.EXPECT().Ping(mock.Anything).Return(nil).Maybe()
 	client.EXPECT().ListContainers(mock.Anything, mock.Anything).Return([]types.Container{}, nil).Maybe()
 	client.EXPECT().ListContainers(mock.Anything).Return([]types.Container{}, nil).Maybe()
 
-	opts := withTestLogger(config.Options{
+	opts := withTestLogger(t, routes.Options{
 		Token:               "api-token",
 		EventsToken:         "events-token",
 		RateLimit:           1000,
 		EnableUpdateAPI:     true,
+		UpdateLock:          schedule.NewUpdateLock(),
 		EnableMetricsAPI:    true,
 		EnableContainersAPI: true,
 		EnableCheckAPI:      true,
@@ -67,9 +68,9 @@ func newFullSurfaceApp(t *testing.T) *fiber.App {
 		EventBroadcaster: NewEventsBroadcasterHelper(),
 	})
 
-	app := api.New(opts.Logger, opts.RateLimit, api.ProxyConfig{}, api.CORSConfig{}, opts.NoStartupMessage)
+	app := newApp(opts.Logger, opts.RateLimit, proxyConfig{}, corsConfig{}, opts.NoStartupMessage)
 
-	err := routes.ValidateAndRegister(t.Context(), app, api.NewAPIAuthMiddleware(opts.Logger, opts.Token), opts)
+	err := routes.ValidateAndRegister(t.Context(), app, auth.NewAPIMiddleware(opts.Logger, opts.Token), opts)
 	require.NoError(t, err)
 
 	return app

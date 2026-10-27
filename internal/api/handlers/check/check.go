@@ -9,10 +9,12 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/rs/zerolog"
 
+	"github.com/nicholas-fedor/watchtower/internal/container"
+	containerClient "github.com/nicholas-fedor/watchtower/internal/container/client"
+	containerImage "github.com/nicholas-fedor/watchtower/internal/container/image"
+	"github.com/nicholas-fedor/watchtower/internal/container/oci"
+	"github.com/nicholas-fedor/watchtower/internal/container/provenance"
 	"github.com/nicholas-fedor/watchtower/internal/git"
-	"github.com/nicholas-fedor/watchtower/pkg/container"
-	gitPkg "github.com/nicholas-fedor/watchtower/pkg/container/git"
-	"github.com/nicholas-fedor/watchtower/pkg/container/oci"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
@@ -99,7 +101,7 @@ func extractFilterParams(c fiber.Ctx, key string) []string {
 //   - error: Non-nil if listing containers fails.
 func CheckForUpdates(log *zerolog.Logger,
 	ctx context.Context,
-	client container.Client,
+	client containerClient.Client,
 	filter types.Filter,
 	params types.UpdateParams,
 	gitClient *git.Client,
@@ -168,7 +170,7 @@ func applyReportMetadata(c types.Container, params types.UpdateParams, result *C
 		return
 	}
 
-	meta := container.ResolveReportMeta(c, params, container.ChangelogVars{}, oci.Annotations{})
+	meta := provenance.ResolveReportMeta(c, params, provenance.ChangelogVars{}, oci.Annotations{})
 	result.GitRepo = meta.GitRepo
 	result.GitRef = meta.GitRef
 	result.Changelog = meta.Changelog
@@ -193,7 +195,7 @@ func applyLocalDigest(c types.Container, result *ContainerCheck) {
 		return
 	}
 
-	result.Digest = container.ExtractImageDigest(info.RepoDigests, c.ImageName())
+	result.Digest = containerImage.ExtractImageDigest(info.RepoDigests, c.ImageName())
 }
 
 // isGitWatched reports whether a container is checked against its hosted Git
@@ -224,7 +226,7 @@ func isGitWatched(
 		return false
 	}
 
-	return gitPkg.ShouldMonitor(log, c, params)
+	return provenance.ShouldMonitor(log, c, params)
 }
 
 // checkGitSource compares the hosted Git ref for a container.
@@ -269,10 +271,10 @@ func checkGitSource(
 	result.GitCommit = checkResult.Commit
 
 	if checkResult.Tag != "" {
-		result.Changelog = container.ResolveReportMeta(
+		result.Changelog = provenance.ResolveReportMeta(
 			c,
 			params,
-			container.ChangelogVars{
+			provenance.ChangelogVars{
 				Tag:    checkResult.Tag,
 				Commit: checkResult.Commit,
 			},
@@ -299,7 +301,7 @@ func checkGitSource(
 func checkRegistrySource(
 	ctx context.Context,
 	log *zerolog.Logger,
-	client container.Client,
+	client containerClient.Client,
 	c types.Container,
 	params types.UpdateParams,
 	result *ContainerCheck,

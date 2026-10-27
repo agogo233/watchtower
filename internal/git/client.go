@@ -15,8 +15,9 @@ import (
 	"github.com/rs/zerolog"
 	"golang.org/x/mod/semver"
 
-	"github.com/nicholas-fedor/watchtower/internal/compose"
-	gitPkg "github.com/nicholas-fedor/watchtower/pkg/container/git"
+	composeLabels "github.com/nicholas-fedor/watchtower/internal/compose/labels"
+	"github.com/nicholas-fedor/watchtower/internal/container/labels"
+	"github.com/nicholas-fedor/watchtower/internal/container/provenance"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
@@ -188,7 +189,7 @@ func (c *Client) Check(ctx context.Context, req CheckRequest) (CheckResult, erro
 //   - error: Non-nil on clone or checkout failure. The directory is removed on error.
 func (c *Client) Clone(ctx context.Context, repo string, rev CheckResult) (string, error) {
 	if c == nil {
-		return "", fmt.Errorf("%w: client is nil", ErrCloneFailed)
+		return "", fmt.Errorf("%w: client is nil", errCloneFailed)
 	}
 
 	ctx, cancel := c.WithTimeout(ctx)
@@ -196,7 +197,7 @@ func (c *Client) Clone(ctx context.Context, repo string, rev CheckResult) (strin
 
 	dir, err := os.MkdirTemp("", "watchtower-git-*")
 	if err != nil {
-		return "", fmt.Errorf("%w: mkdir: %w", ErrCloneFailed, err)
+		return "", fmt.Errorf("%w: mkdir: %w", errCloneFailed, err)
 	}
 
 	err = cloneCheckout(ctx, dir, repo, rev, c)
@@ -226,7 +227,7 @@ func CheckContainer(
 	c types.Container,
 	params types.UpdateParams,
 ) (CheckResult, error) {
-	assoc, ok := gitPkg.ResolveAssociation(c, params)
+	assoc, ok := provenance.ResolveAssociation(c, params)
 	if !ok {
 		return CheckResult{}, nil
 	}
@@ -236,13 +237,13 @@ func CheckContainer(
 	}
 
 	if raw := strings.TrimSpace(assoc.Host); raw != "" {
-		_, err := gitPkg.ParseAPIOrigin(raw)
+		_, err := provenance.ParseAPIOrigin(raw)
 		if err != nil {
 			return CheckResult{}, fmt.Errorf("%w: %w", ErrInvalidHost, err)
 		}
 	}
 
-	lastCommit, lastTag := gitPkg.Baseline(c)
+	lastCommit, lastTag := provenance.Baseline(c)
 	if commit, tag, rejected := client.unacceptedBaseline(ApplyStampKeyFrom(c), lastCommit); rejected {
 		lastCommit = commit
 		lastTag = tag
@@ -319,17 +320,17 @@ func ApplyStampKeyFrom(c types.Container) ApplyStampKey {
 		return ApplyStampKey{}
 	}
 
-	dir, _ := c.GetLabel(gitPkg.ComposeDirLabel)
+	dir, _ := c.GetLabel(labels.ComposeDir)
 
 	dir = strings.TrimSpace(dir)
 	if dir == "" {
 		return ApplyStampKey{}
 	}
 
-	projectName, _ := c.GetLabel(compose.ComposeProjectLabel)
-	files, _ := c.GetLabel(compose.ComposeConfigFilesLabel)
-	service, _ := c.GetLabel(compose.ComposeServiceLabel)
-	number, _ := c.GetLabel(compose.ComposeContainerNumber)
+	projectName, _ := c.GetLabel(composeLabels.ComposeProjectLabel)
+	files, _ := c.GetLabel(composeLabels.ComposeConfigFilesLabel)
+	service, _ := c.GetLabel(composeLabels.ComposeServiceLabel)
+	number, _ := c.GetLabel(composeLabels.ComposeContainerNumber)
 
 	service = strings.TrimSpace(service)
 	if service == "" {
@@ -433,9 +434,9 @@ func repositoryOperationError(operation, repo string, err error) error {
 
 	classified := classifyTransport(err)
 	switch {
-	case errors.Is(classified, ErrAuthRequired),
-		errors.Is(classified, ErrAuthFailed),
-		errors.Is(classified, ErrRepoNotFound):
+	case errors.Is(classified, errAuthRequired),
+		errors.Is(classified, errAuthFailed),
+		errors.Is(classified, errRepoNotFound):
 		return fmt.Errorf("%s %s: %w", operation, safeRepo, classified)
 	case errors.Is(err, context.Canceled):
 		return fmt.Errorf("%s %s: %w", operation, safeRepo, context.Canceled)
@@ -513,7 +514,7 @@ func (c *Client) checkTagPolicy(ctx context.Context, req CheckRequest) (CheckRes
 	}
 
 	if lastTag == "" && req.LastCommit == "" {
-		selected, ok := SelectTag("", names, req.Policy)
+		selected, ok := selectTag("", names, req.Policy)
 		if !ok {
 			// No usable semver tags. Observe the configured ref without
 			// treating the missing baseline as a reason to rebuild.
@@ -535,7 +536,7 @@ func (c *Client) checkTagPolicy(ctx context.Context, req CheckRequest) (CheckRes
 		}, nil
 	}
 
-	selected, ok := SelectTag(lastTag, names, req.Policy)
+	selected, ok := selectTag(lastTag, names, req.Policy)
 	if !ok {
 		if inferred {
 			return CheckResult{
@@ -878,7 +879,7 @@ func policyLabelValue(c types.Container) string {
 		return ""
 	}
 
-	val, ok := c.GetLabel(gitPkg.SemverPolicyLabel)
+	val, ok := c.GetLabel(labels.GitSemverPolicy)
 	if !ok {
 		return ""
 	}

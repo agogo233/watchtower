@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/nicholas-fedor/watchtower/internal/testutil/golden"
-	"github.com/nicholas-fedor/watchtower/pkg/session"
+	"github.com/nicholas-fedor/watchtower/internal/update/state"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 	mockTypes "github.com/nicholas-fedor/watchtower/pkg/types/mocks"
 )
@@ -64,7 +64,7 @@ func withContainer(data map[string]any, container string) map[string]any {
 func newBatchingNotifier(t *testing.T, entries []*notificationEntry) *shoutrrrTypeNotifier {
 	t.Helper()
 
-	notifier := createTestNotifier([]string{}, zerolog.TraceLevel, true, StaticData{}, false, 0)
+	notifier := createTestNotifier(newTestLogger(t), []string{}, zerolog.TraceLevel, true, StaticData{}, false, 0)
 	t.Cleanup(notifier.Close)
 
 	notifier.entries = entries
@@ -114,7 +114,7 @@ func TestNotificationBatching(t *testing.T) {
 	focus.EXPECT().ImageName().Return("org/web:1.0").Maybe()
 
 	focused := newBatchingNotifier(t, batchEntries())
-	focused.SendNotification(&session.SingleContainerReport{UpdatedReports: []types.ContainerReport{focus}})
+	focused.SendNotification(&state.SingleContainerReport{UpdatedReports: []types.ContainerReport{focus}})
 	writeMessages(&out, sentMessages(focused))
 
 	out.WriteString("--- still queued\n")

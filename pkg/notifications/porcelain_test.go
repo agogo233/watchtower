@@ -6,15 +6,15 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/nicholas-fedor/watchtower/pkg/container"
-	"github.com/nicholas-fedor/watchtower/pkg/session"
+	"github.com/nicholas-fedor/watchtower/internal/container/provenance"
+	"github.com/nicholas-fedor/watchtower/internal/update/state"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 func TestToPorcelainReport_NilInput(t *testing.T) {
 	t.Parallel()
 
-	report := ToPorcelainReport(nil)
+	report := toPorcelainReport(nil)
 
 	assert.Empty(t, report.Containers)
 	assert.Empty(t, report.Containers)
@@ -23,7 +23,7 @@ func TestToPorcelainReport_NilInput(t *testing.T) {
 func TestToPorcelainJSON_NilInput(t *testing.T) {
 	t.Parallel()
 
-	result := ToPorcelainJSON(nil)
+	result := toPorcelainJSON(nil)
 
 	require.NotEmpty(t, result)
 	assert.JSONEq(t, `{
@@ -34,8 +34,8 @@ func TestToPorcelainJSON_NilInput(t *testing.T) {
 func TestToPorcelainJSON_GitAndOCIFields(t *testing.T) {
 	t.Parallel()
 
-	status := session.NewContainerStatus("app", "org/app:latest")
-	status.SetGitMetadata(container.ReportMeta{
+	status := updatedAppStatus()
+	status.SetGitMetadata(provenance.ReportMeta{
 		GitRepo:         "https://github.com/org/app.git",
 		GitRef:          "main",
 		Changelog:       "https://github.com/org/app/releases",
@@ -46,7 +46,7 @@ func TestToPorcelainJSON_GitAndOCIFields(t *testing.T) {
 		LatestRevision:  "deadbeef",
 	})
 
-	jsonOut := ToPorcelainJSON(&session.SingleContainerReport{
+	jsonOut := toPorcelainJSON(&state.SingleContainerReport{
 		UpdatedReports: []types.ContainerReport{status},
 	})
 	assert.Contains(t, jsonOut, `"git_repo": "https://github.com/org/app.git"`)

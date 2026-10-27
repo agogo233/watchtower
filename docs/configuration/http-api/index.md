@@ -15,7 +15,7 @@ Sets the host interface for binding the HTTP API.
             Argument: --http-api-host
 Environment Variable: WATCHTOWER_HTTP_API_HOST
                 Type: String
-             Default: empty (binds to all interfaces)
+             Default: empty (binds to all IPv4 interfaces)
 ```
 
 !!! Note "See the [HTTP API Host documentation](../../http-api/configuration/host-and-port/index.md#http_api_host) for details"
@@ -79,7 +79,7 @@ Selects which HTTP API endpoints to enable.
 ```text
             Argument: --http-api-endpoints
 Environment Variable: WATCHTOWER_HTTP_API_ENDPOINTS
-                Type: String (comma or space separated list)
+                Type: String (comma or whitespace separated list)
              Default: empty (HTTP API disabled)
 ```
 

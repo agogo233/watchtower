@@ -9,7 +9,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/spf13/cobra"
 
-	notifyConfig "github.com/nicholas-fedor/watchtower/internal/config/notify"
+	notifyConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/notify"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
@@ -104,7 +104,7 @@ func (n *msTeamsTypeNotifier) GetURL(_ *cobra.Command) (string, error) {
 	// Create Teams config with the full webhook URL as the host.
 	config := &teams.Config{
 		Host:  n.webHookURL,
-		Color: ColorHex,
+		Color: colorHex,
 	}
 
 	urlStr := config.GetURL().String()

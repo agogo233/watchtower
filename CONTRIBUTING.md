@@ -104,6 +104,9 @@ To generate new mock implementations of Watchtower's interfaces, run the followi
 task mocks
 ```
 
+It removes the generated mocks before regenerating them, so the mock of a removed or renamed interface is deleted with it.
+Hand-written fakes in the `mocks` directories are kept.
+
 `task mocks:check` regenerates the mocks and fails if they differ from the committed ones.
 It leaves the regenerated files in place so you can review and commit them.
 
@@ -118,14 +121,33 @@ task test
 This will run the `go test` command with the following flags:
 
 * `-timeout 30s` - sets the timeout for the tests to 30 seconds
-* `-v` - enables verbose output
 * `-coverprofile coverage.out` - generates a coverage profile
 * `-covermode atomic` - sets the cover mode to atomic
+
+Tests written with the standard `testing` package send Watchtower's log output to the test that produced it, so a failing test prints what it logged.
+Add `-v` to a `go test` command to see the output of passing tests too.
 
 Two further tasks help catch concurrency and test-isolation bugs:
 
 * `task test:race` - runs the tests with the race detector
-* `task test:repeat` - runs the repeat-safe packages twice in shuffled order to catch state leaking between tests
+* `task test:repeat` - runs every package twice in shuffled order to catch state leaking between tests
+
+### Fuzzing
+
+`task test` runs each fuzz target's seed corpus only.
+To fuzz the targets, run:
+
+```bash
+task fuzz
+```
+
+This fuzzes every target in the module for 10 seconds each, one after another, and stops at the first failing input.
+Go saves that input under the package's `testdata/fuzz` directory, where `go test` replays it as a regression case until it is removed.
+Three variables adjust the run:
+
+* `FUZZTIME` - how long to fuzz each target, for example `task fuzz FUZZTIME=1m`
+* `FUZZPKGS` - the packages to fuzz, for example `task fuzz FUZZPKGS=./internal/registry/...`
+* `FUZZPARALLEL` - the number of fuzzing workers, 8 by default
 
 ### Golden Files
 
@@ -149,7 +171,7 @@ After changing a built-in template, the container report, or the JSON output, re
 
 ```bash
 go build                               # compiles and packages an executable binary, watchtower
-go test ./... -v                       # runs tests with verbose output
+go test ./...                          # runs the tests
 ./watchtower                           # runs the application (outside of a container)
 ```
 

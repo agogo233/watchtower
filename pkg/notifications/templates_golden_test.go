@@ -11,10 +11,9 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
 
-	mockActions "github.com/nicholas-fedor/watchtower/internal/actions/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/container/provenance"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/golden"
-	"github.com/nicholas-fedor/watchtower/pkg/container"
-	"github.com/nicholas-fedor/watchtower/pkg/session"
+	"github.com/nicholas-fedor/watchtower/internal/update/state"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
@@ -75,6 +74,10 @@ var legacyTemplateMessages = []string{
 	"Ignoring depends-on entry that names no container",
 	"Skipping container update (self-dependency)",
 	"Skipping container update (circular dependency)",
+	"Could not identify Watchtower's own container. Self-updates are disabled and old instances will not be removed",
+	"Could not inspect Watchtower's own container. Self-updates are disabled",
+	"Could not inspect Watchtower's own container to read its scope label. Exiting rather than running without a scope",
+	"Could not disable Watchtower's restart policy. The runtime may start it again",
 }
 
 // Disk sizes used by the image-usage budget fixtures, in bytes.
@@ -205,6 +208,13 @@ func goldenEntryData(message string) map[string]any {
 		return map[string]any{"container": "app", "id": "abcdef123456"}
 	case "Only checking containers in scope":
 		return map[string]any{"scope": "production"}
+	case "Could not identify Watchtower's own container. Self-updates are disabled and old instances will not be removed":
+		return map[string]any{"error": "failed to detect current container ID: no container ID in cgroup file"}
+	case "Could not inspect Watchtower's own container. Self-updates are disabled",
+		"Could not inspect Watchtower's own container to read its scope label. Exiting rather than running without a scope":
+		return map[string]any{"error": "failed to inspect container: context deadline exceeded"}
+	case "Could not disable Watchtower's restart policy. The runtime may start it again":
+		return map[string]any{"error": "failed to set restart policy: context deadline exceeded"}
 	case "Starting HTTP API server", "HTTP API server is enabled":
 		return map[string]any{"host": "0.0.0.0", "port": "8080", "tls": true}
 	default:
@@ -250,13 +260,13 @@ func goldenEntries() []*notificationEntry {
 func goldenFullReport() types.Report {
 	nop := zerolog.Nop()
 	log := &nop
-	progress := session.Progress{}
+	progress := state.Progress{}
 	failures := map[types.ContainerID]error{}
 
-	updated, newImage := mockActions.CreateContainerForProgress(0, 11, "updt%d")
+	updated, newImage := newProgressContainer(0, updatedIDPrefix, "updt%d")
 	progress.AddScanned(log, updated, newImage, types.UpdateParams{})
 	progress.MarkForUpdate(log, updated.ID())
-	progress[updated.ID()].SetGitMetadata(container.ReportMeta{
+	progress[updated.ID()].SetGitMetadata(provenance.ReportMeta{
 		GitRepo:         "https://github.com/org/app.git",
 		GitRef:          "v1.2.0",
 		Changelog:       "https://github.com/org/app/releases/tag/v1.2.0",
@@ -269,21 +279,21 @@ func goldenFullReport() types.Report {
 		LatestRevision:  "2222222222222222222222222222222222222222",
 	})
 
-	secondUpdated, secondImage := mockActions.CreateContainerForProgress(1, 11, "updt%d")
+	secondUpdated, secondImage := newProgressContainer(1, updatedIDPrefix, "updt%d")
 	progress.AddScanned(log, secondUpdated, secondImage, types.UpdateParams{})
 	progress.MarkForUpdate(log, secondUpdated.ID())
 
-	fresh, _ := mockActions.CreateContainerForProgress(0, 31, "frsh%d")
+	fresh, _ := newProgressContainer(0, freshIDPrefix, "frsh%d")
 	progress.AddScanned(log, fresh, fresh.ImageID(), types.UpdateParams{})
 
-	failed, failedImage := mockActions.CreateContainerForProgress(0, 21, "fail%d")
+	failed, failedImage := newProgressContainer(0, failedIDPrefix, "fail%d")
 	progress.AddScanned(log, failed, failedImage, types.UpdateParams{})
 	failures[failed.ID()] = errGoldenFailure
 
-	skipped, _ := mockActions.CreateContainerForProgress(0, 41, "skip%d")
+	skipped, _ := newProgressContainer(0, skippedIDPrefix, "skip%d")
 	progress.AddSkipped(log, skipped, errGoldenSkipped, types.UpdateParams{})
 
-	restarted, _ := mockActions.CreateContainerForProgress(0, 51, "rstr%d")
+	restarted, _ := newProgressContainer(0, restartedIDPrefix, "rstr%d")
 	progress.AddScanned(log, restarted, restarted.ImageID(), types.UpdateParams{})
 	progress.MarkRestarted(log, restarted.ID())
 
@@ -293,14 +303,14 @@ func goldenFullReport() types.Report {
 }
 
 // goldenFixtures returns the notification data each built-in template is rendered against.
-func goldenFixtures() map[string]Data {
+func goldenFixtures() map[string]notificationData {
 	nop := zerolog.Nop()
 	staticData := StaticData{
-		Title: GetTitle(&nop, goldenHost, ""),
+		Title: getTitle(&nop, goldenHost, ""),
 		Host:  goldenHost,
 	}
 
-	return map[string]Data{
+	return map[string]notificationData{
 		"full": {
 			StaticData: staticData,
 			Entries:    goldenEntries(),
@@ -309,7 +319,7 @@ func goldenFixtures() map[string]Data {
 		"empty": {
 			StaticData: staticData,
 			Entries:    []*notificationEntry{},
-			Report:     session.Progress{}.Report(&nop),
+			Report:     state.Progress{}.Report(&nop),
 		},
 		"nil-report": {
 			StaticData: staticData,

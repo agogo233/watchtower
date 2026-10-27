@@ -13,11 +13,41 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/timeout"
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/nicholas-fedor/watchtower/internal/metrics"
+	"github.com/nicholas-fedor/watchtower/internal/observability/metrics"
+	"github.com/nicholas-fedor/watchtower/internal/update/schedule"
 )
+
+// newTestLogger returns a logger that writes each event to the test's log, so a
+// failing test shows what it logged.
+//
+// Parameters:
+//   - t: Test that receives the log lines.
+//
+// Returns:
+//   - *zerolog.Logger: Logger writing to t.
+func newTestLogger(t *testing.T) *zerolog.Logger {
+	t.Helper()
+
+	// Frame 4 skips zerolog's write path, so each line names the log call.
+	w := zerolog.TestWriter{T: t, Frame: 4}
+
+	return new(zerolog.New(w))
+}
+
+// newNopLogger returns a logger that discards every event, for fuzz targets.
+//
+// Returns:
+//   - *zerolog.Logger: Logger that discards all events.
+func newNopLogger() *zerolog.Logger {
+	return new(zerolog.Nop())
+}
+
+// testMaxTimeout is the maximum per-request timeout the tests give handlers.
+const testMaxTimeout = 5 * time.Minute
 
 func TestNew(t *testing.T) {
 	updateFn := func(_ context.Context, _, _ []string) *metrics.Metric {
@@ -27,26 +57,20 @@ func TestNew(t *testing.T) {
 	tests := []struct {
 		name       string
 		updateFn   func(ctx context.Context, images, containers []string) *metrics.Metric
-		updateLock chan bool
+		updateLock *schedule.UpdateLock
 		wantPath   string
 	}{
 		{
-			name:       "with nil lock creates new lock",
-			updateFn:   updateFn,
-			updateLock: nil,
-			wantPath:   "/v1/update",
-		},
-		{
 			name:       "with provided lock uses it",
 			updateFn:   updateFn,
-			updateLock: make(chan bool, 1),
+			updateLock: schedule.NewUpdateLock(),
 			wantPath:   "/v1/update",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := New(testLogger(), tt.updateFn, tt.updateLock)
+			h := New(newTestLogger(t), tt.updateFn, tt.updateLock, testMaxTimeout)
 			require.NotNil(t, h)
 			assert.Equal(t, tt.wantPath, h.Path)
 		})
@@ -64,10 +88,9 @@ func TestHandler_Handle_Sync(t *testing.T) {
 		return expectedMetric
 	}
 
-	lock := make(chan bool, 1)
-	lock <- true
+	lock := schedule.NewUpdateLock()
 
-	h := New(testLogger(), updateFn, lock)
+	h := New(newTestLogger(t), updateFn, lock, testMaxTimeout)
 
 	app := fiber.New(fiber.Config{})
 	app.Post("/v1/update", h.Handle)
@@ -85,14 +108,13 @@ func TestHandler_Handle_Sync(t *testing.T) {
 func TestHandler_Handle_Async(t *testing.T) {
 	var called atomic.Int32
 
-	lock := make(chan bool, 1)
-	lock <- true
+	lock := schedule.NewUpdateLock()
 
-	h := New(testLogger(), func(_ context.Context, _, _ []string) *metrics.Metric {
+	h := New(newTestLogger(t), func(_ context.Context, _, _ []string) *metrics.Metric {
 		called.Add(1)
 
 		return &metrics.Metric{}
-	}, lock)
+	}, lock, testMaxTimeout)
 
 	app := fiber.New(fiber.Config{})
 	app.Post("/v1/update", h.Handle)
@@ -105,17 +127,20 @@ func TestHandler_Handle_Async(t *testing.T) {
 
 	assert.Equal(t, http.StatusAccepted, resp.StatusCode)
 
-	time.Sleep(50 * time.Millisecond)
+	// The async update logs its completion before it releases the lock, so the
+	// test ends only after that log.
+	require.Eventually(t, lock.TryLock, 2*time.Second, 10*time.Millisecond, "lock should be released after async update")
 	assert.Equal(t, int32(1), called.Load())
 }
 
 func TestHandler_Handle_FullUpdateLocked(t *testing.T) {
-	lock := make(chan bool, 1)
-	h := New(testLogger(), func(_ context.Context, _, _ []string) *metrics.Metric {
+	lock := schedule.NewUpdateLock()
+	require.True(t, lock.TryLock())
+	h := New(newTestLogger(t), func(_ context.Context, _, _ []string) *metrics.Metric {
 		t.Error("update function should not be called when lock is held")
 
 		return &metrics.Metric{}
-	}, lock)
+	}, lock, testMaxTimeout)
 
 	app := fiber.New(fiber.Config{})
 	app.Post("/v1/update", h.Handle)
@@ -146,8 +171,9 @@ func TestHandler_Handle_TargetedUpdateBlocks(t *testing.T) {
 		return &metrics.Metric{Scanned: 1, Updated: 1, Failed: 0}
 	}
 
-	lock := make(chan bool, 1)
-	h := New(testLogger(), updateFn, lock)
+	lock := schedule.NewUpdateLock()
+	require.True(t, lock.TryLock())
+	h := New(newTestLogger(t), updateFn, lock, testMaxTimeout)
 
 	app := fiber.New(fiber.Config{})
 	app.Post("/v1/update", h.Handle)
@@ -171,7 +197,7 @@ func TestHandler_Handle_TargetedUpdateBlocks(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 	assert.Equal(t, int32(0), called.Load())
 
-	lock <- true
+	lock.Unlock()
 
 	time.Sleep(50 * time.Millisecond)
 
@@ -189,8 +215,9 @@ func TestHandler_Handle_TargetedContainerUpdateBlocks(t *testing.T) {
 		return &metrics.Metric{Scanned: 1, Updated: 1, Failed: 0}
 	}
 
-	lock := make(chan bool, 1)
-	h := New(testLogger(), updateFn, lock)
+	lock := schedule.NewUpdateLock()
+	require.True(t, lock.TryLock())
+	h := New(newTestLogger(t), updateFn, lock, testMaxTimeout)
 
 	app := fiber.New(fiber.Config{})
 	app.Post("/v1/update", h.Handle)
@@ -214,7 +241,7 @@ func TestHandler_Handle_TargetedContainerUpdateBlocks(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 	assert.Equal(t, int32(0), called.Load())
 
-	lock <- true
+	lock.Unlock()
 
 	time.Sleep(50 * time.Millisecond)
 
@@ -224,10 +251,11 @@ func TestHandler_Handle_TargetedContainerUpdateBlocks(t *testing.T) {
 }
 
 func TestHandler_Handle_ContextCancellation(t *testing.T) {
-	lock := make(chan bool, 1)
-	h := New(testLogger(), func(_ context.Context, _, _ []string) *metrics.Metric {
+	lock := schedule.NewUpdateLock()
+	require.True(t, lock.TryLock())
+	h := New(newTestLogger(t), func(_ context.Context, _, _ []string) *metrics.Metric {
 		return &metrics.Metric{}
-	}, lock)
+	}, lock, testMaxTimeout)
 
 	app := fiber.New(fiber.Config{})
 	app.Post("/v1/update", h.Handle)
@@ -259,12 +287,11 @@ func TestHandler_Handle_ContextCancellation(t *testing.T) {
 }
 
 func TestHandler_Handle_PanicRecovery(t *testing.T) {
-	lock := make(chan bool, 1)
-	lock <- true
+	lock := schedule.NewUpdateLock()
 
-	h := New(testLogger(), func(_ context.Context, _, _ []string) *metrics.Metric {
+	h := New(newTestLogger(t), func(_ context.Context, _, _ []string) *metrics.Metric {
 		panic("simulated panic")
-	}, lock)
+	}, lock, testMaxTimeout)
 
 	app := fiber.New(fiber.Config{})
 	app.Post("/v1/update", h.Handle)
@@ -277,19 +304,15 @@ func TestHandler_Handle_PanicRecovery(t *testing.T) {
 
 	assert.Equal(t, http.StatusAccepted, resp.StatusCode)
 
-	time.Sleep(50 * time.Millisecond)
-
-	select {
-	case <-lock:
-	default:
-		t.Error("lock was not released after panic")
-	}
+	// The async update logs the panic and the lock release before the lock is
+	// free, so the test ends only after those logs.
+	require.Eventually(t, lock.TryLock, 2*time.Second, 10*time.Millisecond, "lock was not released after panic")
 }
 
 func TestExtractImages_Unit(t *testing.T) {
-	h := New(testLogger(), func(_ context.Context, _, _ []string) *metrics.Metric {
+	h := New(newTestLogger(t), func(_ context.Context, _, _ []string) *metrics.Metric {
 		return &metrics.Metric{}
-	}, nil)
+	}, schedule.NewUpdateLock(), testMaxTimeout)
 
 	tests := []struct {
 		name      string
@@ -382,9 +405,9 @@ func TestExtractImages_Unit(t *testing.T) {
 }
 
 func TestExtractContainers_Unit(t *testing.T) {
-	h := New(testLogger(), func(_ context.Context, _, _ []string) *metrics.Metric {
+	h := New(newTestLogger(t), func(_ context.Context, _, _ []string) *metrics.Metric {
 		return &metrics.Metric{}
-	}, nil)
+	}, schedule.NewUpdateLock(), testMaxTimeout)
 
 	tests := []struct {
 		name      string
@@ -465,9 +488,9 @@ func TestExtractContainers_Unit(t *testing.T) {
 }
 
 func Test_send429Response(t *testing.T) {
-	h := New(testLogger(), func(_ context.Context, _, _ []string) *metrics.Metric {
+	h := New(newTestLogger(t), func(_ context.Context, _, _ []string) *metrics.Metric {
 		return &metrics.Metric{}
-	}, nil)
+	}, schedule.NewUpdateLock(), testMaxTimeout)
 
 	app := fiber.New(fiber.Config{})
 	app.Post("/test", func(c fiber.Ctx) error {
@@ -496,9 +519,9 @@ func Test_send429Response(t *testing.T) {
 func Test_executeUpdate(t *testing.T) {
 	expected := &metrics.Metric{Scanned: 10, Updated: 5, Failed: 2}
 
-	h := New(testLogger(), func(_ context.Context, _, _ []string) *metrics.Metric {
+	h := New(newTestLogger(t), func(_ context.Context, _, _ []string) *metrics.Metric {
 		return expected
-	}, nil)
+	}, schedule.NewUpdateLock(), testMaxTimeout)
 
 	metric, duration := h.executeUpdate(t.Context(), []string{"nginx:latest"}, nil)
 	assert.Equal(t, expected, metric)
@@ -508,25 +531,20 @@ func Test_executeUpdate(t *testing.T) {
 func Test_executeUpdateAsync(t *testing.T) {
 	var called atomic.Int32
 
-	lock := make(chan bool, 1)
-	lock <- true
+	lock := schedule.NewUpdateLock()
 
-	h := New(testLogger(), func(_ context.Context, _, _ []string) *metrics.Metric {
+	h := New(newTestLogger(t), func(_ context.Context, _, _ []string) *metrics.Metric {
 		called.Add(1)
 
 		return &metrics.Metric{}
-	}, lock)
+	}, lock, testMaxTimeout)
 
-	token := <-lock
-	h.executeUpdateAsync(t.Context(), nil, nil, token)
+	require.True(t, lock.TryLock())
+	h.executeUpdateAsync(t.Context(), nil, nil)
 
 	assert.Equal(t, int32(1), called.Load())
 
-	select {
-	case <-lock:
-	default:
-		t.Error("lock was not released")
-	}
+	assert.True(t, lock.TryLock(), "lock was not released")
 }
 
 func Test_contextForAsync(t *testing.T) {
@@ -534,9 +552,9 @@ func Test_contextForAsync(t *testing.T) {
 		type ctxKey struct{}
 
 		handlerCtx := context.WithValue(context.Background(), ctxKey{}, "handler")
-		h := New(testLogger(), func(_ context.Context, _, _ []string) *metrics.Metric {
+		h := New(newTestLogger(t), func(_ context.Context, _, _ []string) *metrics.Metric {
 			return &metrics.Metric{}
-		}, nil, handlerCtx)
+		}, schedule.NewUpdateLock(), testMaxTimeout, handlerCtx)
 
 		ctx, cancel := h.contextForAsync(context.Background())
 		defer cancel()
@@ -548,9 +566,9 @@ func Test_contextForAsync(t *testing.T) {
 
 	t.Run("projects deadline without inheriting cancellation", func(t *testing.T) {
 		handlerCtx := context.Background()
-		h := New(testLogger(), func(_ context.Context, _, _ []string) *metrics.Metric {
+		h := New(newTestLogger(t), func(_ context.Context, _, _ []string) *metrics.Metric {
 			return &metrics.Metric{}
-		}, nil, handlerCtx)
+		}, schedule.NewUpdateLock(), testMaxTimeout, handlerCtx)
 
 		deadline := time.Now().Add(3 * time.Minute).Truncate(time.Millisecond)
 		updateCtx, cancelUpdate := context.WithDeadline(context.Background(), deadline)
@@ -574,9 +592,9 @@ func Test_contextForAsync(t *testing.T) {
 
 	t.Run("cancels when handler context is canceled", func(t *testing.T) {
 		handlerCtx, handlerCancel := context.WithCancel(context.Background())
-		h := New(testLogger(), func(_ context.Context, _, _ []string) *metrics.Metric {
+		h := New(newTestLogger(t), func(_ context.Context, _, _ []string) *metrics.Metric {
 			return &metrics.Metric{}
-		}, nil, handlerCtx)
+		}, schedule.NewUpdateLock(), testMaxTimeout, handlerCtx)
 
 		deadline := time.Now().Add(time.Minute)
 
@@ -595,32 +613,31 @@ func Test_contextForAsync(t *testing.T) {
 }
 
 func Test_executeUpdateAsync_ignoresRequestContextCancellation(t *testing.T) {
-	lock := make(chan bool, 1)
-	lock <- true
+	lock := schedule.NewUpdateLock()
 
 	handlerCtx := context.Background()
 	started := make(chan context.Context, 1)
 	release := make(chan struct{})
 
-	h := New(testLogger(), func(ctx context.Context, _, _ []string) *metrics.Metric {
+	h := New(newTestLogger(t), func(ctx context.Context, _, _ []string) *metrics.Metric {
 		started <- ctx
 
 		<-release
 
 		return &metrics.Metric{}
-	}, lock, handlerCtx)
+	}, lock, testMaxTimeout, handlerCtx)
 
 	deadline := time.Now().Add(2 * time.Minute)
 	updateCtx, cancelUpdate := context.WithDeadline(context.Background(), deadline)
 	cancelUpdate()
 
-	token := <-lock
+	require.True(t, lock.TryLock())
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 
-		h.executeUpdateAsync(updateCtx, nil, nil, token)
+		h.executeUpdateAsync(updateCtx, nil, nil)
 	}()
 
 	var observedCtx context.Context
@@ -648,27 +665,19 @@ func Test_executeUpdateAsync_ignoresRequestContextCancellation(t *testing.T) {
 		t.Fatal("executeUpdateAsync did not finish")
 	}
 
-	select {
-	case <-lock:
-	default:
-		t.Error("lock was not released")
-	}
+	assert.True(t, lock.TryLock(), "lock was not released")
 }
 
 func Test_releaseLock(t *testing.T) {
-	lock := make(chan bool, 1)
-	h := New(testLogger(), func(_ context.Context, _, _ []string) *metrics.Metric {
+	lock := schedule.NewUpdateLock()
+	require.True(t, lock.TryLock())
+	h := New(newTestLogger(t), func(_ context.Context, _, _ []string) *metrics.Metric {
 		return &metrics.Metric{}
-	}, lock)
+	}, lock, testMaxTimeout)
 
-	h.releaseLock(true)
+	h.releaseLock()
 
-	select {
-	case token := <-lock:
-		assert.True(t, token)
-	default:
-		t.Error("lock should have a token after releaseLock")
-	}
+	assert.True(t, lock.TryLock(), "the lock was still held after releaseLock")
 }
 
 func Test_handleSync(t *testing.T) {
@@ -676,12 +685,11 @@ func Test_handleSync(t *testing.T) {
 		Scanned: 8, Updated: 3, Failed: 1, Restarted: 2, Skipped: 1,
 	}
 
-	lock := make(chan bool, 1)
-	lock <- true
+	lock := schedule.NewUpdateLock()
 
-	h := New(testLogger(), func(_ context.Context, _, _ []string) *metrics.Metric {
+	h := New(newTestLogger(t), func(_ context.Context, _, _ []string) *metrics.Metric {
 		return expected
-	}, lock)
+	}, lock, testMaxTimeout)
 
 	app := fiber.New(fiber.Config{})
 	app.Post("/v1/update", h.Handle)
@@ -708,12 +716,11 @@ func Test_handleSync_JSONStructure(t *testing.T) {
 		Scanned: 10, Updated: 3, Failed: 1, Restarted: 2, Skipped: 0,
 	}
 
-	lock := make(chan bool, 1)
-	lock <- true
+	lock := schedule.NewUpdateLock()
 
-	h := New(testLogger(), func(_ context.Context, _, _ []string) *metrics.Metric {
+	h := New(newTestLogger(t), func(_ context.Context, _, _ []string) *metrics.Metric {
 		return expected
-	}, lock)
+	}, lock, testMaxTimeout)
 
 	app := fiber.New(fiber.Config{})
 	app.Post("/v1/update", h.Handle)
@@ -745,18 +752,16 @@ func Test_handleSync_JSONStructure(t *testing.T) {
 }
 
 func Test_handleAsync(t *testing.T) {
-	lock := make(chan bool, 1)
-	lock <- true
+	lock := schedule.NewUpdateLock()
+	require.True(t, lock.TryLock())
 
-	<-lock
-
-	h := New(testLogger(), func(_ context.Context, _, _ []string) *metrics.Metric {
+	h := New(newTestLogger(t), func(_ context.Context, _, _ []string) *metrics.Metric {
 		return &metrics.Metric{}
-	}, lock)
+	}, lock, testMaxTimeout)
 
 	app := fiber.New(fiber.Config{})
 	app.Post("/test", func(c fiber.Ctx) error {
-		return h.handleAsync(c, nil, nil, true, c.Context())
+		return h.handleAsync(c, nil, nil, c.Context())
 	})
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/test", nil)
@@ -767,24 +772,16 @@ func Test_handleAsync(t *testing.T) {
 
 	assert.Equal(t, http.StatusAccepted, resp.StatusCode)
 
-	require.Eventually(t, func() bool {
-		select {
-		case <-lock:
-			return true
-		default:
-			return false
-		}
-	}, 2*time.Second, 10*time.Millisecond, "lock should be released after async update")
+	require.Eventually(t, lock.TryLock, 2*time.Second, 10*time.Millisecond, "lock should be released after async update")
 }
 
 func Test_handleAsync_survivesRequestContextCancellation(t *testing.T) {
-	lock := make(chan bool, 1)
-	lock <- true
+	lock := schedule.NewUpdateLock()
 
 	started := make(chan context.Context, 1)
 	release := make(chan struct{})
 
-	h := NewWithTimeout(testLogger(), func(ctx context.Context, _, _ []string) *metrics.Metric {
+	h := New(newTestLogger(t), func(ctx context.Context, _, _ []string) *metrics.Metric {
 		started <- ctx
 
 		<-release
@@ -825,25 +822,17 @@ func Test_handleAsync_survivesRequestContextCancellation(t *testing.T) {
 
 	close(release)
 
-	require.Eventually(t, func() bool {
-		select {
-		case <-lock:
-			return true
-		default:
-			return false
-		}
-	}, 2*time.Second, 10*time.Millisecond, "lock should be released after async update")
+	require.Eventually(t, lock.TryLock, 2*time.Second, 10*time.Millisecond, "lock should be released after async update")
 }
 
 func Test_handleAsync_survivesTimeoutMiddlewareCancellation(t *testing.T) {
-	lock := make(chan bool, 1)
-	lock <- true
+	lock := schedule.NewUpdateLock()
 
 	started := make(chan context.Context, 1)
 	release := make(chan struct{})
 
 	routeTimeout := 5 * time.Minute
-	h := NewWithTimeout(testLogger(), func(ctx context.Context, _, _ []string) *metrics.Metric {
+	h := New(newTestLogger(t), func(ctx context.Context, _, _ []string) *metrics.Metric {
 		started <- ctx
 
 		<-release
@@ -890,23 +879,15 @@ func Test_handleAsync_survivesTimeoutMiddlewareCancellation(t *testing.T) {
 
 	close(release)
 
-	require.Eventually(t, func() bool {
-		select {
-		case <-lock:
-			return true
-		default:
-			return false
-		}
-	}, 2*time.Second, 10*time.Millisecond, "lock should be released after async update")
+	require.Eventually(t, lock.TryLock, 2*time.Second, 10*time.Millisecond, "lock should be released after async update")
 }
 
 func Test_handleSync_NilMetric(t *testing.T) {
-	lock := make(chan bool, 1)
-	lock <- true
+	lock := schedule.NewUpdateLock()
 
-	h := New(testLogger(), func(_ context.Context, _, _ []string) *metrics.Metric {
+	h := New(newTestLogger(t), func(_ context.Context, _, _ []string) *metrics.Metric {
 		return nil
-	}, lock)
+	}, lock, testMaxTimeout)
 
 	app := fiber.New(fiber.Config{})
 	app.Post("/v1/update", h.Handle)
@@ -921,12 +902,11 @@ func Test_handleSync_NilMetric(t *testing.T) {
 }
 
 func Test_acquireLock_ContextCancelled(t *testing.T) {
-	lock := make(chan bool, 1)
-	lock <- true
+	lock := schedule.NewUpdateLock()
 
-	h := New(testLogger(), func(_ context.Context, _, _ []string) *metrics.Metric {
+	h := New(newTestLogger(t), func(_ context.Context, _, _ []string) *metrics.Metric {
 		return &metrics.Metric{}
-	}, lock)
+	}, lock, testMaxTimeout)
 
 	app := fiber.New(fiber.Config{})
 
@@ -958,11 +938,12 @@ func Test_acquireLock_ContextCancelled(t *testing.T) {
 }
 
 func Test_acquireLock_FullUpdateBusy(t *testing.T) {
-	lock := make(chan bool, 1)
+	lock := schedule.NewUpdateLock()
+	require.True(t, lock.TryLock())
 
-	h := New(testLogger(), func(_ context.Context, _, _ []string) *metrics.Metric {
+	h := New(newTestLogger(t), func(_ context.Context, _, _ []string) *metrics.Metric {
 		return &metrics.Metric{}
-	}, lock)
+	}, lock, testMaxTimeout)
 
 	app := fiber.New(fiber.Config{})
 	app.Post("/v1/update", h.Handle)
@@ -981,10 +962,9 @@ func Test_acquireLock_FullUpdateBusy(t *testing.T) {
 
 func TestHandler_Handle_TimeoutOverride(t *testing.T) {
 	t.Run("sync update respects valid timeout", func(t *testing.T) {
-		lock := make(chan bool, 1)
-		lock <- true
+		lock := schedule.NewUpdateLock()
 
-		h := NewWithTimeout(testLogger(), func(ctx context.Context, _, _ []string) *metrics.Metric {
+		h := New(newTestLogger(t), func(ctx context.Context, _, _ []string) *metrics.Metric {
 			return &metrics.Metric{}
 		}, lock, 5*time.Minute)
 		app := fiber.New(fiber.Config{})
@@ -999,11 +979,34 @@ func TestHandler_Handle_TimeoutOverride(t *testing.T) {
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
 	})
 
-	t.Run("sync update clamps timeout to max", func(t *testing.T) {
-		lock := make(chan bool, 1)
-		lock <- true
+	t.Run("zero max timeout ignores the timeout parameter", func(t *testing.T) {
+		lock := schedule.NewUpdateLock()
 
-		h := NewWithTimeout(testLogger(), func(ctx context.Context, _, _ []string) *metrics.Metric {
+		var hasDeadline atomic.Bool
+
+		h := New(newTestLogger(t), func(ctx context.Context, _, _ []string) *metrics.Metric {
+			_, ok := ctx.Deadline()
+			hasDeadline.Store(ok)
+
+			return &metrics.Metric{}
+		}, lock, 0)
+		app := fiber.New(fiber.Config{})
+		app.Post("/v1/update", h.Handle)
+
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/update?timeout=2m", nil)
+		resp, err := app.Test(req)
+		require.NoError(t, err)
+
+		defer resp.Body.Close()
+
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.False(t, hasDeadline.Load(), "the update ran with a deadline from the timeout parameter")
+	})
+
+	t.Run("sync update clamps timeout to max", func(t *testing.T) {
+		lock := schedule.NewUpdateLock()
+
+		h := New(newTestLogger(t), func(ctx context.Context, _, _ []string) *metrics.Metric {
 			return &metrics.Metric{}
 		}, lock, 2*time.Minute)
 		app := fiber.New(fiber.Config{})
@@ -1019,12 +1022,11 @@ func TestHandler_Handle_TimeoutOverride(t *testing.T) {
 	})
 
 	t.Run("async update respects valid timeout", func(t *testing.T) {
-		lock := make(chan bool, 1)
-		lock <- true
+		lock := schedule.NewUpdateLock()
 
 		started := make(chan context.Context, 1)
 
-		h := NewWithTimeout(testLogger(), func(ctx context.Context, _, _ []string) *metrics.Metric {
+		h := New(newTestLogger(t), func(ctx context.Context, _, _ []string) *metrics.Metric {
 			started <- ctx
 
 			return &metrics.Metric{}
@@ -1052,21 +1054,13 @@ func TestHandler_Handle_TimeoutOverride(t *testing.T) {
 		require.True(t, ok)
 		assert.WithinDuration(t, before.Add(2*time.Minute), deadline, 5*time.Second)
 
-		require.Eventually(t, func() bool {
-			select {
-			case <-lock:
-				return true
-			default:
-				return false
-			}
-		}, 2*time.Second, 10*time.Millisecond)
+		require.Eventually(t, lock.TryLock, 2*time.Second, 10*time.Millisecond)
 	})
 
 	t.Run("invalid timeout is ignored", func(t *testing.T) {
-		lock := make(chan bool, 1)
-		lock <- true
+		lock := schedule.NewUpdateLock()
 
-		h := NewWithTimeout(testLogger(), func(ctx context.Context, _, _ []string) *metrics.Metric {
+		h := New(newTestLogger(t), func(ctx context.Context, _, _ []string) *metrics.Metric {
 			return &metrics.Metric{}
 		}, lock, 5*time.Minute)
 		app := fiber.New(fiber.Config{})
@@ -1097,10 +1091,9 @@ func TestHandler_Handle_SyncScanFailed(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			lock := make(chan bool, 1)
-			lock <- true
+			lock := schedule.NewUpdateLock()
 
-			h := New(testLogger(), func(context.Context, []string, []string) *metrics.Metric { return tt.metric }, lock)
+			h := New(newTestLogger(t), func(context.Context, []string, []string) *metrics.Metric { return tt.metric }, lock, testMaxTimeout)
 			app := fiber.New(fiber.Config{})
 			app.Post("/v1/update", h.Handle)
 

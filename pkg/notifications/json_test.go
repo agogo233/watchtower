@@ -2,19 +2,60 @@ package notifications
 
 import (
 	"encoding/json"
+	"strings"
+	"testing"
 
-	"github.com/onsi/ginkgo/v2"
-	"github.com/onsi/gomega"
+	"github.com/rs/zerolog"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
-	"github.com/nicholas-fedor/watchtower/pkg/container"
-	"github.com/nicholas-fedor/watchtower/pkg/session"
+	dockerContainer "github.com/moby/moby/api/types/container"
+	dockerImage "github.com/moby/moby/api/types/image"
+
+	"github.com/nicholas-fedor/watchtower/internal/container"
+	"github.com/nicholas-fedor/watchtower/internal/container/provenance"
+	"github.com/nicholas-fedor/watchtower/internal/update/state"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
-var _ = ginkgo.Describe("JSON template", func() {
-	ginkgo.When("using report templates", func() {
-		ginkgo.When("JSON template is used", func() {
-			ginkgo.It("should format the messages to the expected format", func() {
+// updatedAppStatus returns the report status of an updated "app" container
+// running org/app:latest, built the way an update session builds it.
+//
+// Returns:
+//   - *state.ContainerStatus: Status in the updated state.
+func updatedAppStatus() *state.ContainerStatus {
+	log := new(zerolog.Nop())
+	app := container.NewContainer(nil,
+		&dockerContainer.InspectResponse{
+			ID:     strings.Repeat("a", 64),
+			Name:   "/app",
+			Image:  "sha256:" + strings.Repeat("b", 64),
+			Config: &dockerContainer.Config{Image: "org/app:latest"},
+		},
+		&dockerImage.InspectResponse{ID: "sha256:" + strings.Repeat("b", 64)},
+	)
+
+	progress := state.Progress{}
+	progress.AddScanned(log, app, types.ImageID("sha256:"+strings.Repeat("c", 64)), types.UpdateParams{})
+	progress.MarkForUpdate(log, app.ID())
+
+	return progress[app.ID()]
+}
+
+// TestJSONTemplate verifies the JSON report template: its fields, ID types,
+// and container states.
+func TestJSONTemplate(t *testing.T) {
+	t.Parallel()
+
+	t.Run("using report templates", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("JSON template is used", func(t *testing.T) {
+			t.Parallel()
+
+			t.Run("should format the messages to the expected format", func(t *testing.T) {
+				t.Parallel()
+
 				expected := `{
 	"entries": [
 			{
@@ -116,129 +157,150 @@ var _ = ginkgo.Describe("JSON template", func() {
 		},
 		"title": "Watchtower updates on Mock"
 }`
-				data := mockDataFromStates(
-					session.UpdatedState,
-					session.FreshState,
-					session.FailedState,
-					session.SkippedState,
-					session.UpdatedState,
+				data := mockDataFromStates(t,
+					state.UpdatedState,
+					state.FreshState,
+					state.FailedState,
+					state.SkippedState,
+					state.UpdatedState,
 				)
-				gomega.Expect(getTemplatedResult(`json.v1`, false, data)).
-					To(gomega.MatchJSON(expected))
+				assert.JSONEq(t, expected, getTemplatedResult(t, `json.v1`, false, data))
 			})
-			ginkgo.It("should use correct ID types in JSON output", func() {
-				data := mockDataFromStates(session.UpdatedState)
-				result := getTemplatedResult(`json.v1`, false, data)
+			t.Run("should use correct ID types in JSON output", func(t *testing.T) {
+				t.Parallel()
+
+				data := mockDataFromStates(t, state.UpdatedState)
+				result := getTemplatedResult(t, `json.v1`, false, data)
 
 				// Verify that updated containers use container IDs for the id field, and image IDs for currentImageId and latestImageId
 				// Container IDs should be like "c79110000000"
 				// Image IDs are like "01d110000000" and "d0a110000000"
-				gomega.Expect(result).To(gomega.ContainSubstring("c79110000000"))
-				gomega.Expect(result).To(gomega.ContainSubstring("01d110000000"))
-				gomega.Expect(result).To(gomega.ContainSubstring("d0a110000000"))
+				assert.Contains(t, result, "c79110000000")
+				assert.Contains(t, result, "01d110000000")
+				assert.Contains(t, result, "d0a110000000")
 			})
 
-			ginkgo.It("should include restarted containers in JSON output", func() {
-				data := mockDataFromStates(session.UpdatedState, session.RestartedState)
-				result := getTemplatedResult(`json.v1`, false, data)
+			t.Run("should include restarted containers in JSON output", func(t *testing.T) {
+				t.Parallel()
+
+				data := mockDataFromStates(t, state.UpdatedState, state.RestartedState)
+				result := getTemplatedResult(t, `json.v1`, false, data)
 
 				// Verify restarted containers are included
-				gomega.Expect(result).To(gomega.ContainSubstring(`"restarted"`))
-				gomega.Expect(result).To(gomega.ContainSubstring(`"state": "Restarted"`))
-				gomega.Expect(result).To(gomega.ContainSubstring("rstr1"))
+				assert.Contains(t, result, `"restarted"`)
+				assert.Contains(t, result, `"state": "Restarted"`)
+				assert.Contains(t, result, "rstr1")
 			})
 
-			ginkgo.It("should render restarted containers without errors", func() {
-				data := mockDataFromStates(session.RestartedState)
-				result := getTemplatedResult(`json.v1`, false, data)
-				gomega.Expect(result).To(gomega.ContainSubstring(`"restarted"`))
-				gomega.Expect(result).NotTo(gomega.ContainSubstring("Error:"))
+			t.Run("should render restarted containers without errors", func(t *testing.T) {
+				t.Parallel()
+
+				data := mockDataFromStates(t, state.RestartedState)
+				result := getTemplatedResult(t, `json.v1`, false, data)
+				assert.Contains(t, result, `"restarted"`)
+				assert.NotContains(t, result, "Error:")
 			})
 
-			ginkgo.It("should handle state transitions in notification templates", func() {
+			t.Run("should handle state transitions in notification templates", func(t *testing.T) {
+				t.Parallel()
+
 				// Test mixing different states
-				data := mockDataFromStates(
-					session.UpdatedState,
-					session.RestartedState,
-					session.FailedState,
+				data := mockDataFromStates(t,
+					state.UpdatedState,
+					state.RestartedState,
+					state.FailedState,
 				)
-				result := getTemplatedResult(`json.v1`, false, data)
+				result := getTemplatedResult(t, `json.v1`, false, data)
 
 				// Verify all states are present
-				gomega.Expect(result).To(gomega.ContainSubstring(`"updated"`))
-				gomega.Expect(result).To(gomega.ContainSubstring(`"restarted"`))
-				gomega.Expect(result).To(gomega.ContainSubstring(`"failed"`))
-				gomega.Expect(result).To(gomega.ContainSubstring(`"state": "Updated"`))
-				gomega.Expect(result).To(gomega.ContainSubstring(`"state": "Restarted"`))
-				gomega.Expect(result).To(gomega.ContainSubstring(`"state": "Failed"`))
+				assert.Contains(t, result, `"updated"`)
+				assert.Contains(t, result, `"restarted"`)
+				assert.Contains(t, result, `"failed"`)
+				assert.Contains(t, result, `"state": "Updated"`)
+				assert.Contains(t, result, `"state": "Restarted"`)
+				assert.Contains(t, result, `"state": "Failed"`)
 			})
 
-			ginkgo.It("should maintain priority ordering in notification output", func() {
-				data := mockDataFromStates(
-					session.RestartedState,
-					session.UpdatedState,
-					session.FailedState,
+			t.Run("should maintain priority ordering in notification output", func(t *testing.T) {
+				t.Parallel()
+
+				data := mockDataFromStates(t,
+					state.RestartedState,
+					state.UpdatedState,
+					state.FailedState,
 				)
-				result := getTemplatedResult(`json.v1`, false, data)
+				result := getTemplatedResult(t, `json.v1`, false, data)
 
 				// The order should be based on the report arrays: scanned, updated, restarted, failed, skipped, stale, fresh
 				// Check that all expected keys are present
-				gomega.Expect(result).To(gomega.ContainSubstring(`"scanned"`))
-				gomega.Expect(result).To(gomega.ContainSubstring(`"updated"`))
-				gomega.Expect(result).To(gomega.ContainSubstring(`"restarted"`))
-				gomega.Expect(result).To(gomega.ContainSubstring(`"failed"`))
+				assert.Contains(t, result, `"scanned"`)
+				assert.Contains(t, result, `"updated"`)
+				assert.Contains(t, result, `"restarted"`)
+				assert.Contains(t, result, `"failed"`)
 			})
 
-			ginkgo.It("should integrate with other notification types in JSON", func() {
-				data := mockDataFromStates(session.RestartedState)
+			t.Run("should integrate with other notification types in JSON", func(t *testing.T) {
+				t.Parallel()
+
+				data := mockDataFromStates(t, state.RestartedState)
 				// Test that JSON includes all required fields
-				result := getTemplatedResult(`json.v1`, false, data)
+				result := getTemplatedResult(t, `json.v1`, false, data)
 
 				// Should include report, title, host, entries
-				gomega.Expect(result).To(gomega.ContainSubstring(`"report"`))
-				gomega.Expect(result).To(gomega.ContainSubstring(`"title"`))
-				gomega.Expect(result).To(gomega.ContainSubstring(`"host"`))
-				gomega.Expect(result).To(gomega.ContainSubstring(`"entries"`))
-				gomega.Expect(result).To(gomega.ContainSubstring(`"restarted"`))
+				assert.Contains(t, result, `"report"`)
+				assert.Contains(t, result, `"title"`)
+				assert.Contains(t, result, `"host"`)
+				assert.Contains(t, result, `"entries"`)
+				assert.Contains(t, result, `"restarted"`)
 			})
 
-			ginkgo.It("should handle template rendering edge cases", func() {
+			t.Run("should handle template rendering edge cases", func(t *testing.T) {
+				t.Parallel()
+
 				// Test with empty report
-				data := Data{
+				data := notificationData{
 					Entries: []*notificationEntry{},
 					Report:  nil,
 					Title:   "Test Title",
 					Host:    "Test Host",
 				}
-				result := getTemplatedResult(`json.v1`, false, data)
+				result := getTemplatedResult(t, `json.v1`, false, data)
 
 				// Should still produce valid JSON
-				gomega.Expect(result).To(gomega.ContainSubstring(`"report": null`))
-				gomega.Expect(result).To(gomega.ContainSubstring(`"title": "Test Title"`))
-				gomega.Expect(result).To(gomega.ContainSubstring(`"host": "Test Host"`))
+				assert.Contains(t, result, `"report": null`)
+				assert.Contains(t, result, `"title": "Test Title"`)
+				assert.Contains(t, result, `"host": "Test Host"`)
 			})
 
-			ginkgo.It("should validate notification formatting", func() {
-				data := mockDataFromStates(session.RestartedState)
-				result := getTemplatedResult(`json.v1`, false, data)
+			t.Run("should validate notification formatting", func(t *testing.T) {
+				t.Parallel()
+
+				data := mockDataFromStates(t, state.RestartedState)
+				result := getTemplatedResult(t, `json.v1`, false, data)
 
 				// Should be valid JSON
-				gomega.Expect(result).To(gomega.MatchJSON(result))
+				assert.True(t, json.Valid([]byte(result)), "invalid JSON: %s", result)
 
 				// Should contain expected structure
-				gomega.Expect(result).To(gomega.ContainSubstring(`"id"`))
-				gomega.Expect(result).To(gomega.ContainSubstring(`"name"`))
-				gomega.Expect(result).To(gomega.ContainSubstring(`"imageName"`))
-				gomega.Expect(result).To(gomega.ContainSubstring(`"state"`))
+				assert.Contains(t, result, `"id"`)
+				assert.Contains(t, result, `"name"`)
+				assert.Contains(t, result, `"imageName"`)
+				assert.Contains(t, result, `"state"`)
 			})
 		})
 	})
-})
+}
 
-var _ = ginkgo.Describe("JSON Git and OCI report fields", func() {
-	ginkgo.It("includes populated Git and OCI fields", func() {
-		status := session.NewContainerStatus("app", "org/app:latest")
-		status.SetGitMetadata(container.ReportMeta{
+// TestJSONGitAndOCIReportFields verifies that the JSON report includes the Git
+// and OCI fields that are set and omits the empty ones.
+func TestJSONGitAndOCIReportFields(t *testing.T) {
+	t.Parallel()
+
+	t.Run("includes populated Git and OCI fields", func(t *testing.T) {
+		t.Parallel()
+
+		status := updatedAppStatus()
+		status.SetGitMetadata(provenance.ReportMeta{
 			GitRepo:         "https://github.com/org/app.git",
 			GitRef:          "main",
 			Changelog:       "https://github.com/org/app/releases",
@@ -252,42 +314,46 @@ var _ = ginkgo.Describe("JSON Git and OCI report fields", func() {
 		})
 
 		got := marshalReports([]types.ContainerReport{status})
-		gomega.Expect(got).To(gomega.HaveLen(1))
-		gomega.Expect(got[0]["gitRepo"]).To(gomega.Equal("https://github.com/org/app.git"))
-		gomega.Expect(got[0]["gitRef"]).To(gomega.Equal("main"))
-		gomega.Expect(got[0]["changelog"]).To(gomega.Equal("https://github.com/org/app/releases"))
-		gomega.Expect(got[0]["ociSource"]).To(gomega.Equal("https://github.com/org/app"))
-		gomega.Expect(got[0]["imageUrl"]).To(gomega.Equal("https://example.com/image"))
-		gomega.Expect(got[0]["documentation"]).To(gomega.Equal("https://example.com/docs"))
-		gomega.Expect(got[0]["currentImageRevision"]).To(gomega.Equal("olddeadbeef"))
-		gomega.Expect(got[0]["latestImageRevision"]).To(gomega.Equal("deadbeef"))
-		gomega.Expect(got[0]["currentImageVersion"]).To(gomega.Equal("1.2.2"))
-		gomega.Expect(got[0]["latestImageVersion"]).To(gomega.Equal("1.2.3"))
+		require.Len(t, got, 1)
+		assert.Equal(t, "https://github.com/org/app.git", got[0]["gitRepo"])
+		assert.Equal(t, "main", got[0]["gitRef"])
+		assert.Equal(t, "https://github.com/org/app/releases", got[0]["changelog"])
+		assert.Equal(t, "https://github.com/org/app", got[0]["ociSource"])
+		assert.Equal(t, "https://example.com/image", got[0]["imageUrl"])
+		assert.Equal(t, "https://example.com/docs", got[0]["documentation"])
+		assert.Equal(t, "olddeadbeef", got[0]["currentImageRevision"])
+		assert.Equal(t, "deadbeef", got[0]["latestImageRevision"])
+		assert.Equal(t, "1.2.2", got[0]["currentImageVersion"])
+		assert.Equal(t, "1.2.3", got[0]["latestImageVersion"])
 	})
 
-	ginkgo.It("omits empty Git and OCI fields", func() {
-		status := session.NewContainerStatus("app", "org/app:latest")
+	t.Run("omits empty Git and OCI fields", func(t *testing.T) {
+		t.Parallel()
+
+		status := updatedAppStatus()
 		got := marshalReports([]types.ContainerReport{status})
-		gomega.Expect(got).To(gomega.HaveLen(1))
-		gomega.Expect(got[0]).NotTo(gomega.HaveKey("gitRepo"))
-		gomega.Expect(got[0]).NotTo(gomega.HaveKey("changelog"))
-		gomega.Expect(got[0]).NotTo(gomega.HaveKey("ociSource"))
-		gomega.Expect(got[0]).NotTo(gomega.HaveKey("latestImageVersion"))
-		gomega.Expect(got[0]).NotTo(gomega.HaveKey("currentImageRevision"))
+		require.Len(t, got, 1)
+		assert.NotContains(t, got[0], "gitRepo")
+		assert.NotContains(t, got[0], "changelog")
+		assert.NotContains(t, got[0], "ociSource")
+		assert.NotContains(t, got[0], "latestImageVersion")
+		assert.NotContains(t, got[0], "currentImageRevision")
 	})
 
-	ginkgo.It("marshals updated reports with Git fields", func() {
-		status := session.NewContainerStatus("app", "org/app:latest")
-		status.SetGitMetadata(container.ReportMeta{GitRepo: "https://github.com/org/app.git", GitRef: "main"})
+	t.Run("marshals updated reports with Git fields", func(t *testing.T) {
+		t.Parallel()
 
-		raw, err := json.Marshal(Data{
+		status := updatedAppStatus()
+		status.SetGitMetadata(provenance.ReportMeta{GitRepo: "https://github.com/org/app.git", GitRef: "main"})
+
+		raw, err := json.Marshal(notificationData{
 			Title: "update", Host: "box",
-			Report: &session.SingleContainerReport{
+			Report: &state.SingleContainerReport{
 				UpdatedReports: []types.ContainerReport{status},
 			},
 		})
-		gomega.Expect(err).NotTo(gomega.HaveOccurred())
-		gomega.Expect(string(raw)).To(gomega.ContainSubstring(`"gitRepo":"https://github.com/org/app.git"`))
-		gomega.Expect(string(raw)).To(gomega.ContainSubstring(`"gitRef":"main"`))
+		require.NoError(t, err)
+		assert.Contains(t, string(raw), `"gitRepo":"https://github.com/org/app.git"`)
+		assert.Contains(t, string(raw), `"gitRef":"main"`)
 	})
-})
+}

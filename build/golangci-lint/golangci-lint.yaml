@@ -106,7 +106,6 @@ linters:
     - errorlint # Errorlint is a linter for that can be used to find code that will cause problems with the error wrapping scheme introduced in Go 1.13.
     - exptostd # Detects functions from golang.org/x/exp/ that can be replaced by std functions.
     - fatcontext # Detects nested contexts in loops and function literals.
-    - ginkgolinter # Enforces standards of using ginkgo and gomega.
     - gocritic # Provides diagnostics that check for bugs, performance and style issues.
     - godot # Check if comments end in a period.
     - goheader # Checks if file header matches to pattern.
@@ -196,6 +195,7 @@ linters:
     - depguard # Checks if package imports are in a list of acceptable packages.
     - exhaustruct # Checks if all structure fields are initialized.
     - funlen # Checks for long functions.
+    - ginkgolinter # Enforces standards of using ginkgo and gomega.
     - gochecknoglobals # Check that no global variables exist.
     - gochecknoinits # Checks that no init functions are present in Go code.
     - gocognit # Computes and checks the cognitive complexity of functions.
@@ -240,7 +240,12 @@ linters:
           severity: warning
           disabled: false
           exclude:
-            - ".*internal/metrics/.*"
+            - ".*internal/observability/metrics/.*"
+    wrapcheck:
+      # Constructors that build a new error rather than return one from another call.
+      extra-ignore-sigs:
+        - ratelimit.FromResponse(
+        - ratelimit.FromErrorMessage(
     gocyclo:
       # Functions above this complexity are reported. The functions listed under
       # exclusions are already above it and are excluded until they are split up.
@@ -319,47 +324,39 @@ linters:
           - gosec
         text: "G117"
       # Functions above the gocyclo threshold today. Remove an entry when its function is split up.
-      - path: "internal/actions/update.go"
+      - path: "internal/update/update.go"
         linters:
           - gocyclo
-        text: "of func `Update` is high"
-      - path: "internal/actions/update.go"
-        linters:
-          - gocyclo
-        text: "of func `linkedIdentifierMarkedForRestart` is high"
+        text: "of func `update` is high"
       - path: "internal/git/project/checkout.go"
         linters:
           - gocyclo
         text: "of func `Checkout` is high"
-      - path: "internal/actions/update.go"
+      - path: "internal/update/restart.go"
         linters:
           - gocyclo
         text: "of func `restartStaleContainer` is high"
-      - path: "internal/actions/git_compose.go"
+      - path: "internal/update/git_compose.go"
         linters:
           - gocyclo
         text: 'of func `\(\*gitSession\)\.applyCompose` is high'
-      - path: "pkg/registry/digest/digest.go"
+      - path: "internal/registry/digest/digest.go"
         linters:
           - gocyclo
-        text: "of func `HandleManifestResponse` is high"
-      - path: "pkg/registry/age.go"
-        linters:
-          - gocyclo
-        text: "of func `fetchPlatformManifestWithRetry` is high"
-      - path: "pkg/filters/filters.go"
+        text: "of func `handleManifestResponse` is high"
+      - path: "internal/container/filters/filters.go"
         linters:
           - gocyclo
         text: "of func `BuildFilter` is high"
-      - path: "pkg/registry/digest/digest.go"
+      - path: "internal/registry/digest/digest.go"
         linters:
           - gocyclo
         text: "of func `fetchDigest` is high"
-      - path: "internal/scheduling/scheduling.go"
+      - path: "internal/update/schedule/scheduling.go"
         linters:
           - gocyclo
         text: "of func `RunUpgradesOnSchedule` is high"
-      - path: "internal/actions/cleanup.go"
+      - path: "internal/update/cleanup.go"
         linters:
           - gocyclo
         text: "of func `getChainedContainers` is high"

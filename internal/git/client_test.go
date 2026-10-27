@@ -22,9 +22,9 @@ import (
 	dockerspec "github.com/moby/docker-image-spec/specs-go/v1"
 	dockerImage "github.com/moby/moby/api/types/image"
 
-	"github.com/nicholas-fedor/watchtower/internal/compose"
-	gitPkg "github.com/nicholas-fedor/watchtower/pkg/container/git"
-	"github.com/nicholas-fedor/watchtower/pkg/container/oci"
+	composeLabels "github.com/nicholas-fedor/watchtower/internal/compose/labels"
+	"github.com/nicholas-fedor/watchtower/internal/container/labels"
+	"github.com/nicholas-fedor/watchtower/internal/container/oci"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 	mockTypes "github.com/nicholas-fedor/watchtower/pkg/types/mocks"
 )
@@ -93,14 +93,14 @@ func labeledComposeMember(t *testing.T, project, service, number, dir, files, co
 	t.Helper()
 
 	return labeledContainer(t, map[string]string{
-		gitPkg.RepoLabel:                "https://example.com/org/app.git",
-		gitPkg.RefLabel:                 "main",
-		gitPkg.LastCommitLabel:          commit,
-		gitPkg.ComposeDirLabel:          dir,
-		compose.ComposeProjectLabel:     project,
-		compose.ComposeServiceLabel:     service,
-		compose.ComposeContainerNumber:  number,
-		compose.ComposeConfigFilesLabel: files,
+		labels.GitRepo:                        "https://example.com/org/app.git",
+		labels.GitRef:                         "main",
+		labels.GitLastCommit:                  commit,
+		labels.ComposeDir:                     dir,
+		composeLabels.ComposeProjectLabel:     project,
+		composeLabels.ComposeServiceLabel:     service,
+		composeLabels.ComposeContainerNumber:  number,
+		composeLabels.ComposeConfigFilesLabel: files,
 	})
 }
 
@@ -158,7 +158,7 @@ func TestCheck_RejectsUnsafeRef(t *testing.T) {
 		Repo: "https://example.com/org/app.git",
 		Ref:  "foo..bar",
 	})
-	require.ErrorIs(t, err, ErrInvalidRef)
+	require.ErrorIs(t, err, errInvalidRef)
 }
 
 func TestCheck_BranchSHACompare(t *testing.T) {
@@ -256,7 +256,7 @@ func TestCheck_MissingRef(t *testing.T) {
 		Repo: "https://example.com/org/app.git",
 		Ref:  "missing",
 	})
-	require.ErrorIs(t, err, ErrRefNotFound)
+	require.ErrorIs(t, err, errRefNotFound)
 }
 
 func TestCheck_TagPolicyIgnoresNonSemver(t *testing.T) {
@@ -610,7 +610,7 @@ func TestClone(t *testing.T) {
 		var client *Client
 
 		_, err := client.Clone(t.Context(), "https://example.com/org/app.git", CheckResult{})
-		require.ErrorIs(t, err, ErrCloneFailed)
+		require.ErrorIs(t, err, errCloneFailed)
 		assert.ErrorContains(t, err, "client is nil")
 	})
 
@@ -639,7 +639,7 @@ func TestClone(t *testing.T) {
 			Kind:   kindBranch,
 			Ref:    "main",
 		})
-		require.ErrorIs(t, err, ErrCloneFailed)
+		require.ErrorIs(t, err, errCloneFailed)
 	})
 }
 
@@ -807,9 +807,9 @@ func TestCheckContainer(t *testing.T) {
 		t.Parallel()
 
 		c := labeledContainer(t, map[string]string{
-			gitPkg.RepoLabel:       "https://example.com/org/app.git",
-			gitPkg.RefLabel:        "main",
-			gitPkg.LastCommitLabel: "old",
+			labels.GitRepo:       "https://example.com/org/app.git",
+			labels.GitRef:        "main",
+			labels.GitLastCommit: "old",
 		})
 
 		client := testClient(t, []RemoteRef{{Name: "refs/heads/main", Hash: "newsha"}})
@@ -823,8 +823,8 @@ func TestCheckContainer(t *testing.T) {
 		t.Parallel()
 
 		c := labeledContainer(t, map[string]string{
-			gitPkg.RepoLabel:         "https://example.com/org/app.git",
-			gitPkg.SemverPolicyLabel: "nightly",
+			labels.GitRepo:         "https://example.com/org/app.git",
+			labels.GitSemverPolicy: "nightly",
 		})
 
 		got, err := CheckContainer(t.Context(), testClient(t, nil), c, types.UpdateParams{})
@@ -837,8 +837,8 @@ func TestCheckContainer(t *testing.T) {
 
 		rawHost := "https://user:secret@git.example.com?token=secret=bad"
 		c := labeledContainer(t, map[string]string{
-			gitPkg.RepoLabel: "https://example.com/org/app.git",
-			gitPkg.HostLabel: rawHost,
+			labels.GitRepo: "https://example.com/org/app.git",
+			labels.GitHost: rawHost,
 		})
 
 		got, err := CheckContainer(t.Context(), testClient(t, nil), c, types.UpdateParams{})
@@ -852,8 +852,8 @@ func TestCheckContainer(t *testing.T) {
 		t.Parallel()
 
 		c := labeledContainer(t, map[string]string{
-			gitPkg.RepoLabel: "https://example.com/org/app.git",
-			gitPkg.RefLabel:  "main",
+			labels.GitRepo: "https://example.com/org/app.git",
+			labels.GitRef:  "main",
 		})
 
 		lister := &mutableLister{refs: []RemoteRef{{Name: "refs/heads/main", Hash: "aaa111"}}}
@@ -880,8 +880,8 @@ func TestCheckContainer(t *testing.T) {
 		t.Parallel()
 
 		c := labeledImageContainer(t, map[string]string{
-			gitPkg.RepoLabel: "https://example.com/org/app.git",
-			gitPkg.RefLabel:  "main",
+			labels.GitRepo: "https://example.com/org/app.git",
+			labels.GitRef:  "main",
 		}, "app:latest", ociImage("aaa111", ""))
 
 		client := testClient(t, []RemoteRef{{Name: "refs/heads/main", Hash: "aaa111"}})
@@ -900,8 +900,8 @@ func TestCheckContainer(t *testing.T) {
 		t.Parallel()
 
 		c := labeledImageContainer(t, map[string]string{
-			gitPkg.RepoLabel: "https://example.com/org/app.git",
-			gitPkg.RefLabel:  "main",
+			labels.GitRepo: "https://example.com/org/app.git",
+			labels.GitRef:  "main",
 		}, "app:git-aaa111bbbbcc", nil)
 
 		client := testClient(t, []RemoteRef{{Name: "refs/heads/main", Hash: "aaa111bbbbccdddd"}})
@@ -1160,7 +1160,7 @@ func TestClassifyHostsDetectsProviders(t *testing.T) {
 		got := client.ClassifyHosts(t.Context(), []url.URL{origin})
 		assert.Equal(t, types.GitHostGitLab, got["git.example.com"])
 		assert.Equal(t, "https://git.example.com/gitlab/api/v4/projects/group%2Fapp/repository/commits/main",
-			joinEscaped(client.gitlabAPI("git.example.com"), "projects", "group/app", "repository", "commits", "main").String())
+			joinEscaped(client.gitlabAPIAt(url.URL{}, "git.example.com"), "projects", "group/app", "repository", "commits", "main").String())
 	})
 
 	t.Run("unauthorized without fingerprint", func(t *testing.T) {
@@ -1213,8 +1213,8 @@ func TestGitHubAPIURL(t *testing.T) {
 	nop := zerolog.Nop()
 	client := New(&nop, Options{})
 
-	assert.Equal(t, "https://api.github.com/repos/org/app", client.githubAPI("github.com", "repos", "org", "app").String())
-	assert.Equal(t, "https://github.company.com/api/v3/repos/org/app", client.githubAPI("github.company.com", "repos", "org", "app").String())
+	assert.Equal(t, "https://api.github.com/repos/org/app", client.githubAPIAt(url.URL{}, "github.com", "repos", "org", "app").String())
+	assert.Equal(t, "https://github.company.com/api/v3/repos/org/app", client.githubAPIAt(url.URL{}, "github.company.com", "repos", "org", "app").String())
 }
 
 func httpsOrigin(host string) url.URL {

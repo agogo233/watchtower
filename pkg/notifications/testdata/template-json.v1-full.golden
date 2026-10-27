@@ -400,6 +400,38 @@
     },
     {
       "data": {
+        "error": "failed to detect current container ID: no container ID in cgroup file"
+      },
+      "level": "error",
+      "message": "Could not identify Watchtower's own container. Self-updates are disabled and old instances will not be removed",
+      "time": "2026-10-07T12:00:42Z"
+    },
+    {
+      "data": {
+        "error": "failed to inspect container: context deadline exceeded"
+      },
+      "level": "debug",
+      "message": "Could not inspect Watchtower's own container. Self-updates are disabled",
+      "time": "2026-10-07T12:00:43Z"
+    },
+    {
+      "data": {
+        "error": "failed to inspect container: context deadline exceeded"
+      },
+      "level": "info",
+      "message": "Could not inspect Watchtower's own container to read its scope label. Exiting rather than running without a scope",
+      "time": "2026-10-07T12:00:44Z"
+    },
+    {
+      "data": {
+        "error": "failed to set restart policy: context deadline exceeded"
+      },
+      "level": "warning",
+      "message": "Could not disable Watchtower's restart policy. The runtime may start it again",
+      "time": "2026-10-07T12:00:45Z"
+    },
+    {
+      "data": {
         "alpha": "one",
         "beta": 2
       },

@@ -8,21 +8,19 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
-	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
 
-	notifyConfig "github.com/nicholas-fedor/watchtower/internal/config/notify"
-	"github.com/nicholas-fedor/watchtower/internal/logging"
+	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
+	notifyConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/notify"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
-// ColorHex is the default notification color used for services that support it
+// colorHex is the default notification color used for services that support it
 // (formatted as a CSS hex string).
-const ColorHex = "#406170"
+const colorHex = "#406170"
 
-// ColorInt is the default notification color used for services that support it
+// colorInt is the default notification color used for services that support it
 // (as an int value).
-const ColorInt = 0x406170
+const colorInt = 0x406170
 
 // errUnknownNotificationType indicates an unsupported legacy notification type name.
 var errUnknownNotificationType = errors.New("unknown notification type")
@@ -34,7 +32,7 @@ var errUnknownNotificationType = errors.New("unknown notification type")
 //
 // Parameters:
 //   - log: Process logger for configuration-time diagnostics (required and non-nil).
-//   - cfg: Notification settings from config.Load (Config.Notify).
+//   - cfg: Notification settings from settings.Load (Config.Notify).
 //
 // Returns:
 //   - types.Notifier: Configured notifier instance.
@@ -77,7 +75,7 @@ func NewNotifier(log *zerolog.Logger, cfg notifyConfig.Notify) types.Notifier {
 	// Start from configured Shoutrrr URLs, then append any legacy type URLs.
 	urls := append([]string(nil), cfg.URLs...)
 	urls, legacyDelay := appendLegacyURLs(log, urls, cfg.LegacyTypes, cfg.Legacy)
-	delay := GetDelay(log, cfg.DelaySeconds, legacyDelay)
+	delay := getDelay(log, cfg.DelaySeconds, legacyDelay)
 
 	// Use report template when enabled, otherwise use legacy template.
 	legacyTemplate := !cfg.Report
@@ -117,21 +115,6 @@ func NewNotifier(log *zerolog.Logger, cfg notifyConfig.Notify) types.Notifier {
 	)
 }
 
-// NewNotifierFromFlags creates a notification client from Cobra flags.
-//
-// Prefer config.Load plus NewNotifier in production. This entry point is for
-// tests that configure notifications via flags only.
-//
-// Parameters:
-//   - log: Process logger for configuration-time diagnostics.
-//   - c: Cobra command with flags.
-//
-// Returns:
-//   - types.Notifier: Configured notification client.
-func NewNotifierFromFlags(log *zerolog.Logger, c *cobra.Command) types.Notifier {
-	return NewNotifier(log, notifyFromFlags(c))
-}
-
 // BuildURLs builds Shoutrrr notification URLs from resolved notification settings
 // without initializing a notifier.
 //
@@ -140,7 +123,7 @@ func NewNotifierFromFlags(log *zerolog.Logger, c *cobra.Command) types.Notifier 
 //
 // Parameters:
 //   - log: Logger for legacy notifier construction diagnostics.
-//   - cfg: Notification settings from config.Load (Config.Notify).
+//   - cfg: Notification settings from settings.Load (Config.Notify).
 //
 // Returns:
 //   - []string: Shoutrrr URLs ready for output or notification use.
@@ -181,97 +164,6 @@ func BuildURLs(log *zerolog.Logger, cfg notifyConfig.Notify) ([]string, error) {
 	return urls, nil
 }
 
-// notifyFromFlags reads notification-related flags into confignotify.Notify.
-//
-// This is a test and deprecated-path helper. Production code must use config.Load
-// and pass Config.Notify to NewNotifier instead of scraping Cobra flags here.
-//
-// Parameters:
-//   - c: Cobra command with flags.
-//
-// Returns:
-//   - confignotify.Notify: Values for NewNotifier.
-func notifyFromFlags(c *cobra.Command) notifyConfig.Notify {
-	flag := c.Flags()
-	persistent := c.PersistentFlags()
-
-	urls, _ := flag.GetStringArray("notification-url")
-	legacyTypes, _ := flag.GetStringSlice("notifications")
-	level, _ := flag.GetString("notifications-level")
-	template, _ := flag.GetString("notification-template")
-	templateFile, _ := flag.GetString("notification-template-file")
-	report, _ := flag.GetBool("notification-report")
-	skipTitle, _ := flag.GetBool("notification-skip-title")
-	logStdout, _ := flag.GetBool("notification-log-stdout")
-	delaySec, _ := persistent.GetInt("notifications-delay")
-	hostname, _ := persistent.GetString("notifications-hostname")
-	titleTag, _ := flag.GetString("notification-title-tag")
-	emailSubjectTag, _ := flag.GetString("notification-email-subjecttag")
-
-	return notifyConfig.Notify{
-		URLs:            urls,
-		LegacyTypes:     legacyTypes,
-		Level:           level,
-		Template:        template,
-		TemplateFile:    templateFile,
-		Report:          report,
-		LogStdout:       logStdout,
-		SkipTitle:       skipTitle,
-		DelaySeconds:    delaySec,
-		Hostname:        hostname,
-		TitleTag:        titleTag,
-		EmailSubjectTag: emailSubjectTag,
-		Legacy:          legacyFromFlags(flag),
-	}
-}
-
-// legacyFromFlags reads deprecated per-service notification flags into Legacy.
-//
-// Parameters:
-//   - flag: Flag set containing legacy notification options.
-//
-// Returns:
-//   - notifyConfig.Legacy: Email, Slack, MS Teams, and Gotify legacy settings.
-func legacyFromFlags(flag *pflag.FlagSet) notifyConfig.Legacy {
-	emailFrom, _ := flag.GetString("notification-email-from")
-	emailTo, _ := flag.GetString("notification-email-to")
-	emailServer, _ := flag.GetString("notification-email-server")
-	emailUser, _ := flag.GetString("notification-email-server-user")
-	emailPassword, _ := flag.GetString("notification-email-server-password")
-	emailPort, _ := flag.GetInt("notification-email-server-port")
-	emailTLSSkip, _ := flag.GetBool("notification-email-server-tls-skip-verify")
-	emailDelay, _ := flag.GetInt("notification-email-delay")
-	slackHook, _ := flag.GetString("notification-slack-hook-url")
-	slackID, _ := flag.GetString("notification-slack-identifier")
-	slackChannel, _ := flag.GetString("notification-slack-channel")
-	slackEmoji, _ := flag.GetString("notification-slack-icon-emoji")
-	slackIcon, _ := flag.GetString("notification-slack-icon-url")
-	msTeamsHook, _ := flag.GetString("notification-msteams-hook")
-	gotifyURL, _ := flag.GetString("notification-gotify-url")
-	gotifyToken, _ := flag.GetString("notification-gotify-token")
-	gotifyTLSSkip, _ := flag.GetBool("notification-gotify-tls-skip-verify")
-
-	return notifyConfig.Legacy{
-		EmailFrom:           emailFrom,
-		EmailTo:             emailTo,
-		EmailServer:         emailServer,
-		EmailUser:           emailUser,
-		EmailPassword:       emailPassword,
-		EmailPort:           emailPort,
-		EmailTLSSkipVerify:  emailTLSSkip,
-		EmailDelay:          emailDelay,
-		SlackHookURL:        slackHook,
-		SlackIdentifier:     slackID,
-		SlackChannel:        slackChannel,
-		SlackIconEmoji:      slackEmoji,
-		SlackIconURL:        slackIcon,
-		MSTeamsHook:         msTeamsHook,
-		GotifyURL:           gotifyURL,
-		GotifyToken:         gotifyToken,
-		GotifyTLSSkipVerify: gotifyTLSSkip,
-	}
-}
-
 // templateData builds static notification title/host data from resolved values.
 //
 // Parameters:
@@ -306,7 +198,7 @@ func templateData(log *zerolog.Logger, hostname, titleTag, emailSubjectTag strin
 			}
 		}
 
-		title = GetTitle(log, hostname, tag)
+		title = getTitle(log, hostname, tag)
 	}
 
 	clog.Debug().
@@ -418,32 +310,7 @@ func appendLegacyURLs(
 	return urls, legacyDelay
 }
 
-// AppendLegacyUrls adds shoutrrr URLs from legacy notification flags.
-//
-// Parameters:
-//   - log: Logger for diagnostics.
-//   - urls: Initial URL list.
-//   - cmd: Cobra command with flags.
-//
-// Returns:
-//   - []string: Updated URL list.
-//   - time.Duration: Notification delay (legacy delay notifier or --notifications-delay).
-//
-// Deprecated: Legacy notification types are deprecated.
-// Use --notification-url instead. Prefer NewNotifier with Config.Notify from config.Load.
-//
-// TODO: Remove AppendLegacyUrls for the v2 release.
-//
-//nolint:godox
-func AppendLegacyUrls(log *zerolog.Logger, urls []string, cmd *cobra.Command) ([]string, time.Duration) {
-	cfg := notifyFromFlags(cmd)
-
-	urls, legacyDelay := appendLegacyURLs(log, urls, cfg.LegacyTypes, cfg.Legacy)
-
-	return urls, GetDelay(log, cfg.DelaySeconds, legacyDelay)
-}
-
-// GetDelay selects the notification delay from a legacy value or configured seconds.
+// getDelay selects the notification delay from a legacy value or configured seconds.
 //
 // Parameters:
 //   - log: Logger for diagnostics.
@@ -453,12 +320,12 @@ func AppendLegacyUrls(log *zerolog.Logger, urls []string, cmd *cobra.Command) ([
 // Returns:
 //   - time.Duration: Selected delay (legacy delay if set, otherwise delaySeconds, otherwise zero).
 //
-// Deprecated: Prefer NewNotifier with Config.Notify from config.Load.
+// Deprecated: Prefer NewNotifier with Config.Notify from settings.Load.
 //
-// TODO: Simplify GetDelay to only use configured delay seconds when legacy types are removed.
+// TODO: Simplify getDelay to only use configured delay seconds when legacy types are removed.
 //
 //nolint:godox
-func GetDelay(log *zerolog.Logger, delaySeconds int, legacyDelay time.Duration) time.Duration {
+func getDelay(log *zerolog.Logger, delaySeconds int, legacyDelay time.Duration) time.Duration {
 	clog := log.With().Dur("legacy_delay", legacyDelay).Logger()
 	clog.Debug().Msg("Determining notification delay")
 
@@ -484,7 +351,7 @@ func GetDelay(log *zerolog.Logger, delaySeconds int, legacyDelay time.Duration) 
 	return 0
 }
 
-// GetTitle formats the notification title with hostname and tag.
+// getTitle formats the notification title with hostname and tag.
 //
 // Parameters:
 //   - log: Logger for diagnostics.
@@ -493,7 +360,7 @@ func GetDelay(log *zerolog.Logger, delaySeconds int, legacyDelay time.Duration) 
 //
 // Returns:
 //   - string: Formatted title.
-func GetTitle(log *zerolog.Logger, hostname, tag string) string {
+func getTitle(log *zerolog.Logger, hostname, tag string) string {
 	clog := log.With().
 		Str("hostname", hostname).
 		Str("tag", tag).
@@ -522,25 +389,6 @@ func GetTitle(log *zerolog.Logger, hostname, tag string) string {
 		Msg("Generated notification title")
 
 	return title
-}
-
-// GetTemplateData populates static notification data from Cobra flags.
-//
-// Prefer config.Load plus NewNotifier in production. This helper remains for tests
-// and deprecated call paths that still configure notifications via flags.
-//
-// Parameters:
-//   - log: Logger for diagnostics.
-//   - c: Cobra command with flags.
-//
-// Returns:
-//   - StaticData: Populated data (hostname from flag or system, title unless skip-title).
-//
-// Deprecated: Prefer NewNotifier with Config.Notify from config.Load.
-func GetTemplateData(log *zerolog.Logger, c *cobra.Command) StaticData {
-	cfg := notifyFromFlags(c)
-
-	return templateData(log, cfg.Hostname, cfg.TitleTag, cfg.EmailSubjectTag, cfg.SkipTitle)
 }
 
 // LogLegacyDeprecationWarnings logs deprecation warnings for legacy notification types.

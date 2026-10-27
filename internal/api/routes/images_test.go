@@ -7,8 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 
-	"github.com/nicholas-fedor/watchtower/internal/api/config"
-	mockContainer "github.com/nicholas-fedor/watchtower/pkg/container/mocks"
+	mockContainerClient "github.com/nicholas-fedor/watchtower/internal/container/client/mocks"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
@@ -16,10 +15,10 @@ func TestRegisterImagesRoute(t *testing.T) {
 	t.Run("with client registers route", func(t *testing.T) {
 		app := testApp()
 		auth := testAuthMiddleware()
-		mockClient := mockContainer.NewMockClient(t)
+		mockClient := mockContainerClient.NewMockClient(t)
 		mockClient.EXPECT().ListContainers(mock.Anything).Return([]types.Container{}, nil).Maybe()
 
-		opts := config.Options{
+		opts := Options{
 			EnableImagesAPI: true,
 			Client:          mockClient,
 			Filter:          func(_ types.FilterableContainer) bool { return true },
@@ -45,7 +44,7 @@ func TestRegisterImagesRoute(t *testing.T) {
 		app := testApp()
 		auth := testAuthMiddleware()
 
-		opts := config.Options{
+		opts := Options{
 			EnableImagesAPI: true,
 			Client:          nil,
 			Filter:          func(_ types.FilterableContainer) bool { return true },

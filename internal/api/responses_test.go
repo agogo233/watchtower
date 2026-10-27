@@ -1,4 +1,4 @@
-package api_test
+package api
 
 import (
 	"bufio"
@@ -26,14 +26,15 @@ import (
 	dockerContainer "github.com/moby/moby/api/types/container"
 	dockerImage "github.com/moby/moby/api/types/image"
 
-	"github.com/nicholas-fedor/watchtower/internal/api"
-	"github.com/nicholas-fedor/watchtower/internal/api/config"
-	"github.com/nicholas-fedor/watchtower/internal/api/handlers/events"
+	"github.com/nicholas-fedor/watchtower/internal/api/auth"
 	"github.com/nicholas-fedor/watchtower/internal/api/routes"
-	"github.com/nicholas-fedor/watchtower/internal/metrics"
+	"github.com/nicholas-fedor/watchtower/internal/container"
+	containerClient "github.com/nicholas-fedor/watchtower/internal/container/client"
+	mockContainerClient "github.com/nicholas-fedor/watchtower/internal/container/client/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/observability/events"
+	"github.com/nicholas-fedor/watchtower/internal/observability/metrics"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/golden"
-	"github.com/nicholas-fedor/watchtower/pkg/container"
-	mockContainer "github.com/nicholas-fedor/watchtower/pkg/container/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/update/schedule"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
@@ -144,12 +145,12 @@ func fixtureContainers() []types.Container {
 
 // newFixtureClient returns a Docker client that lists the fixture containers and
 // reports a newer image for the web containers and a registry error for cache.
-func newFixtureClient(t *testing.T) *mockContainer.MockClient {
+func newFixtureClient(t *testing.T) *mockContainerClient.MockClient {
 	t.Helper()
 
 	list := fixtureContainers()
 
-	client := mockContainer.NewMockClient(t)
+	client := mockContainerClient.NewMockClient(t)
 	client.EXPECT().Ping(mock.Anything).Return(nil).Maybe()
 	client.EXPECT().ListContainers(mock.Anything, mock.Anything).Return(list, nil).Maybe()
 	client.EXPECT().ListContainers(mock.Anything).Return(list, nil).Maybe()
@@ -169,10 +170,10 @@ func newFixtureClient(t *testing.T) *mockContainer.MockClient {
 }
 
 // newFailingClient returns a Docker client whose daemon is unreachable.
-func newFailingClient(t *testing.T) *mockContainer.MockClient {
+func newFailingClient(t *testing.T) *mockContainerClient.MockClient {
 	t.Helper()
 
-	client := mockContainer.NewMockClient(t)
+	client := mockContainerClient.NewMockClient(t)
 	client.EXPECT().Ping(mock.Anything).Return(errFixtureDocker).Maybe()
 	client.EXPECT().ListContainers(mock.Anything, mock.Anything).Return(nil, errFixtureDocker).Maybe()
 	client.EXPECT().ListContainers(mock.Anything).Return(nil, errFixtureDocker).Maybe()
@@ -194,8 +195,10 @@ func newFixtureMetrics(t *testing.T) *metrics.Metrics {
 
 // fixtureOptions returns API options with every endpoint enabled, backed by the
 // given Docker client and metrics store. Each update reports the same scan.
-func fixtureOptions(client container.Client, store *metrics.Metrics) config.Options {
-	return withTestLogger(config.Options{
+func fixtureOptions(t *testing.T, client containerClient.Client, store *metrics.Metrics) routes.Options {
+	t.Helper()
+
+	return withTestLogger(t, routes.Options{
 		Token:               fixtureAPIToken,
 		EventsToken:         fixtureEventsToken,
 		RateLimit:           1000,
@@ -214,7 +217,7 @@ func fixtureOptions(client container.Client, store *metrics.Metrics) config.Opti
 		Filter:              func(types.FilterableContainer) bool { return true },
 		FilterDesc:          "Checking all containers (except explicitly disabled with label)",
 		IncludeStopped:      true,
-		UpdateLock:          newUpdateLock(),
+		UpdateLock:          schedule.NewUpdateLock(),
 		BaseParams: types.UpdateParams{
 			Cleanup:        true,
 			LifecycleHooks: true,
@@ -228,22 +231,14 @@ func fixtureOptions(client container.Client, store *metrics.Metrics) config.Opti
 	})
 }
 
-// newUpdateLock returns an update lock holding its token, so an update can start.
-func newUpdateLock() chan bool {
-	lock := make(chan bool, 1)
-	lock <- true
-
-	return lock
-}
-
 // newFixtureApp builds the HTTP API from opts the same way SetupAndStartAPI
 // does, without starting a listener.
-func newFixtureApp(t *testing.T, opts config.Options) *fiber.App {
+func newFixtureApp(t *testing.T, opts routes.Options) *fiber.App {
 	t.Helper()
 
-	app := api.New(opts.Logger, opts.RateLimit, api.ProxyConfig{}, api.CORSConfig{}, opts.NoStartupMessage)
+	app := newApp(opts.Logger, opts.RateLimit, proxyConfig{}, corsConfig{}, opts.NoStartupMessage)
 
-	err := routes.ValidateAndRegister(t.Context(), app, api.NewAPIAuthMiddleware(opts.Logger, opts.Token), opts)
+	err := routes.ValidateAndRegister(t.Context(), app, auth.NewAPIMiddleware(opts.Logger, opts.Token), opts)
 	require.NoError(t, err)
 
 	return app
@@ -417,7 +412,7 @@ func (r *responseRecorder) recordOne(t *testing.T, req responseRequest) {
 // an update. Requests run in order because later ones observe earlier updates.
 func TestHTTPAPIResponses(t *testing.T) {
 	store := newFixtureMetrics(t)
-	opts := fixtureOptions(newFixtureClient(t), store)
+	opts := fixtureOptions(t, newFixtureClient(t), store)
 	recorder := newResponseRecorder(t, newFixtureApp(t, opts), responseRequest{method: http.MethodGet, target: "/livez"})
 
 	recorder.record(t,
@@ -449,12 +444,20 @@ func TestHTTPAPIResponses(t *testing.T) {
 	)
 
 	// The asynchronous update returns its lock when it finishes.
-	require.Eventually(t, func() bool { return len(opts.UpdateLock) == 1 }, probeTimeout, 10*time.Millisecond)
+	require.Eventually(t, func() bool {
+		if !opts.UpdateLock.TryLock() {
+			return false
+		}
+
+		opts.UpdateLock.Unlock()
+
+		return true
+	}, probeTimeout, 10*time.Millisecond)
 
 	// A scan that ends in an error is reported as failed, with the counts it
 	// reached, by the update, the status, and the history.
 	failedStore := newFixtureMetrics(t)
-	failedOpts := fixtureOptions(newFixtureClient(t), failedStore)
+	failedOpts := fixtureOptions(t, newFixtureClient(t), failedStore)
 	failedOpts.RunUpdatesWithNotifications = func(context.Context, types.Filter, types.UpdateParams) *metrics.Metric {
 		return &metrics.Metric{Scanned: 5, Updated: 1, Failed: 0, Restarted: 0, Skipped: 0, ScanFailed: true}
 	}
@@ -476,7 +479,7 @@ func TestHTTPAPIResponses(t *testing.T) {
 // TestHTTPAPIErrorResponses snapshots the responses for rejected requests,
 // invalid parameters, a busy update lock, and an unreachable Docker daemon.
 func TestHTTPAPIErrorResponses(t *testing.T) {
-	app := newFixtureApp(t, fixtureOptions(newFixtureClient(t), newFixtureMetrics(t)))
+	app := newFixtureApp(t, fixtureOptions(t, newFixtureClient(t), newFixtureMetrics(t)))
 	recorder := newResponseRecorder(t, app, responseRequest{method: http.MethodGet, target: "/livez"})
 
 	recorder.record(t,
@@ -495,13 +498,14 @@ func TestHTTPAPIErrorResponses(t *testing.T) {
 		responseRequest{method: http.MethodGet, target: "/v1/unknown", token: fixtureAPIToken},
 	)
 
-	busyOpts := fixtureOptions(newFixtureClient(t), newFixtureMetrics(t))
-	busyOpts.UpdateLock = make(chan bool, 1)
+	busyOpts := fixtureOptions(t, newFixtureClient(t), newFixtureMetrics(t))
+	busyOpts.UpdateLock = schedule.NewUpdateLock()
+	require.True(t, busyOpts.UpdateLock.TryLock())
 
 	recorder.app = newFixtureApp(t, busyOpts)
 	recorder.record(t, responseRequest{method: http.MethodPost, target: "/v1/update", token: fixtureAPIToken})
 
-	failingOpts := fixtureOptions(newFailingClient(t), newFixtureMetrics(t))
+	failingOpts := fixtureOptions(t, newFailingClient(t), newFixtureMetrics(t))
 	failingOpts.RunUpdatesWithNotifications = func(context.Context, types.Filter, types.UpdateParams) *metrics.Metric {
 		return nil
 	}
@@ -523,7 +527,7 @@ func TestHTTPAPIErrorResponses(t *testing.T) {
 // metrics endpoint exposes for Watchtower. Values depend on earlier scans in
 // the process, so only the HELP and TYPE lines are recorded.
 func TestHTTPAPIMetricsResponse(t *testing.T) {
-	app := newFixtureApp(t, fixtureOptions(newFixtureClient(t), newFixtureMetrics(t)))
+	app := newFixtureApp(t, fixtureOptions(t, newFixtureClient(t), newFixtureMetrics(t)))
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/metrics", nil)
 	req.Header.Set(fiber.HeaderAuthorization, "Bearer "+fixtureAPIToken)
@@ -589,7 +593,7 @@ func readSSEEvents(t *testing.T, stream *bufio.Reader, count int) string {
 // session publishes. The stream is served on a local listener because it
 // stays open until the client disconnects.
 func TestHTTPAPIEventStream(t *testing.T) {
-	opts := fixtureOptions(newFixtureClient(t), newFixtureMetrics(t))
+	opts := fixtureOptions(t, newFixtureClient(t), newFixtureMetrics(t))
 	app := newFixtureApp(t, opts)
 
 	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")

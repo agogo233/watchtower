@@ -4,25 +4,33 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
+	"net/netip"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
 	dockerContainer "github.com/moby/moby/api/types/container"
 	dockerImage "github.com/moby/moby/api/types/image"
+	dockerNetwork "github.com/moby/moby/api/types/network"
 
-	appConfig "github.com/nicholas-fedor/watchtower/internal/config"
-	notifyConfig "github.com/nicholas-fedor/watchtower/internal/config/notify"
-	"github.com/nicholas-fedor/watchtower/internal/logging"
-	"github.com/nicholas-fedor/watchtower/pkg/container"
-	mockContainer "github.com/nicholas-fedor/watchtower/pkg/container/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/container"
+	containerClient "github.com/nicholas-fedor/watchtower/internal/container/client"
+	mockContainerClient "github.com/nicholas-fedor/watchtower/internal/container/client/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
+	"github.com/nicholas-fedor/watchtower/internal/registry/ratelimit"
+	"github.com/nicholas-fedor/watchtower/internal/settings"
+	notifyConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/notify"
 	"github.com/nicholas-fedor/watchtower/pkg/notifications"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
@@ -49,7 +57,7 @@ var withFilter = mock.MatchedBy(func([]types.Filter) bool { return true })
 // runTestState is the process state run and runMain read from package
 // variables, set by setRunState.
 type runTestState struct {
-	client    container.Client
+	client    containerClient.Client
 	current   types.Container
 	currentID types.ContainerID
 }
@@ -62,6 +70,7 @@ func setRunState(t *testing.T, state runTestState) {
 
 	savedCfg := appCfg
 	savedClient := client
+	savedRateLimiter := rateLimiter
 	savedNotifier := notifier
 	savedCurrent := currentWatchtowerContainer
 	savedCurrentID := currentWatchtowerContainerID
@@ -73,6 +82,7 @@ func setRunState(t *testing.T, state runTestState) {
 	t.Cleanup(func() {
 		appCfg = savedCfg
 		client = savedClient
+		rateLimiter = savedRateLimiter
 		notifier = savedNotifier
 		currentWatchtowerContainer = savedCurrent
 		currentWatchtowerContainerID = savedCurrentID
@@ -82,19 +92,21 @@ func setRunState(t *testing.T, state runTestState) {
 		createSignalContext = savedSignalContext
 	})
 
-	appCfg = appConfig.Config{}
+	appCfg = settings.Config{}
 	client = state.client
+	rateLimiter = ratelimit.New()
 	currentWatchtowerContainer = state.current
 	currentWatchtowerContainerID = state.currentID
 	currentWatchtowerContainerUnknown = false
 	sleepFunc = func(time.Duration) {}
 
-	notifier = notifications.NewNotifier(logging.NopLogger(), notifyConfig.Notify{Level: "info"})
+	notifier = notifications.NewNotifier(new(zerolog.Nop()), notifyConfig.Notify{Level: "info"})
 	t.Cleanup(notifier.Close)
 }
 
 // runFixtureContainer returns a running container with the given ID, name,
-// creation time, and labels.
+// creation time, and labels. Its restart policy is "unless-stopped", so
+// disabling its restarts sends a policy update.
 func runFixtureContainer(id, name, created string, labels map[string]string) types.Container {
 	return container.NewContainer(nil,
 		&dockerContainer.InspectResponse{
@@ -107,7 +119,9 @@ func runFixtureContainer(id, name, created string, labels map[string]string) typ
 				Image:  "nickfedor/watchtower:latest",
 				Labels: labels,
 			},
-			HostConfig: &dockerContainer.HostConfig{},
+			HostConfig: &dockerContainer.HostConfig{
+				RestartPolicy: dockerContainer.RestartPolicy{Name: dockerContainer.RestartPolicyUnlessStopped},
+			},
 		},
 		&dockerImage.InspectResponse{ID: "sha256:" + id},
 	)
@@ -119,9 +133,36 @@ func currentWatchtower() types.Container {
 		map[string]string{watchtowerLabelKey: "true"})
 }
 
+// currentWatchtowerWithPorts returns the Watchtower container the tests run
+// as, publishing its port 8080 on the host.
+func currentWatchtowerWithPorts() types.Container {
+	port := dockerNetwork.MustParsePort("8080/tcp")
+
+	return container.NewContainer(nil,
+		&dockerContainer.InspectResponse{
+			ID:      "c0c0",
+			Name:    "/watchtower",
+			Image:   "sha256:c0c0",
+			Created: "2026-10-08T12:00:00Z",
+			State:   &dockerContainer.State{Running: true},
+			Config: &dockerContainer.Config{
+				Image:  "nickfedor/watchtower:latest",
+				Labels: map[string]string{watchtowerLabelKey: "true"},
+			},
+			HostConfig: &dockerContainer.HostConfig{
+				RestartPolicy: dockerContainer.RestartPolicy{Name: dockerContainer.RestartPolicyUnlessStopped},
+				PortBindings: dockerNetwork.PortMap{
+					port: {{HostIP: netip.MustParseAddr("0.0.0.0"), HostPort: port.Port()}},
+				},
+			},
+		},
+		&dockerImage.InspectResponse{ID: "sha256:c0c0"},
+	)
+}
+
 // runCalls returns the Docker client calls in the order they were made, each
 // with the container, image, or listing it targeted.
-func runCalls(client *mockContainer.MockClient) []string {
+func runCalls(client *mockContainerClient.MockClient) []string {
 	calls := make([]string, 0, len(client.Calls))
 
 	for _, call := range client.Calls {
@@ -151,8 +192,18 @@ func runCalls(client *mockContainer.MockClient) []string {
 	return calls
 }
 
-// containerLabel names a container argument, or "none" when it is nil.
+// containerLabel names a container argument by its name, or a container ID
+// argument by its short ID. It returns "none" for a nil container or an empty
+// ID.
 func containerLabel(arg any) string {
+	if id, ok := arg.(types.ContainerID); ok {
+		if id == "" {
+			return "none"
+		}
+
+		return id.ShortID()
+	}
+
 	c, ok := arg.(types.Container)
 	if !ok || c == nil {
 		return "none"
@@ -205,7 +256,7 @@ func runUntilCanceled(t *testing.T, args ...string) {
 
 // newRunProcess returns a process that logs nothing.
 func newRunProcess() *process {
-	return &process{log: logging.NopLogger()}
+	return &process{log: new(zerolog.Nop())}
 }
 
 // TestRun_RunOnce records the Docker calls of a run-once update with no
@@ -224,16 +275,16 @@ func TestRun_RunOnce(t *testing.T) {
 		{
 			name:    "in a container",
 			current: currentWatchtower(),
-			want:    []string{"GetVersion", "ListContainers filtered", "SetRestartPolicy watchtower no"},
+			want:    []string{"GetVersion", "ListContainers filtered", "SetRestartPolicy c0c0 no"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mockClient := mockContainer.NewMockClient(t)
+			mockClient := mockContainerClient.NewMockClient(t)
 			mockClient.EXPECT().GetVersion().Return("1.47")
 			mockClient.EXPECT().ListContainers(mock.Anything, withFilter).Return(nil, nil)
-			mockClient.EXPECT().SetRestartPolicy(mock.Anything, mock.Anything, mock.Anything)
+			mockClient.EXPECT().SetRestartPolicy(mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
 			state := runTestState{client: mockClient, current: tt.current}
 			if tt.current != nil {
@@ -272,12 +323,12 @@ func TestRun_Continuous(t *testing.T) {
 		// uncached runs without a current container, as outside a container or
 		// after a failed lookup.
 		uncached bool
-		setup    func(client *mockContainer.MockClient, current types.Container)
+		setup    func(client *mockContainerClient.MockClient, current types.Container)
 		want     []string
 	}{
 		{
 			name: "no other containers",
-			setup: func(client *mockContainer.MockClient, current types.Container) {
+			setup: func(client *mockContainerClient.MockClient, current types.Container) {
 				client.EXPECT().ListContainers(mock.Anything, withFilter).Return([]types.Container{current}, nil)
 				client.EXPECT().ListContainers(mock.Anything).Return([]types.Container{current}, nil)
 			},
@@ -287,7 +338,7 @@ func TestRun_Continuous(t *testing.T) {
 			// The removed image is reported to a slice that is then discarded.
 			name: "older instance and its image are removed",
 			args: []string{"--cleanup"},
-			setup: func(client *mockContainer.MockClient, current types.Container) {
+			setup: func(client *mockContainerClient.MockClient, current types.Container) {
 				client.EXPECT().ListContainers(mock.Anything, withFilter).Return([]types.Container{current, older}, nil)
 				client.EXPECT().StopAndRemoveContainer(mock.Anything, older, 10*time.Minute).Return(nil)
 				client.EXPECT().RemoveImageByID(mock.Anything, older.ImageID(), older.ImageName()).Return(nil)
@@ -307,7 +358,7 @@ func TestRun_Continuous(t *testing.T) {
 			name:     "older instance is kept outside a container",
 			args:     []string{"--cleanup"},
 			uncached: true,
-			setup: func(client *mockContainer.MockClient, current types.Container) {
+			setup: func(client *mockContainerClient.MockClient, current types.Container) {
 				client.EXPECT().ListContainers(mock.Anything, withFilter).Return([]types.Container{current, older}, nil)
 				client.EXPECT().ListContainers(mock.Anything).Return([]types.Container{current, older}, nil)
 			},
@@ -318,7 +369,7 @@ func TestRun_Continuous(t *testing.T) {
 			args:     []string{"--cleanup"},
 			uncached: true,
 			knownID:  true,
-			setup: func(client *mockContainer.MockClient, current types.Container) {
+			setup: func(client *mockContainerClient.MockClient, current types.Container) {
 				client.EXPECT().ListContainers(mock.Anything, withFilter).Return([]types.Container{current, older}, nil)
 				client.EXPECT().ListContainers(mock.Anything).Return([]types.Container{current, older}, nil)
 			},
@@ -327,7 +378,7 @@ func TestRun_Continuous(t *testing.T) {
 		{
 			name: "orchestrator still handing off is kept",
 			args: []string{"--scope", "prod"},
-			setup: func(client *mockContainer.MockClient, current types.Container) {
+			setup: func(client *mockContainerClient.MockClient, current types.Container) {
 				client.EXPECT().ListContainers(mock.Anything, withFilter).Return([]types.Container{current}, nil)
 				client.EXPECT().ListContainers(mock.Anything).Return([]types.Container{current, inFlight}, nil)
 			},
@@ -336,7 +387,7 @@ func TestRun_Continuous(t *testing.T) {
 		{
 			name: "orphaned orchestrator from another scope is removed",
 			args: []string{"--scope", "prod"},
-			setup: func(client *mockContainer.MockClient, current types.Container) {
+			setup: func(client *mockContainerClient.MockClient, current types.Container) {
 				client.EXPECT().ListContainers(mock.Anything, withFilter).Return([]types.Container{current}, nil)
 				client.EXPECT().ListContainers(mock.Anything).Return([]types.Container{current, orchestrator}, nil)
 				client.EXPECT().StopAndRemoveContainer(mock.Anything, orchestrator, time.Duration(0)).Return(nil)
@@ -354,7 +405,7 @@ func TestRun_Continuous(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			current := currentWatchtower()
 
-			mockClient := mockContainer.NewMockClient(t)
+			mockClient := mockContainerClient.NewMockClient(t)
 			tt.setup(mockClient, current)
 			mockClient.EXPECT().GetVersion().Return("1.47")
 
@@ -377,10 +428,200 @@ func TestRun_Continuous(t *testing.T) {
 	}
 }
 
+// TestRun_PublishedPortsBlockSelfUpdates verifies that continuous mode does
+// not let an update replace a Watchtower container that publishes host ports,
+// unless self-updates are ephemeral. A Watchtower container whose self-update
+// is skipped is never checked for a newer image, so the client mock fails the
+// test if it is checked when it should not be.
+func TestRun_PublishedPortsBlockSelfUpdates(t *testing.T) {
+	tests := []struct {
+		name      string
+		args      []string
+		ports     bool
+		wantCheck bool
+	}{
+		{name: "published ports", ports: true, wantCheck: false},
+		{
+			name:      "published ports with ephemeral self-updates",
+			args:      []string{"--ephemeral-self-update"},
+			ports:     true,
+			wantCheck: true,
+		},
+		{name: "no published ports", ports: false, wantCheck: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			current := currentWatchtower()
+			if tt.ports {
+				current = currentWatchtowerWithPorts()
+			}
+
+			mockClient := mockContainerClient.NewMockClient(t)
+			mockClient.EXPECT().ListContainers(mock.Anything, withFilter).Return([]types.Container{current}, nil)
+			mockClient.EXPECT().ListContainers(mock.Anything).Return([]types.Container{current}, nil)
+			mockClient.EXPECT().GetVersion().Return("1.47")
+
+			if tt.wantCheck {
+				mockClient.EXPECT().IsContainerStale(mock.Anything, current, mock.Anything).
+					Return(false, current.ImageID(), "", nil).Once()
+			}
+
+			setRunState(t, runTestState{client: mockClient, current: current, currentID: current.ID()})
+
+			runUntilCanceled(t, append([]string{"--update-on-start"}, tt.args...)...)
+		})
+	}
+}
+
+// TestRun_WaitsForAPIDrain verifies that continuous mode with the HTTP API in
+// the background does not return until the API has finished a request it was
+// serving when the process was told to stop. The request lists containers, so
+// it does not hold the update lock that the scheduler also waits for.
+func TestRun_WaitsForAPIDrain(t *testing.T) {
+	// stopTimeout bounds the wait for run to return after its context is
+	// canceled. It covers the HTTP API's shutdown grace period.
+	const stopTimeout = 10 * time.Second
+
+	current := currentWatchtower()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+
+	// Release the request even when the test fails early, so the API and run
+	// do not stay blocked after the test ends.
+	releaseRequest := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseRequest)
+
+	mockClient := mockContainerClient.NewMockClient(t)
+	// The startup cleanup of older instances lists the containers first.
+	mockClient.EXPECT().ListContainers(mock.Anything, withFilter).Return([]types.Container{current}, nil).Once()
+	mockClient.EXPECT().ListContainers(mock.Anything).Return([]types.Container{current}, nil)
+	// The API request then lists them, and stays open until released.
+	mockClient.EXPECT().ListContainers(mock.Anything, withFilter).
+		RunAndReturn(func(context.Context, ...types.Filter) ([]types.Container, error) {
+			close(entered)
+			<-release
+
+			return []types.Container{}, nil
+		}).Once()
+	mockClient.EXPECT().GetVersion().Return("1.47").Maybe()
+
+	setRunState(t, runTestState{client: mockClient, current: current, currentID: current.ID()})
+
+	// run's process context, which the test cancels the way a signal would.
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	createSignalContext = func(context.Context, ...os.Signal) (context.Context, context.CancelFunc) {
+		return runCtx, cancelRun
+	}
+
+	var listenConfig net.ListenConfig
+
+	ln, err := listenConfig.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	addr := ln.Addr().String()
+	require.NoError(t, ln.Close())
+
+	_, port, err := net.SplitHostPort(addr)
+	require.NoError(t, err)
+
+	cmd := newTestRootCommand(t,
+		"--http-api-endpoints=containers",
+		"--http-api-periodic-polls",
+		"--http-api-token", "test-token",
+		"--http-api-host", "127.0.0.1",
+		"--http-api-port", port,
+	)
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		newRunProcess().run(cmd, nil)
+	}()
+
+	// Stop run before setRunState restores the package state it reads, so a
+	// test that fails early does not leave run behind.
+	t.Cleanup(func() {
+		cancelRun()
+		releaseRequest()
+
+		select {
+		case <-done:
+		case <-time.After(stopTimeout):
+			t.Error("run did not stop during cleanup")
+		}
+	})
+
+	var dialer net.Dialer
+
+	require.Eventually(t, func() bool {
+		conn, dialErr := dialer.DialContext(t.Context(), "tcp", addr)
+		if dialErr != nil {
+			return false
+		}
+
+		_ = conn.Close()
+
+		return true
+	}, 5*time.Second, 20*time.Millisecond, "the HTTP API did not start listening")
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+addr+"/v1/containers", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	statuses := make(chan int, 1)
+
+	go func() {
+		resp, doErr := http.DefaultClient.Do(req)
+		if doErr != nil {
+			statuses <- 0
+
+			return
+		}
+
+		_ = resp.Body.Close()
+		statuses <- resp.StatusCode
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the API request did not reach the Docker client")
+	}
+
+	// Stop the process the way a signal would. The scheduler returns, and run
+	// then waits for the API to finish the request.
+	cancelRun()
+
+	select {
+	case <-done:
+		t.Fatal("run returned while the HTTP API was still serving a request")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	releaseRequest()
+
+	select {
+	case status := <-statuses:
+		assert.Equal(t, http.StatusOK, status)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the API request did not finish after it was released")
+	}
+
+	select {
+	case <-done:
+	case <-time.After(stopTimeout):
+		t.Fatal("run did not return after the HTTP API finished its request")
+	}
+}
+
 // TestRun_HealthCheck verifies that the health check mode returns without
 // touching Docker when Watchtower is not the container's main process.
 func TestRun_HealthCheck(t *testing.T) {
-	mockClient := mockContainer.NewMockClient(t)
+	mockClient := mockContainerClient.NewMockClient(t)
 	setRunState(t, runTestState{client: mockClient})
 
 	newRunProcess().run(newTestRootCommand(t, "--health-check"), nil)
@@ -428,7 +669,7 @@ func TestRun_Exit(t *testing.T) {
 			require.ErrorAs(t, err, &exitErr, "output:\n%s", out)
 			assert.Equal(t, 1, exitErr.ExitCode(), "output:\n%s", out)
 			assert.Contains(t, string(out), tt.wantOutput)
-			assert.Contains(t, string(out), "SetRestartPolicy watchtower no",
+			assert.Contains(t, string(out), "SetRestartPolicy c0c0 no",
 				"the restart policy is disabled before the process ends")
 		})
 	}
@@ -441,12 +682,12 @@ func runExitHelper(t *testing.T, helperCase string) {
 
 	current := currentWatchtower()
 
-	mockClient := mockContainer.NewMockClient(t)
+	mockClient := mockContainerClient.NewMockClient(t)
 	mockClient.EXPECT().GetVersion().Return("1.47").Maybe()
 	mockClient.EXPECT().SetRestartPolicy(mock.Anything, mock.Anything, mock.Anything).
-		Run(func(_ context.Context, c types.Container, policy dockerContainer.RestartPolicy) {
-			fmt.Fprintf(os.Stderr, "SetRestartPolicy %s %s\n", containerLabel(c), policy.Name)
-		})
+		Run(func(_ context.Context, id types.ContainerID, policy dockerContainer.RestartPolicy) {
+			fmt.Fprintf(os.Stderr, "SetRestartPolicy %s %s\n", containerLabel(id), policy.Name)
+		}).Return(nil)
 
 	var args []string
 
@@ -480,12 +721,12 @@ func TestRun_OldInstanceStops(t *testing.T) {
 	oldSelf := runFixtureContainer("01d0", "/watchtower-old-01d0", "2026-10-01T12:00:00Z",
 		map[string]string{watchtowerLabelKey: "true"})
 
-	mockClient := mockContainer.NewMockClient(t)
+	mockClient := mockContainerClient.NewMockClient(t)
 	mockClient.EXPECT().ListContainers(mock.Anything, withFilter).Return([]types.Container{oldSelf}, nil)
 	mockClient.EXPECT().ListContainers(mock.Anything).Return([]types.Container{oldSelf}, nil)
 	mockClient.EXPECT().GetVersion().Return("1.47").Maybe()
-	mockClient.EXPECT().SetRestartPolicy(mock.Anything, oldSelf,
-		dockerContainer.RestartPolicy{Name: dockerContainer.RestartPolicyDisabled})
+	mockClient.EXPECT().SetRestartPolicy(mock.Anything, oldSelf.ID(),
+		dockerContainer.RestartPolicy{Name: dockerContainer.RestartPolicyDisabled}).Return(nil)
 
 	setRunState(t, runTestState{client: mockClient, current: oldSelf, currentID: oldSelf.ID()})
 
