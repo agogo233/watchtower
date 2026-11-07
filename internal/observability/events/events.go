@@ -3,8 +3,6 @@ package events
 import (
 	"sync"
 	"time"
-
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 const (
@@ -16,14 +14,13 @@ const (
 
 // Event represents a Watchtower operational event emitted to SSE subscribers.
 type Event struct {
-	Type      string    `json:"type"`
 	Timestamp time.Time `json:"timestamp"`
 	Data      any       `json:"data"`
+	Type      string    `json:"type"`
 }
 
-// ScanStartedData carries redacted scan policy flags for SSE subscribers.
-// It intentionally omits filter functions, container IDs, and other internal
-// fields from types.UpdateParams.
+// ScanStartedData carries the update settings published to event subscribers
+// when a scan starts. It holds only flags that are safe to publish.
 type ScanStartedData struct {
 	Cleanup             bool `json:"cleanup"`
 	NoRestart           bool `json:"no_restart"`
@@ -37,26 +34,6 @@ type ScanStartedData struct {
 	SkipSelfUpdate      bool `json:"skip_self_update"`
 	EphemeralSelfUpdate bool `json:"ephemeral_self_update"`
 	ReviveStopped       bool `json:"revive_stopped"`
-}
-
-// NewScanStartedData creates a redacted scan_started event payload from the
-// full update configuration. It intentionally omits filter functions, container
-// IDs, durations, and other internal fields from types.UpdateParams.
-func NewScanStartedData(updateParams types.UpdateParams) ScanStartedData {
-	return ScanStartedData{
-		Cleanup:             updateParams.Cleanup,
-		NoRestart:           updateParams.NoRestart,
-		MonitorOnly:         updateParams.MonitorOnly,
-		LifecycleHooks:      updateParams.LifecycleHooks,
-		RollingRestart:      updateParams.RollingRestart,
-		LabelPrecedence:     updateParams.LabelPrecedence,
-		NoPull:              updateParams.NoPull,
-		RunOnce:             updateParams.RunOnce,
-		UseComposeDependsOn: updateParams.UseComposeDependsOn,
-		SkipSelfUpdate:      updateParams.SkipSelfUpdate,
-		EphemeralSelfUpdate: updateParams.EphemeralSelfUpdate,
-		ReviveStopped:       updateParams.ReviveStopped,
-	}
 }
 
 // ScanCompletedData carries details about a scan that has finished.
@@ -94,8 +71,8 @@ type subscriber struct {
 
 // Broadcaster manages SSE subscriber registration and event distribution.
 type Broadcaster struct {
-	mu          sync.RWMutex
 	subscribers []*subscriber
+	mu          sync.RWMutex
 }
 
 // NewBroadcaster creates a new event broadcaster for distributing Watchtower

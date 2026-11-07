@@ -11,6 +11,8 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/robfig/cron/v3"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -18,6 +20,8 @@ import (
 	"github.com/nicholas-fedor/watchtower/internal/container/filters"
 	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
 	"github.com/nicholas-fedor/watchtower/internal/observability/metrics"
+	"github.com/nicholas-fedor/watchtower/internal/testutil/logcapture"
+	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
@@ -42,7 +46,7 @@ func newTestLogger(t *testing.T) *zerolog.Logger {
 // Callers override fields such as ScheduleSpec, UpdateOnStart, SkipFirstRun, and BaseParams as needed.
 func testDeps(
 	t *testing.T,
-	runUpdate func(context.Context, types.Filter, types.UpdateParams) *metrics.Metric,
+	runUpdate func(context.Context, types.Filter, updateParams.Params) *metrics.Metric,
 	writeStartup func(logging.StartupParams),
 ) ScheduleDeps {
 	t.Helper()
@@ -52,8 +56,41 @@ func testDeps(
 		Filter:              filters.NoFilter,
 		WriteStartupMessage: writeStartup,
 		RunUpdate:           runUpdate,
-		BaseParams:          types.UpdateParams{},
+		BaseParams:          updateParams.Params{},
 	}
+}
+
+// skippedScansTotal returns the process-wide watchtower_scans_skipped_total
+// counter, which the scheduler records through the default metrics handler.
+// It reports failures with t.Errorf, so it is safe to call from a condition
+// that require.Eventually runs on another goroutine.
+//
+// Parameters:
+//   - t: Test that receives any gather failure.
+//
+// Returns:
+//   - float64: Current counter value, or 0 after a failure.
+func skippedScansTotal(t *testing.T) float64 {
+	t.Helper()
+
+	metrics.Default()
+
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Errorf("gather metrics: %v", err)
+
+		return 0
+	}
+
+	for _, family := range families {
+		if family.GetName() == "watchtower_scans_skipped_total" {
+			return family.GetMetric()[0].GetCounter().GetValue()
+		}
+	}
+
+	t.Errorf("watchtower_scans_skipped_total is not registered")
+
+	return 0
 }
 
 // TestWaitForRunningUpdate verifies that the shutdown wait takes the update
@@ -138,6 +175,163 @@ func TestWaitForRunningUpdate(t *testing.T) {
 	})
 }
 
+// TestSkipIfStillRunning verifies that a scheduled run that starts while the
+// previous one is still running is skipped and counted as a skipped scan, and
+// that a run after the previous one finishes runs normally. It reads the
+// process-wide skipped scans counter, so it does not run in parallel.
+func TestSkipIfStillRunning(t *testing.T) {
+	before := skippedScansTotal(t)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	var runs atomic.Int32
+
+	job := skipIfStillRunning(newTestLogger(t))(cron.FuncJob(func() {
+		if runs.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+	}))
+
+	done := make(chan struct{})
+
+	go func() {
+		job.Run()
+		close(done)
+	}()
+
+	<-started
+	job.Run()
+
+	assert.Equal(t, int32(1), runs.Load(), "the overlapping run is skipped")
+	assert.InDelta(t, before+1, skippedScansTotal(t), 0)
+
+	close(release)
+	<-done
+	job.Run()
+
+	assert.Equal(t, int32(2), runs.Load(), "a run after the previous one finishes runs")
+	assert.InDelta(t, before+1, skippedScansTotal(t), 0)
+}
+
+// TestRecoverPanics verifies that a panic in a scheduled run is recovered and
+// logged through the scheduler's logger in one error line with notify=no. The
+// line carries the panic value and the stack. A run after the panic runs
+// normally.
+func TestRecoverPanics(t *testing.T) {
+	t.Parallel()
+
+	log, output := logcapture.New(zerolog.DebugLevel)
+
+	var runs atomic.Int32
+
+	job := recoverPanics(log)(cron.FuncJob(func() {
+		if runs.Add(1) == 1 {
+			panic("boom")
+		}
+	}))
+
+	require.NotPanics(t, job.Run)
+	job.Run()
+
+	assert.Equal(t, int32(2), runs.Load(), "a run after the panic runs")
+
+	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+	require.Len(t, lines, 1)
+
+	assert.Contains(t, lines[0], "level=error")
+	assert.Contains(t, lines[0], `msg="Scheduled run panicked"`)
+	assert.Contains(t, lines[0], "error=boom")
+	assert.Contains(t, lines[0], "notify=no")
+	assert.Contains(t, lines[0], "TestRecoverPanics")
+}
+
+// TestRunUpgradesOnSchedule_RecoversPanickingRun verifies that the scheduler's
+// cron entry logs a panicking scheduled run through the scheduler's logger and
+// keeps running, so the next scheduled update still runs.
+//
+// The default metrics handler, which the second run registers its scan with,
+// is created before the synctest bubble.
+func TestRunUpgradesOnSchedule_RecoversPanickingRun(t *testing.T) {
+	metrics.Default()
+
+	synctest.Test(t, func(t *testing.T) {
+		log, output := logcapture.New(zerolog.DebugLevel)
+
+		var runs atomic.Int32
+
+		deps := testDeps(t, func(context.Context, types.Filter, updateParams.Params) *metrics.Metric {
+			if runs.Add(1) == 1 {
+				panic("boom")
+			}
+
+			return &metrics.Metric{}
+		}, func(logging.StartupParams) {})
+		deps.Logger = log
+		deps.ScheduleSpec = "@every 1s"
+
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+
+		go func() { done <- RunUpgradesOnSchedule(ctx, deps) }()
+
+		// The run at 1 second panics, and the run at 2 seconds follows it.
+		time.Sleep(2500 * time.Millisecond)
+		synctest.Wait()
+
+		cancel()
+		require.NoError(t, <-done)
+
+		assert.Equal(t, int32(2), runs.Load(), "the run after the panic did not start")
+		assert.Contains(t, output.String(), `msg="Scheduled run panicked" error=boom`)
+	})
+}
+
+// TestRunUpgradesOnSchedule_OverlappingRunIsSkipped verifies that the
+// scheduler's cron entry skips a run that comes due while the previous
+// scheduled update is still running, so only one update runs, and that the
+// skip is counted as a skipped scan.
+//
+// The first read of the process-wide skipped scans counter creates the default
+// metrics handler outside the synctest bubble. The test reads that counter, so
+// it does not run in parallel.
+func TestRunUpgradesOnSchedule_OverlappingRunIsSkipped(t *testing.T) {
+	before := skippedScansTotal(t)
+
+	synctest.Test(t, func(t *testing.T) {
+		release := make(chan struct{})
+
+		var runs atomic.Int32
+
+		deps := testDeps(t, func(context.Context, types.Filter, updateParams.Params) *metrics.Metric {
+			runs.Add(1)
+			<-release
+
+			return &metrics.Metric{}
+		}, func(logging.StartupParams) {})
+		deps.ScheduleSpec = "@every 1s"
+
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+
+		go func() { done <- RunUpgradesOnSchedule(ctx, deps) }()
+
+		// The run at 1 second holds the update, and the run at 2 seconds overlaps it.
+		time.Sleep(2500 * time.Millisecond)
+		synctest.Wait()
+
+		assert.Equal(t, int32(1), runs.Load(), "the overlapping run started an update")
+		assert.InDelta(t, before+1, skippedScansTotal(t), 0)
+
+		cancel()
+		close(release)
+
+		require.NoError(t, <-done)
+		assert.Equal(t, int32(1), runs.Load(), "an update ran after shutdown")
+	})
+}
+
 // TestRunUpgradesOnSchedule_WaitingRunStopsAtShutdown verifies that a
 // scheduled run waiting for the update lock gives up when the scheduler shuts
 // down, instead of starting an update once the lock comes free.
@@ -145,22 +339,24 @@ func TestRunUpgradesOnSchedule_WaitingRunStopsAtShutdown(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var updated atomic.Bool
 
-		deps := testDeps(t, func(context.Context, types.Filter, types.UpdateParams) *metrics.Metric {
+		deps := testDeps(t, func(context.Context, types.Filter, updateParams.Params) *metrics.Metric {
 			updated.Store(true)
 
 			return &metrics.Metric{}
 		}, func(logging.StartupParams) {})
 
-		// Another update holds the lock while the scheduled run comes due.
 		deps.Lock = NewUpdateLock()
-		require.True(t, deps.Lock.TryLock())
-
 		deps.ScheduleSpec = "@every 1s"
 
 		ctx, cancel := context.WithCancel(t.Context())
 		done := make(chan error, 1)
 
 		go func() { done <- RunUpgradesOnSchedule(ctx, deps) }()
+
+		// Another update takes the lock after the startup message and holds it
+		// while the scheduled run comes due.
+		synctest.Wait()
+		require.True(t, deps.Lock.TryLock())
 
 		time.Sleep(1500 * time.Millisecond)
 		cancel()
@@ -177,7 +373,7 @@ func TestRunUpgradesOnSchedule_WaitingRunStopsAtShutdown(t *testing.T) {
 func TestRunUpgradesOnSchedule_EmptySchedule(t *testing.T) {
 	ctx := t.Context()
 
-	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, _ types.UpdateParams) *metrics.Metric {
+	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
 		return &metrics.Metric{Scanned: 1, Updated: 0, Failed: 0}
 	}
 
@@ -198,7 +394,7 @@ func TestRunUpgradesOnSchedule_EmptySchedule(t *testing.T) {
 func TestRunUpgradesOnSchedule_StartupMessageSuppressed(t *testing.T) {
 	ctx := t.Context()
 
-	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, _ types.UpdateParams) *metrics.Metric {
+	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
 		return &metrics.Metric{Scanned: 1, Updated: 0, Failed: 0}
 	}
 
@@ -230,7 +426,7 @@ func TestRunUpgradesOnSchedule_UpdateOnStart(t *testing.T) {
 	ctx := t.Context()
 
 	updateCalled := false
-	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, _ types.UpdateParams) *metrics.Metric {
+	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
 		updateCalled = true
 
 		return &metrics.Metric{Scanned: 1, Updated: 1, Failed: 0}
@@ -261,7 +457,7 @@ func TestRunUpgradesOnSchedule_UpdateOnStart(t *testing.T) {
 // reported as a failure.
 func TestRunUpgradesOnSchedule_UpdateOnStartSkippedWhenCanceled(t *testing.T) {
 	updateCalled := false
-	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, _ types.UpdateParams) *metrics.Metric {
+	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
 		updateCalled = true
 
 		return &metrics.Metric{}
@@ -283,10 +479,196 @@ func TestRunUpgradesOnSchedule_UpdateOnStartSkippedWhenCanceled(t *testing.T) {
 	}
 }
 
+// TestRunUpgradesOnSchedule_StartupWaitsForRunningUpdate verifies that the
+// startup message waits for an update that already holds the lock, such as
+// one the HTTP API started as soon as it began serving. The two would
+// otherwise share one notification batch. The update at startup is then
+// skipped and counted as a skipped scan, as it is when it finds the lock
+// taken. The startup message therefore does not announce it. The test does
+// not run in parallel, because it reads the process-wide skipped scans counter.
+func TestRunUpgradesOnSchedule_StartupWaitsForRunningUpdate(t *testing.T) {
+	before := skippedScansTotal(t)
+
+	synctest.Test(t, func(t *testing.T) {
+		lock := NewUpdateLock()
+		require.True(t, lock.TryLock())
+
+		var updated atomic.Bool
+
+		var announced atomic.Pointer[logging.StartupParams]
+
+		deps := testDeps(t, func(context.Context, types.Filter, updateParams.Params) *metrics.Metric {
+			updated.Store(true)
+
+			return &metrics.Metric{}
+		}, func(startup logging.StartupParams) {
+			announced.Store(&startup)
+		})
+		deps.Lock = lock
+		deps.UpdateOnStart = true
+
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+
+		go func() { done <- RunUpgradesOnSchedule(ctx, deps) }()
+
+		synctest.Wait()
+		assert.Nil(t, announced.Load(), "the startup message waits for the running update")
+
+		lock.Unlock()
+		synctest.Wait()
+
+		startup := announced.Load()
+		require.NotNil(t, startup, "the startup message follows the running update")
+		require.NotNil(t, startup.UpdateOnStart)
+		assert.False(t, *startup.UpdateOnStart, "the startup message announces the skipped update at startup")
+		assert.InDelta(t, before+1, skippedScansTotal(t), 0)
+
+		cancel()
+		require.NoError(t, <-done)
+		assert.False(t, updated.Load(), "the update at startup is skipped")
+	})
+}
+
+// TestRunUpgradesOnSchedule_UpdateOnStartSkippedWhileLocked verifies that the
+// update at startup does not wait for an update that holds the lock. The HTTP
+// API can start one right after the startup message. The skipped update is
+// counted as a skipped scan. Because the startup message is already sent
+// here, the lock is left to that update. The test does not run in parallel,
+// because it reads the process-wide skipped scans counter.
+func TestRunUpgradesOnSchedule_UpdateOnStartSkippedWhileLocked(t *testing.T) {
+	before := skippedScansTotal(t)
+
+	synctest.Test(t, func(t *testing.T) {
+		lock := NewUpdateLock()
+		require.True(t, lock.TryLock())
+
+		var updated atomic.Bool
+
+		deps := testDeps(t, func(context.Context, types.Filter, updateParams.Params) *metrics.Metric {
+			updated.Store(true)
+
+			return &metrics.Metric{}
+		}, nil)
+		deps.Lock = lock
+		deps.StartupMessageSent = true
+		deps.UpdateOnStart = true
+
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+
+		go func() { done <- RunUpgradesOnSchedule(ctx, deps) }()
+
+		synctest.Wait()
+		assert.InDelta(t, before+1, skippedScansTotal(t), 0)
+
+		lock.Unlock()
+		cancel()
+		require.NoError(t, <-done)
+		assert.False(t, updated.Load(), "the update at startup is skipped")
+	})
+}
+
+// TestRunUpgradesOnSchedule_UpdateOnStartHoldsLock verifies that the update at
+// startup holds the update lock until it returns. Another caller of the lock,
+// such as the HTTP API, waits for the update to finish before it can start one.
+// The metrics handler is created before the bubble, since its goroutine outlives
+// the test.
+func TestRunUpgradesOnSchedule_UpdateOnStartHoldsLock(t *testing.T) {
+	metrics.Default()
+
+	synctest.Test(t, func(t *testing.T) {
+		lock := NewUpdateLock()
+		release := make(chan struct{})
+
+		var running atomic.Bool
+
+		deps := testDeps(t, func(context.Context, types.Filter, updateParams.Params) *metrics.Metric {
+			running.Store(true)
+			<-release
+			running.Store(false)
+
+			return &metrics.Metric{}
+		}, nil)
+		deps.Lock = lock
+		deps.UpdateOnStart = true
+
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+
+		go func() { done <- RunUpgradesOnSchedule(ctx, deps) }()
+
+		synctest.Wait()
+		require.True(t, running.Load(), "the update at startup is running")
+
+		// overlapped records whether the second caller took the lock while the
+		// update at startup was still running.
+		var overlapped atomic.Bool
+
+		acquired := make(chan struct{})
+
+		go func() {
+			if lock.Lock(t.Context()) != nil {
+				return
+			}
+
+			overlapped.Store(running.Load())
+			close(acquired)
+			lock.Unlock()
+		}()
+
+		synctest.Wait()
+
+		select {
+		case <-acquired:
+			t.Fatal("another caller took the lock while the update at startup was running")
+		default:
+		}
+
+		close(release)
+		<-acquired
+		assert.False(t, overlapped.Load(), "the lock was taken before the update at startup returned")
+
+		cancel()
+		require.NoError(t, <-done)
+	})
+}
+
+// TestRunUpgradesOnSchedule_StartupSkippedAtShutdown verifies that a startup
+// message that waits for a running update is skipped when the process stops
+// first. A stopping process has nothing to announce.
+func TestRunUpgradesOnSchedule_StartupSkippedAtShutdown(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		lock := NewUpdateLock()
+		require.True(t, lock.TryLock())
+
+		var announced atomic.Bool
+
+		deps := testDeps(t, nil, func(logging.StartupParams) {
+			announced.Store(true)
+		})
+		deps.Lock = lock
+
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+
+		go func() { done <- RunUpgradesOnSchedule(ctx, deps) }()
+
+		// The scheduler sees the cancellation before the lock comes free.
+		synctest.Wait()
+		cancel()
+		synctest.Wait()
+		lock.Unlock()
+
+		require.NoError(t, <-done)
+		assert.False(t, announced.Load(), "a stopping process wrote the startup message")
+	})
+}
+
 func TestRunUpgradesOnSchedule_InvalidCronSpec(t *testing.T) {
 	ctx := t.Context()
 
-	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, _ types.UpdateParams) *metrics.Metric {
+	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
 		return &metrics.Metric{Scanned: 0, Updated: 0, Failed: 0}
 	}
 
@@ -296,13 +678,7 @@ func TestRunUpgradesOnSchedule_InvalidCronSpec(t *testing.T) {
 	deps.ScheduleSpec = "invalid cron spec"
 
 	err := RunUpgradesOnSchedule(ctx, deps)
-	if err == nil {
-		t.Error("expected error")
-	}
-
-	if err != nil && !strings.Contains(err.Error(), "failed to schedule updates") {
-		t.Errorf("expected error to contain 'failed to schedule updates', got %v", err)
-	}
+	require.ErrorContains(t, err, `invalid schedule "invalid cron spec": `)
 }
 
 func TestRunUpgradesOnSchedule_QuotedScheduleSpec(t *testing.T) {
@@ -347,7 +723,7 @@ func TestRunUpgradesOnSchedule_QuotedScheduleSpec(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := t.Context()
 
-			runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, _ types.UpdateParams) *metrics.Metric {
+			runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
 				return &metrics.Metric{Scanned: 0, Updated: 0, Failed: 0}
 			}
 
@@ -377,7 +753,7 @@ func TestRunUpgradesOnSchedule_QuotedScheduleSpec(t *testing.T) {
 func TestRunUpgradesOnSchedule_ContextCancellation(t *testing.T) {
 	ctx := t.Context()
 
-	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, _ types.UpdateParams) *metrics.Metric {
+	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
 		return &metrics.Metric{Scanned: 0, Updated: 0, Failed: 0}
 	}
 
@@ -412,7 +788,7 @@ func TestRunUpgradesOnSchedule_StopsOnlyOnCancellation(t *testing.T) {
 	signal.Notify(interrupts, os.Interrupt)
 	t.Cleanup(func() { signal.Stop(interrupts) })
 
-	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, _ types.UpdateParams) *metrics.Metric {
+	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
 		return &metrics.Metric{}
 	}
 
@@ -473,9 +849,9 @@ func TestRunUpgradesOnSchedule_MonitorOnlyParameter(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := t.Context()
 
-			var capturedParams types.UpdateParams
+			var capturedParams updateParams.Params
 
-			runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, params types.UpdateParams) *metrics.Metric {
+			runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, params updateParams.Params) *metrics.Metric {
 				capturedParams = params
 
 				return &metrics.Metric{Scanned: 1, Updated: 0, Failed: 0}
@@ -511,7 +887,7 @@ func TestRunUpgradesOnSchedule_CronWithSeconds(t *testing.T) {
 	ctx := t.Context()
 
 	updateCallCount := 0
-	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, _ types.UpdateParams) *metrics.Metric {
+	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
 		updateCallCount++
 
 		return &metrics.Metric{Scanned: 1, Updated: 0, Failed: 0}
@@ -543,9 +919,9 @@ func TestRunUpgradesOnSchedule_CronWithSeconds(t *testing.T) {
 func TestRunUpgradesOnSchedule_SkipFirstRun_True(t *testing.T) {
 	ctx := t.Context()
 
-	var capturedParams []types.UpdateParams
+	var capturedParams []updateParams.Params
 
-	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, params types.UpdateParams) *metrics.Metric {
+	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, params updateParams.Params) *metrics.Metric {
 		capturedParams = append(capturedParams, params)
 
 		return &metrics.Metric{Scanned: 1, Updated: 0, Failed: 0}
@@ -590,7 +966,7 @@ func TestRunUpgradesOnSchedule_ScheduledRuns_Execution(t *testing.T) {
 
 	var executionTimes []time.Time
 
-	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, _ types.UpdateParams) *metrics.Metric {
+	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
 		executionTimes = append(executionTimes, time.Now())
 
 		return &metrics.Metric{Scanned: 1, Updated: 0, Failed: 0}
@@ -639,9 +1015,9 @@ func TestRunUpgradesOnSchedule_ScheduledRuns_Execution(t *testing.T) {
 // TestRunUpgradesOnSchedule_KeepsBaseSkipSelfUpdate verifies that a run cannot
 // enable self-updates that the base parameters disable.
 func TestRunUpgradesOnSchedule_KeepsBaseSkipSelfUpdate(t *testing.T) {
-	var capturedParams types.UpdateParams
+	var capturedParams updateParams.Params
 
-	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, params types.UpdateParams) *metrics.Metric {
+	runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, params updateParams.Params) *metrics.Metric {
 		capturedParams = params
 
 		return &metrics.Metric{Scanned: 1, Updated: 0, Failed: 0}
@@ -661,7 +1037,7 @@ func TestRunUpgradesOnSchedule_KeepsBaseSkipSelfUpdate(t *testing.T) {
 }
 
 // TestRunUpgradesOnSchedule_ReviveStoppedPropagation verifies that RunUpgradesOnSchedule
-// passes the ReviveStopped flag through UpdateParams to the update function.
+// passes the ReviveStopped flag through [updateParams.Params] to the update function.
 func TestRunUpgradesOnSchedule_ReviveStoppedPropagation(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -684,9 +1060,9 @@ func TestRunUpgradesOnSchedule_ReviveStoppedPropagation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := t.Context()
 
-			var capturedParams types.UpdateParams
+			var capturedParams updateParams.Params
 
-			runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, params types.UpdateParams) *metrics.Metric {
+			runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, params updateParams.Params) *metrics.Metric {
 				capturedParams = params
 
 				return &metrics.Metric{Scanned: 1, Updated: 0, Failed: 0}
@@ -704,13 +1080,13 @@ func TestRunUpgradesOnSchedule_ReviveStoppedPropagation(t *testing.T) {
 			require.NoError(t, err)
 
 			assert.Equal(t, tt.expectSelected, capturedParams.ReviveStopped,
-				"ReviveStopped should be %v in UpdateParams", tt.expectSelected)
+				"ReviveStopped should be %v in updateParams.Params", tt.expectSelected)
 		})
 	}
 }
 
 // TestRunUpgradesOnSchedule_UseComposeDependsOnPropagation verifies that
-// RunUpgradesOnSchedule passes UseComposeDependsOn through UpdateParams so
+// RunUpgradesOnSchedule passes UseComposeDependsOn through [updateParams.Params] so
 // scheduled cycles honor Compose depends_on the same way as --run-once.
 func TestRunUpgradesOnSchedule_UseComposeDependsOnPropagation(t *testing.T) {
 	tests := []struct {
@@ -734,9 +1110,9 @@ func TestRunUpgradesOnSchedule_UseComposeDependsOnPropagation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := t.Context()
 
-			var capturedParams types.UpdateParams
+			var capturedParams updateParams.Params
 
-			runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, params types.UpdateParams) *metrics.Metric {
+			runUpdatesWithNotifications := func(_ context.Context, _ types.Filter, params updateParams.Params) *metrics.Metric {
 				capturedParams = params
 
 				return &metrics.Metric{Scanned: 1, Updated: 0, Failed: 0}
@@ -754,7 +1130,7 @@ func TestRunUpgradesOnSchedule_UseComposeDependsOnPropagation(t *testing.T) {
 			require.NoError(t, err)
 
 			assert.Equal(t, tt.expectSelected, capturedParams.UseComposeDependsOn,
-				"UseComposeDependsOn should be %v in UpdateParams", tt.expectSelected)
+				"UseComposeDependsOn should be %v in updateParams.Params", tt.expectSelected)
 			assert.False(t, capturedParams.RunOnce,
 				"scheduled updates must keep RunOnce=false")
 		})

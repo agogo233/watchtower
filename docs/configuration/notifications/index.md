@@ -36,7 +36,7 @@ Configures the notification service URL(s).
 
 ## Notification Split by Container
 
-Send separate notifications for each updated container instead of grouping them.
+Send a separate notification for each container instead of grouping them.
 
 ```text
             Argument: --notification-split-by-container
@@ -47,7 +47,7 @@ Environment Variable: WATCHTOWER_NOTIFICATION_SPLIT_BY_CONTAINER
 
 !!! Note
     When disabled (default), notifications are grouped for all updated containers in a single session.
-    When enabled, a separate notification is sent for each container update.
+    When enabled, a separate notification is sent for each container that needs one. See [Split by Container](../../notifications/general-settings/index.md#split_by_container) for the containers that get one.
 
 ## Notification Template
 
@@ -112,7 +112,7 @@ Environment Variable: WATCHTOWER_NOTIFICATIONS_HOSTNAME
 
 ## Notifications Delay
 
-Delay before sending notifications, expressed in seconds.
+Delay before sending notifications, expressed in seconds. Watchtower exits at startup if the value is negative.
 
 ```text
             Argument: --notifications-delay
@@ -153,6 +153,10 @@ Environment Variable: WATCHTOWER_NOTIFICATION_LOG_STDOUT
                 Type: Boolean
              Default: false
 ```
+
+!!! Note
+    Only the `logger://` output goes to stdout.
+    Shoutrrr's own messages, such as a warning that a service sends without TLS, go to Watchtower's log at their level.
 
 ## Disable Startup Message
 
@@ -264,9 +268,12 @@ Environment Variable: WATCHTOWER_NOTIFICATION_EMAIL_SUBJECTTAG
              Default: ""
 ```
 
+!!! Deprecated
+    Use the [Notification Title Tag](#notification_title_tag) option instead. The `notify-upgrade` command does not carry this setting into the generated URL.
+
 #### Email Server Port
 
-The port the SMTP server listens on.
+The port the SMTP server listens on. Watchtower exits at startup if the value is outside 0 to 65535.
 
 ```text
             Argument: --notification-email-server-port
@@ -277,7 +284,7 @@ Environment Variable: WATCHTOWER_NOTIFICATION_EMAIL_SERVER_PORT
 
 #### Email Delay
 
-The delay (in seconds) between sending notifications if multiple containers are updated at once.
+The delay (in seconds) between sending notifications if multiple containers are updated at once. Watchtower exits at startup if the value is negative.
 
 ```text
             Argument: --notification-email-delay
@@ -285,6 +292,9 @@ Environment Variable: WATCHTOWER_NOTIFICATION_EMAIL_DELAY
                 Type: Integer
              Default: None
 ```
+
+!!! Deprecated
+    Use the [Notifications Delay](#notifications_delay) option instead. The `notify-upgrade` command does not carry this setting into the generated URL.
 
 ### Gotify
 

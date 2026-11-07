@@ -16,9 +16,9 @@ import (
 
 	"github.com/nicholas-fedor/watchtower/internal/container"
 	"github.com/nicholas-fedor/watchtower/internal/container/filters"
-	"github.com/nicholas-fedor/watchtower/internal/observability/metrics"
 	"github.com/nicholas-fedor/watchtower/internal/registry/ratelimit"
 	mockUpdate "github.com/nicholas-fedor/watchtower/internal/update/mocks"
+	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
@@ -133,7 +133,7 @@ func TestUpdateAction_Restarts(t *testing.T) {
 				false,
 			)
 
-			report, cleanupImageInfos, err := update(newTestLogger(t), t.Context(), client, types.UpdateParams{
+			report, cleanupImageInfos, err := update(newTestLogger(t), t.Context(), client, updateParams.Params{
 				Cleanup: true,
 				Filter:  filters.WatchtowerContainersFilter,
 			}, ratelimit.New())
@@ -216,7 +216,7 @@ func TestUpdateAction_Restarts(t *testing.T) {
 				false,
 			)
 
-			report, cleanupImageInfos, err := update(newTestLogger(t), t.Context(), client, types.UpdateParams{Cleanup: true}, ratelimit.New())
+			report, cleanupImageInfos, err := update(newTestLogger(t), t.Context(), client, updateParams.Params{Cleanup: true}, ratelimit.New())
 
 			require.NoError(t, err)
 			require.Len(t, report.Updated(), 1)
@@ -299,7 +299,7 @@ func TestUpdateAction_Restarts(t *testing.T) {
 				false,
 			)
 
-			report, _, err := update(newTestLogger(t), t.Context(), client, types.UpdateParams{Cleanup: true}, ratelimit.New())
+			report, _, err := update(newTestLogger(t), t.Context(), client, updateParams.Params{Cleanup: true}, ratelimit.New())
 
 			require.NoError(t, err)
 			require.Len(t, report.Updated(), 1)
@@ -365,7 +365,7 @@ func TestUpdateAction_Restarts(t *testing.T) {
 				false,
 			)
 
-			report, _, err := update(newTestLogger(t), t.Context(), client, types.UpdateParams{Cleanup: true}, ratelimit.New())
+			report, _, err := update(newTestLogger(t), t.Context(), client, updateParams.Params{Cleanup: true}, ratelimit.New())
 
 			require.NoError(t, err)
 			require.Len(t, report.Updated(), 1)
@@ -423,18 +423,15 @@ func TestUpdateAction_Restarts(t *testing.T) {
 				false,
 			)
 
-			report, _, err := update(newTestLogger(t), t.Context(), client, types.UpdateParams{Cleanup: true}, ratelimit.New())
+			report, _, err := update(newTestLogger(t), t.Context(), client, updateParams.Params{Cleanup: true}, ratelimit.New())
 
 			require.NoError(t, err)
 
-			// Generate metrics from the report
-			metric := metrics.NewMetric(report)
+			metric := newScanMetric(report)
 
-			// Verify metrics include both updated and restarted containers
 			assert.Equal(t, 1, metric.Updated)
+			assert.Equal(t, 1, metric.Restarted)
 			assert.Equal(t, 2, metric.Scanned)
-			// Note: restarted containers are not counted separately in metrics,
-			// they are included in scanned but not in updated
 		})
 	})
 
@@ -485,7 +482,7 @@ func TestUpdateAction_Restarts(t *testing.T) {
 				false,
 			)
 
-			report, _, err := update(newTestLogger(t), t.Context(), client, types.UpdateParams{Cleanup: true}, ratelimit.New())
+			report, _, err := update(newTestLogger(t), t.Context(), client, updateParams.Params{Cleanup: true}, ratelimit.New())
 
 			require.NoError(t, err)
 			// Both should be updated since both are stale
@@ -553,7 +550,7 @@ func TestUpdateAction_Restarts(t *testing.T) {
 				false,
 			)
 
-			report, _, err := update(newTestLogger(t), t.Context(), client, types.UpdateParams{Cleanup: true}, ratelimit.New())
+			report, _, err := update(newTestLogger(t), t.Context(), client, updateParams.Params{Cleanup: true}, ratelimit.New())
 
 			require.NoError(t, err)
 			require.Len(t, report.Updated(), 2)   // A and C
@@ -591,7 +588,7 @@ func TestUpdateAction_Restarts(t *testing.T) {
 				false,
 			)
 
-			report, _, err := update(newTestLogger(t), t.Context(), client, types.UpdateParams{Cleanup: true}, ratelimit.New())
+			report, _, err := update(newTestLogger(t), t.Context(), client, updateParams.Params{Cleanup: true}, ratelimit.New())
 
 			require.NoError(t, err)
 			assert.Empty(t, report.Updated())
@@ -1228,7 +1225,7 @@ func TestUpdateAction_Restarts(t *testing.T) {
 				)
 
 				// Run Update with rolling restart
-				report, cleanupImageInfos, err := update(newTestLogger(t), t.Context(), client, types.UpdateParams{
+				report, cleanupImageInfos, err := update(newTestLogger(t), t.Context(), client, updateParams.Params{
 					Cleanup:        true,
 					RollingRestart: true,
 				}, ratelimit.New())
@@ -1293,7 +1290,7 @@ func TestUpdateAction_Restarts(t *testing.T) {
 					client.TestData.Staleness[name] = true
 				}
 
-				report, _, err := update(newTestLogger(t), t.Context(), client, types.UpdateParams{
+				report, _, err := update(newTestLogger(t), t.Context(), client, updateParams.Params{
 					Cleanup:        true,
 					RollingRestart: true,
 				}, ratelimit.New())
@@ -1324,7 +1321,7 @@ func TestUpdateAction_Restarts(t *testing.T) {
 				cancel() // Cancel immediately
 
 				// Run Update with rolling restart and canceled context
-				_, _, err := update(newTestLogger(t), ctx, client, types.UpdateParams{
+				_, _, err := update(newTestLogger(t), ctx, client, updateParams.Params{
 					Cleanup:        true,
 					RollingRestart: true,
 				}, ratelimit.New())
@@ -1353,7 +1350,7 @@ func TestUpdateAction_Restarts(t *testing.T) {
 				defer cancel()
 
 				// Run Update with rolling restart - should timeout quickly
-				_, _, err := update(newTestLogger(t), ctx, client, types.UpdateParams{
+				_, _, err := update(newTestLogger(t), ctx, client, updateParams.Params{
 					Cleanup:        true,
 					RollingRestart: true,
 				}, ratelimit.New())
@@ -1435,7 +1432,7 @@ func TestUpdateAction_Restarts(t *testing.T) {
 				)
 
 				// Run Update to test restart ordering
-				report, _, err := update(newTestLogger(t), t.Context(), client, types.UpdateParams{
+				report, _, err := update(newTestLogger(t), t.Context(), client, updateParams.Params{
 					Cleanup: true,
 				}, ratelimit.New())
 
@@ -1514,7 +1511,7 @@ func TestUpdateAction_Restarts(t *testing.T) {
 				)
 
 				// Run Update
-				report, cleanupImageInfos, err := update(newTestLogger(t), t.Context(), client, types.UpdateParams{
+				report, cleanupImageInfos, err := update(newTestLogger(t), t.Context(), client, updateParams.Params{
 					Cleanup: true,
 				}, ratelimit.New())
 

@@ -19,6 +19,7 @@ import (
 
 	"github.com/nicholas-fedor/watchtower/internal/container"
 	"github.com/nicholas-fedor/watchtower/internal/container/recreate"
+	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
@@ -399,18 +400,9 @@ func stopSourceContainer(log *zerolog.Logger,
 		return nil
 	}
 
-	// Use container's configured timeout if available and valid, otherwise use passed parameter.
+	// A stop timeout set on the container takes precedence over the passed one.
 	// A timeout of 0 is valid in Docker (means no grace period - immediate SIGKILL after stop signal).
-	effectiveTimeout := timeout
-
-	containerTimeout := sourceContainer.StopTimeout()
-	if containerTimeout != nil && *containerTimeout >= 0 {
-		effectiveTimeout = time.Duration(*containerTimeout) * time.Second
-		clog.Debug().
-			Dur("container_timeout", effectiveTimeout).
-			Dur("default_timeout", timeout).
-			Msg("Using container-specific stop timeout")
-	}
+	effectiveTimeout := sourceContainer.StopTimeout(timeout)
 
 	// Retrieve the container's configured stop signal, falling back to SIGTERM if not specified.
 	signal := sourceContainer.StopSignal()
@@ -420,9 +412,9 @@ func stopSourceContainer(log *zerolog.Logger,
 	}
 
 	// Log the stop attempt with the signal and configured timeout for clarity.
-	message := "Stopping container"
+	message := logging.StoppingContainer
 	if sourceContainer.IsLinkedToRestarting() {
-		message = "Stopping linked container"
+		message = logging.StoppingLinkedContainer
 	}
 
 	clog.Info().

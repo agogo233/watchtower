@@ -11,13 +11,10 @@ import (
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
-// checkCommandTimeout is the timeout in minutes for check commands (pre/post check hooks).
-const checkCommandTimeout = 1
-
 // Errors for lifecycle hook execution.
 var (
 	// errPreUpdateFailed indicates a failure in executing the pre-update command.
-	errPreUpdateFailed = errors.New("pre-update command execution failed")
+	errPreUpdateFailed = errors.New("pre-update command failed")
 )
 
 // ExecutePreChecks runs pre-check lifecycle hooks for filtered containers.
@@ -29,17 +26,26 @@ var (
 //   - log: Logger for debug output.
 //   - ctx: Context for cancellation and timeout.
 //   - client: Container client for execution.
-//   - params: Update parameters with filter.
+//   - filter: Container filter applied when listed is nil.
+//   - uid: Default UID for hooks without a lifecycle UID label.
+//   - gid: Default GID for hooks without a lifecycle GID label.
 //   - listed: Already-listed containers from the current scan, or nil.
-func ExecutePreChecks(log *zerolog.Logger, ctx context.Context, client containerClient.Client, params types.UpdateParams, listed []types.Container) {
-	containers, ok := resolveCheckContainers(log, ctx, client, params, listed, "pre-checks")
+func ExecutePreChecks(
+	log *zerolog.Logger,
+	ctx context.Context,
+	client containerClient.Client,
+	filter types.Filter,
+	uid, gid int,
+	listed []types.Container,
+) {
+	containers, ok := resolveCheckContainers(log, ctx, client, filter, listed, "pre-checks")
 	if !ok {
 		// Listing failed. Hooks are skipped for this phase.
 		return
 	}
 
 	for _, currentContainer := range containers {
-		executePreCheckCommand(log, ctx, client, currentContainer, params.LifecycleUID, params.LifecycleGID)
+		executePreCheckCommand(log, ctx, client, currentContainer, uid, gid)
 	}
 }
 
@@ -52,17 +58,26 @@ func ExecutePreChecks(log *zerolog.Logger, ctx context.Context, client container
 //   - log: Logger for debug output.
 //   - ctx: Context for cancellation and timeout.
 //   - client: Container client for execution.
-//   - params: Update parameters with filter.
+//   - filter: Container filter applied when listed is nil.
+//   - uid: Default UID for hooks without a lifecycle UID label.
+//   - gid: Default GID for hooks without a lifecycle GID label.
 //   - listed: Already-listed containers from the current scan, or nil.
-func ExecutePostChecks(log *zerolog.Logger, ctx context.Context, client containerClient.Client, params types.UpdateParams, listed []types.Container) {
-	containers, ok := resolveCheckContainers(log, ctx, client, params, listed, "post-checks")
+func ExecutePostChecks(
+	log *zerolog.Logger,
+	ctx context.Context,
+	client containerClient.Client,
+	filter types.Filter,
+	uid, gid int,
+	listed []types.Container,
+) {
+	containers, ok := resolveCheckContainers(log, ctx, client, filter, listed, "post-checks")
 	if !ok {
 		// Listing failed. Hooks are skipped for this phase.
 		return
 	}
 
 	for _, currentContainer := range containers {
-		executePostCheckCommand(log, ctx, client, currentContainer, params.LifecycleUID, params.LifecycleGID)
+		executePostCheckCommand(log, ctx, client, currentContainer, uid, gid)
 	}
 }
 
@@ -72,7 +87,7 @@ func ExecutePostChecks(log *zerolog.Logger, ctx context.Context, client containe
 //   - log: Logger for debug output.
 //   - ctx: Context for cancellation and timeout.
 //   - client: Container client for listing when listed is empty.
-//   - params: Update parameters whose filter is applied to a fresh list.
+//   - filter: Container filter applied to a fresh list.
 //   - listed: Already-listed containers from the current scan, or nil.
 //   - phase: Log label for the pre-check or post-check phase.
 //
@@ -83,12 +98,12 @@ func resolveCheckContainers(
 	log *zerolog.Logger,
 	ctx context.Context,
 	client containerClient.Client,
-	params types.UpdateParams,
+	filter types.Filter,
 	listed []types.Container,
 	phase string,
 ) ([]types.Container, bool) {
 	clogVal := log.With().
-		Str("filter", fmt.Sprintf("%v", params.Filter)).
+		Str("filter", fmt.Sprintf("%v", filter)).
 		Logger()
 	clog := &clogVal
 
@@ -104,7 +119,7 @@ func resolveCheckContainers(
 	// Fetch containers using the provided filter.
 	clog.Debug().Msg("Listing containers for " + phase)
 
-	containers, err := client.ListContainers(ctx, params.Filter)
+	containers, err := client.ListContainers(ctx, filter)
 	if err != nil {
 		clog.Debug().
 			Err(err).
@@ -138,6 +153,7 @@ func executePreCheckCommand(log *zerolog.Logger, ctx context.Context, client con
 		uid,
 		gid,
 		container.GetLifecyclePreCheckCommand(),
+		container.PreCheckTimeout,
 		"pre-check",
 	)
 }
@@ -160,6 +176,7 @@ func executePostCheckCommand(log *zerolog.Logger, ctx context.Context, client co
 		uid,
 		gid,
 		container.GetLifecyclePostCheckCommand(),
+		container.PostCheckTimeout,
 		"post-check",
 	)
 }
@@ -174,6 +191,8 @@ func executePostCheckCommand(log *zerolog.Logger, ctx context.Context, client co
 //   - uid: Default UID to run command as.
 //   - gid: Default GID to run command as.
 //   - command: Command string from the container labels.
+//   - timeout: Reads the timeout in minutes from the container labels, where
+//     0 means no timeout. It is called only when the command is set.
 //   - phase: Label for logs ("pre-check" or "post-check").
 func executeCheckCommand(
 	log *zerolog.Logger,
@@ -182,27 +201,13 @@ func executeCheckCommand(
 	cont types.Container,
 	uid, gid int,
 	command string,
+	timeout func() int,
 	phase string,
 ) {
 	clogVal := log.With().
 		Str("container", cont.Name()).
 		Logger()
 	clog := &clogVal
-
-	// Determine effective UID/GID: use container labels if set, otherwise use defaults.
-	effectiveUID := uid
-
-	containerUID, ok := cont.GetLifecycleUID()
-	if ok {
-		effectiveUID = containerUID
-	}
-
-	effectiveGID := gid
-
-	containerGID, ok := cont.GetLifecycleGID()
-	if ok {
-		effectiveGID = containerGID
-	}
 
 	// Skip if no command is set.
 	if command == "" {
@@ -212,16 +217,19 @@ func executeCheckCommand(
 		return
 	}
 
-	// Execute command with fixed short timeout (1 minute).
-	// Check commands are lightweight health checks that should complete quickly,
-	// unlike update commands which may perform complex operations and use configurable timeouts.
+	// The container's lifecycle labels override the configured user.
+	effectiveUID, effectiveGID := cont.LifecycleUser(uid, gid)
+
+	minutes := timeout()
+
 	clog.Debug().
 		Str("command", command).
+		Int("timeout", minutes).
 		Msg("Executing " + phase + " command")
 
-	_, err := client.ExecuteCommand(ctx, cont, command, checkCommandTimeout, effectiveUID, effectiveGID)
+	_, err := client.ExecuteCommand(ctx, cont, command, minutes, effectiveUID, effectiveGID)
 	if err != nil {
-		// Match historical wording: "Pre-check command failed" / "Post-check command failed".
+		// The failure message names the phase, such as "Pre-check command failed".
 		failedMsg := "Pre-check command failed"
 		if phase == "post-check" {
 			failedMsg = "Post-check command failed"
@@ -254,11 +262,9 @@ func ExecutePreUpdateCommand(log *zerolog.Logger,
 	uid int,
 	gid int,
 ) (bool, error) {
-	timeout := container.PreUpdateTimeout()
 	command := container.GetLifecyclePreUpdateCommand()
 	clogVal := log.With().
 		Str("container", container.Name()).
-		Int("timeout", timeout).
 		Logger()
 	clog := &clogVal
 
@@ -278,20 +284,13 @@ func ExecutePreUpdateCommand(log *zerolog.Logger,
 		return false, nil
 	}
 
-	// Determine effective UID/GID: use container labels if set, otherwise use defaults.
-	effectiveUID := uid
+	// Only a hook that runs reads its timeout label, so an invalid label on a
+	// skipped hook logs no warning.
+	timeout := container.PreUpdateTimeout()
+	clogVal = clog.With().Int("timeout", timeout).Logger()
 
-	containerUID, ok := container.GetLifecycleUID()
-	if ok {
-		effectiveUID = containerUID
-	}
-
-	effectiveGID := gid
-
-	containerGID, ok := container.GetLifecycleGID()
-	if ok {
-		effectiveGID = containerGID
-	}
+	// The container's lifecycle labels override the configured user.
+	effectiveUID, effectiveGID := container.LifecycleUser(uid, gid)
 
 	// Execute command with configured timeout.
 	clog.Debug().
@@ -304,12 +303,8 @@ func ExecutePreUpdateCommand(log *zerolog.Logger,
 			Err(err).
 			Msg("Pre-update command failed")
 
-		return true, fmt.Errorf(
-			"%w for container %s: %w",
-			errPreUpdateFailed,
-			container.Name(),
-			err,
-		)
+		// The callers report the error with the container's name.
+		return true, fmt.Errorf("%w: %w", errPreUpdateFailed, err)
 	}
 
 	clog.Debug().
@@ -351,28 +346,11 @@ func ExecutePostUpdateCommand(log *zerolog.Logger,
 		return
 	}
 
-	timeout := newContainer.PostUpdateTimeout()
 	clogVal = log.With().
 		Str("container", newContainer.Name()).
-		Int("timeout", timeout).
 		Logger()
 	clog = &clogVal
 	command := newContainer.GetLifecyclePostUpdateCommand()
-
-	// Determine effective UID/GID: use container labels if set, otherwise use defaults.
-	effectiveUID := uid
-
-	containerUID, ok := newContainer.GetLifecycleUID()
-	if ok {
-		effectiveUID = containerUID
-	}
-
-	effectiveGID := gid
-
-	containerGID, ok := newContainer.GetLifecycleGID()
-	if ok {
-		effectiveGID = containerGID
-	}
 
 	// Skip if no command is set.
 	if len(command) == 0 {
@@ -380,6 +358,14 @@ func ExecutePostUpdateCommand(log *zerolog.Logger,
 
 		return
 	}
+
+	// Only a hook that runs reads its timeout label, so an invalid label on a
+	// skipped hook logs no warning.
+	timeout := newContainer.PostUpdateTimeout()
+	clogVal = clog.With().Int("timeout", timeout).Logger()
+
+	// The container's lifecycle labels override the configured user.
+	effectiveUID, effectiveGID := newContainer.LifecycleUser(uid, gid)
 
 	// Execute command with configured timeout.
 	clog.Debug().

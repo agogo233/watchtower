@@ -41,6 +41,7 @@ import (
 	containerImage "github.com/nicholas-fedor/watchtower/internal/container/image"
 	mockContainer "github.com/nicholas-fedor/watchtower/internal/container/mocks"
 	"github.com/nicholas-fedor/watchtower/internal/container/oci"
+	updateConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/update"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/containerfixture"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/httpstub"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/logcapture"
@@ -55,8 +56,8 @@ const mockContainerID = "container_id"
 type execCase struct {
 	// createErr fails the exec create.
 	createErr error
-	// startErr fails the exec start.
-	startErr error
+	// attachErr fails the attach that starts the exec.
+	attachErr error
 	// inspectErr fails the exec inspect.
 	inspectErr error
 	// containerID is the container the command runs in.
@@ -67,6 +68,8 @@ type execCase struct {
 	cmd string
 	// user is the exec user the command is expected to run as.
 	user string
+	// output is what the command writes before it exits.
+	output string
 	// exitCode is the exit code the exec reports.
 	exitCode int
 }
@@ -94,16 +97,23 @@ type startingDaemon struct {
 	requests int
 }
 
-// expectExec expects GetContainer's inspects of the container and its image,
-// then the exec create, start, attach, and inspect of an ExecuteCommand run,
-// stopping after a configured failure.
+// expectExec expects the Docker calls of an ExecuteCommand run, stopping after a configured failure.
 //
-// The attach fails, so the run continues without captured output.
+// The calls are, in order:
+//   - GetContainer's inspects of the container and its image
+//   - the exec create
+//   - the attach that starts the exec and streams its output
+//   - the exec inspect
+//
+// Any other exec call fails the test.
 //
 // Parameters:
+//   - t: Test the attach connection belongs to.
 //   - api: Mocked Docker API.
 //   - tc: The run to expect.
-func expectExec(api *mockContainer.MockAPIClient, tc execCase) {
+func expectExec(t *testing.T, api *mockContainer.MockAPIClient, tc execCase) {
+	t.Helper()
+
 	const imageName = "test-image:latest"
 
 	api.EXPECT().ContainerInspect(mock.Anything, tc.containerID, dockerClient.ContainerInspectOptions{}).
@@ -139,17 +149,18 @@ func expectExec(api *mockContainer.MockAPIClient, tc execCase) {
 		return
 	}
 
-	// ExecStart must detach, or the daemon blocks until the command finishes
-	// and the attach that follows fails with "exec command is already running".
-	api.EXPECT().ExecStart(mock.Anything, tc.execID, dockerClient.ExecStartOptions{Detach: true, TTY: true}).
-		Return(dockerClient.ExecStartResult{}, tc.startErr).Once()
-
-	if tc.startErr != nil {
-		return
+	attached := dockerClient.ExecAttachResult{}
+	if tc.attachErr == nil {
+		attached = newExecOutput(t, func(conn net.Conn) { _, _ = io.WriteString(conn, tc.output) })
 	}
 
 	api.EXPECT().ExecAttach(mock.Anything, tc.execID, dockerClient.ExecAttachOptions{TTY: true}).
-		Return(dockerClient.ExecAttachResult{}, errors.New("cannot hijack the connection")).Once()
+		Return(attached, tc.attachErr).Once()
+
+	if tc.attachErr != nil {
+		return
+	}
+
 	api.EXPECT().ExecInspect(mock.Anything, tc.execID, dockerClient.ExecInspectOptions{}).
 		Return(dockerClient.ExecInspectResult{ID: tc.execID, ContainerID: tc.containerID, ExitCode: tc.exitCode}, tc.inspectErr).Once()
 }
@@ -926,7 +937,7 @@ func TestClient(t *testing.T) {
 				t.Parallel()
 
 				api := newDockerAPI(t)
-				expectExec(api, execCase{containerID: "ex-cont-id", execID: "ex-exec-id", cmd: "exec-cmd"})
+				expectExec(t, api, execCase{containerID: "ex-cont-id", execID: "ex-exec-id", cmd: "exec-cmd"})
 
 				log, logOutput := logcapture.New(zerolog.DebugLevel)
 				c := &client{log: log, api: api}
@@ -943,7 +954,7 @@ func TestClient(t *testing.T) {
 				t.Parallel()
 
 				api := newDockerAPI(t)
-				expectExec(api, execCase{containerID: "ex-cont-id", execID: "ex-exec-id", cmd: "exec-cmd", exitCode: 75})
+				expectExec(t, api, execCase{containerID: "ex-cont-id", execID: "ex-exec-id", cmd: "exec-cmd", exitCode: 75})
 
 				log, logOutput := logcapture.New(zerolog.DebugLevel)
 				c := &client{log: log, api: api}
@@ -968,7 +979,7 @@ func TestClient(t *testing.T) {
 			t.Helper()
 
 			api := newDockerAPI(t)
-			expectExec(api, tc)
+			expectExec(t, api, tc)
 
 			c := &client{log: newTestLogger(t), api: api}
 
@@ -993,11 +1004,66 @@ func TestClient(t *testing.T) {
 		t.Run("command exits with non-zero code", func(t *testing.T) {
 			t.Parallel()
 
-			t.Run("should return error", func(t *testing.T) {
+			// Output written inside the container is untrusted. Its text
+			// reaches the error without escape sequences or control characters.
+			t.Run("should end the error with the printable output", func(t *testing.T) {
 				t.Parallel()
 
-				_, err := run(t, execCase{containerID: "ex-cont-id", execID: "failure-exec-id", cmd: "failure-cmd", exitCode: 1}, 0, 0)
-				require.ErrorContains(t, err, "command execution failed")
+				_, err := run(t, execCase{
+					containerID: "ex-cont-id",
+					execID:      "failure-exec-id",
+					cmd:         "failure-cmd",
+					output:      "\x1b]0;owned\a\x1b[31mfailed\x1b[0m\r\nsee \u202elog\r\n",
+					exitCode:    1,
+				}, 0, 0)
+				require.EqualError(t, err, "command execution failed with exit code 1: failed | see log")
+			})
+
+			// Each notification entry is a line of its own. Output kept on one
+			// line cannot add a line that reads like a Watchtower message.
+			t.Run("should keep the output on one line", func(t *testing.T) {
+				t.Parallel()
+
+				_, err := run(t, execCase{
+					containerID: "ex-cont-id",
+					execID:      "failure-exec-id",
+					cmd:         "failure-cmd",
+					output:      "backup failed\n\nStarted new container: db (abc123)\n",
+					exitCode:    1,
+				}, 0, 0)
+				require.EqualError(t, err,
+					"command execution failed with exit code 1: backup failed | Started new container: db (abc123)")
+			})
+
+			t.Run("should replace URL credentials in the output", func(t *testing.T) {
+				t.Parallel()
+
+				_, err := run(t, execCase{
+					containerID: "ex-cont-id",
+					execID:      "failure-exec-id",
+					cmd:         "failure-cmd",
+					output:      "clone https://bot:ghp_abc@github.com/org/app.git failed\n",
+					exitCode:    1,
+				}, 0, 0)
+				require.EqualError(t, err,
+					"command execution failed with exit code 1: clone https://xxxxx:xxxxx@github.com/org/app.git failed")
+			})
+
+			// Empty output adds nothing to the error. Neither does output that
+			// cleaning empties.
+			t.Run("should end the error at the exit code when there is no output", func(t *testing.T) {
+				t.Parallel()
+
+				for _, output := range []string{"", "\x1b[0m\r\n"} {
+					_, err := run(t, execCase{
+						containerID: "ex-cont-id",
+						execID:      "failure-exec-id",
+						cmd:         "failure-cmd",
+						output:      output,
+						exitCode:    1,
+					}, 0, 0)
+					require.EqualError(t, err, "command execution failed with exit code 1")
+				}
 			})
 
 			t.Run("should report the command failure rather than an inspect failure", func(t *testing.T) {
@@ -1042,9 +1108,11 @@ func TestClient(t *testing.T) {
 			})
 		})
 
-		t.Run("ExecStart fails", func(t *testing.T) {
+		t.Run("exec cannot start", func(t *testing.T) {
 			t.Parallel()
 
+			// The attach starts the exec. A failed attach means the command never
+			// ran. That must not be taken for a command that exited with 0.
 			t.Run("should return error containing 'failed to start exec'", func(t *testing.T) {
 				t.Parallel()
 
@@ -1052,7 +1120,7 @@ func TestClient(t *testing.T) {
 					containerID: "ex-cont-id",
 					execID:      "start-fail-exec-id",
 					cmd:         "start-fail-cmd",
-					startErr:    daemonError("exec start failed"),
+					attachErr:   daemonError("exec start failed"),
 				}, 0, 0)
 				require.ErrorContains(t, err, "failed to start exec")
 			})
@@ -1074,38 +1142,10 @@ func TestClient(t *testing.T) {
 				assert.False(t, skipUpdate)
 			})
 		})
-
-		t.Run("ExecStart is called", func(t *testing.T) {
-			t.Parallel()
-
-			t.Run("should use Detach true to prevent blocking on command execution", func(t *testing.T) {
-				t.Parallel()
-
-				// expectExec matches only an ExecStart with Detach: true.
-				skipUpdate, err := run(t, execCase{
-					containerID: "detach-test-cont-id",
-					execID:      "detach-test-exec-id",
-					cmd:         "detach-test-cmd",
-				}, 0, 0)
-				require.NoError(t, err)
-				assert.False(t, skipUpdate)
-			})
-		})
 	})
 
-	t.Run("captureExecOutput", func(t *testing.T) {
+	t.Run("readExecOutput", func(t *testing.T) {
 		t.Parallel()
-
-		t.Run("should return error when attach fails", func(t *testing.T) {
-			t.Parallel()
-
-			api := newDockerAPI(t)
-			api.EXPECT().ExecAttach(mock.Anything, "exec-id", dockerClient.ExecAttachOptions{TTY: true}).
-				Return(dockerClient.ExecAttachResult{}, daemonError("attach failed")).Once()
-
-			_, err := (&client{log: newTestLogger(t), api: api}).captureExecOutput(t.Context(), "exec-id")
-			require.ErrorContains(t, err, "failed to attach")
-		})
 
 		t.Run("should handle context cancellation", func(t *testing.T) {
 			t.Parallel()
@@ -1113,27 +1153,71 @@ func TestClient(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			cancel()
 
-			// The output never arrives, so only the cancellation ends the read.
-			api := newDockerAPI(t)
-			api.EXPECT().ExecAttach(mock.Anything, "exec-id", dockerClient.ExecAttachOptions{TTY: true}).
-				Return(newExecOutput(t, nil), nil).Once()
-
-			_, err := (&client{log: newTestLogger(t), api: api}).captureExecOutput(ctx, "exec-id")
+			// The output never arrives. Only the cancellation ends the read.
+			_, err := readExecOutput(ctx, newExecOutput(t, nil))
 			require.ErrorIs(t, err, context.Canceled)
 		})
 
-		t.Run("should truncate output that exceeds the size cap", func(t *testing.T) {
+		// Cancelling while a command still writes ends the read and closes the
+		// stream. The writer's next write then fails instead of blocking.
+		t.Run("should stop reading when cancelled mid-stream", func(t *testing.T) {
 			t.Parallel()
 
-			api := newDockerAPI(t)
-			api.EXPECT().ExecAttach(mock.Anything, "exec-id", dockerClient.ExecAttachOptions{TTY: true}).
-				Return(newExecOutput(t, func(conn net.Conn) {
-					_, _ = io.WriteString(conn, strings.Repeat("x", maxExecOutputSize+4096))
-				}), nil).Once()
+			ctx, cancel := context.WithCancel(t.Context())
+			writerDone := make(chan struct{})
 
-			out, err := (&client{log: newTestLogger(t), api: api}).captureExecOutput(t.Context(), "exec-id")
+			output := newExecOutput(t, func(conn net.Conn) {
+				defer close(writerDone)
+
+				chunk := []byte(strings.Repeat("x", 512))
+
+				_, err := conn.Write(chunk)
+				if err != nil {
+					return
+				}
+
+				cancel()
+
+				for err == nil {
+					_, err = conn.Write(chunk)
+				}
+			})
+
+			_, err := readExecOutput(ctx, output)
+			require.ErrorIs(t, err, context.Canceled)
+
+			select {
+			case <-writerDone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the writer stayed blocked after the read ended")
+			}
+		})
+
+		// The command's whole write succeeds only if all of it is read. A
+		// stream closed at the limit would fail it.
+		t.Run("should read the whole output and keep its last 2 KiB", func(t *testing.T) {
+			t.Parallel()
+
+			writeErr := make(chan error, 1)
+			output := newExecOutput(t, func(conn net.Conn) {
+				_, err := io.WriteString(conn, strings.Repeat("x", 4*maxExecOutput)+"the end")
+				writeErr <- err
+			})
+
+			out, err := readExecOutput(t.Context(), output)
 			require.NoError(t, err)
-			assert.Len(t, out, maxExecOutputSize)
+			assert.Equal(t, droppedOutputMarker+strings.Repeat("x", maxExecOutput-len("the end"))+"the end", out)
+			require.NoError(t, <-writeErr)
+		})
+
+		t.Run("should not mark output that was kept whole", func(t *testing.T) {
+			t.Parallel()
+
+			out, err := readExecOutput(t.Context(), newExecOutput(t, func(conn net.Conn) {
+				_, _ = io.WriteString(conn, strings.Repeat("x", maxExecOutput))
+			}))
+			require.NoError(t, err)
+			assert.Equal(t, strings.Repeat("x", maxExecOutput), out)
 		})
 	})
 
@@ -1431,19 +1515,34 @@ func TestClientEnvironment(t *testing.T) {
 			server := httpstub.New(t)
 			useDockerTLS(t, server, httpstub.NewTLS(t))
 
-			_, err := NewClient(newTestLogger(t), ClientOptions{}).GetInfo(t.Context())
+			client, err := NewClient(t.Context(), newTestLogger(t), ClientOptions{})
+			require.NoError(t, err)
+
+			_, err = client.GetInfo(t.Context())
 			require.ErrorContains(t, err, "failed to get system info")
 			assert.Empty(t, server.ReceivedRequests())
 		})
 	})
 
 	t.Run("NewClient", func(t *testing.T) {
+		t.Run("should return an error when DOCKER_HOST cannot be parsed", func(t *testing.T) {
+			t.Setenv("DOCKER_HOST", "tcp://[::1")
+			t.Setenv("DOCKER_TLS_VERIFY", "")
+			t.Setenv("DOCKER_API_VERSION", "")
+
+			client, err := NewClient(t.Context(), newTestLogger(t), ClientOptions{})
+			require.ErrorContains(t, err, "create Docker client")
+			assert.Nil(t, client)
+		})
+
 		t.Run("should successfully connect with TLS when DOCKER_TLS_VERIFY=1 and DOCKER_HOST points to TLS server", func(t *testing.T) {
 			server := httpstub.NewTLS(t)
 			server.AppendHandlers(respondToPing(t, http.MethodHead, http.StatusOK, "1.45"))
 			useDockerTLS(t, server, server)
 
-			require.NotNil(t, NewClient(newTestLogger(t), ClientOptions{}))
+			client, err := NewClient(t.Context(), newTestLogger(t), ClientOptions{})
+			require.NoError(t, err)
+			require.NotNil(t, client)
 
 			requests := server.ReceivedRequests()
 			require.Len(t, requests, 1)
@@ -1454,7 +1553,7 @@ func TestClientEnvironment(t *testing.T) {
 			server := httpstub.New(t)
 			useDockerTLS(t, server, httpstub.NewTLS(t))
 
-			assert.NotPanics(t, func() { NewClient(newTestLogger(t), ClientOptions{}) })
+			assert.NotPanics(t, func() { _, _ = NewClient(t.Context(), newTestLogger(t), ClientOptions{}) })
 			assert.Empty(t, server.ReceivedRequests(), "no plain HTTP request is sent")
 		})
 
@@ -1463,7 +1562,9 @@ func TestClientEnvironment(t *testing.T) {
 			server.AppendHandlers(respondToPing(t, http.MethodHead, http.StatusOK, "1.45"))
 			useDockerTLS(t, server, server)
 
-			assert.Equal(t, "1.45", NewClient(newTestLogger(t), ClientOptions{}).GetVersion())
+			client, err := NewClient(t.Context(), newTestLogger(t), ClientOptions{})
+			require.NoError(t, err)
+			assert.Equal(t, "1.45", client.GetVersion())
 		})
 
 		t.Run("should use forced API version with TLS", func(t *testing.T) {
@@ -1474,7 +1575,9 @@ func TestClientEnvironment(t *testing.T) {
 			useDockerTLS(t, server, server)
 			t.Setenv("DOCKER_API_VERSION", "1.44")
 
-			assert.Equal(t, "1.44", NewClient(newTestLogger(t), ClientOptions{}).GetVersion())
+			client, err := NewClient(t.Context(), newTestLogger(t), ClientOptions{})
+			require.NoError(t, err)
+			assert.Equal(t, "1.44", client.GetVersion())
 		})
 
 		t.Run("should fall back to negotiation when the forced API version is newer than the daemon's", func(t *testing.T) {
@@ -1488,7 +1591,9 @@ func TestClientEnvironment(t *testing.T) {
 			useDockerTLS(t, server, server)
 			t.Setenv("DOCKER_API_VERSION", "1.47")
 
-			assert.Equal(t, "1.45", NewClient(newTestLogger(t), ClientOptions{}).GetVersion())
+			client, err := NewClient(t.Context(), newTestLogger(t), ClientOptions{})
+			require.NoError(t, err)
+			assert.Equal(t, "1.45", client.GetVersion())
 			assert.Len(t, server.ReceivedRequests(), 2)
 		})
 
@@ -1504,7 +1609,9 @@ func TestClientEnvironment(t *testing.T) {
 			useDockerTLS(t, server, server)
 			t.Setenv("DOCKER_API_VERSION", "1.99")
 
-			assert.Equal(t, "1.45", NewClient(newTestLogger(t), ClientOptions{}).GetVersion())
+			client, err := NewClient(t.Context(), newTestLogger(t), ClientOptions{})
+			require.NoError(t, err)
+			assert.Equal(t, "1.45", client.GetVersion())
 			assert.Len(t, server.ReceivedRequests(), 3)
 		})
 	})
@@ -1766,20 +1873,22 @@ func TestClientWrappers(t *testing.T) {
 	t.Run("IsContainerStale reports a newer local image", func(t *testing.T) {
 		t.Parallel()
 
-		currentImageID := "sha256:" + randomSHA256()
-		newImageID := "sha256:" + randomSHA256()
+		currentImageID := "sha256:" + containerfixture.RandomID()
+		newImageID := "sha256:" + containerfixture.RandomID()
 
 		api := newImageAPI(t)
 		api.EXPECT().ImageInspect(mock.Anything, "test-image:latest").Return(inspected(newImageID), nil).Once()
 
 		stale, latestID, _, err := (&client{log: newTestLogger(t), api: api}).IsContainerStale(
-			t.Context(), runningImage(currentImageID), types.UpdateParams{NoPull: true},
+			t.Context(), runningImage(currentImageID), updateConfig.Policy{NoPull: true},
 		)
 		require.NoError(t, err)
 		assert.True(t, stale)
 		assert.Equal(t, types.ImageID(newImageID), latestID)
 	})
 
+	// The image client's error names the failure. The update session's warning
+	// says what was being checked. The client adds no prefix of its own.
 	t.Run("IsContainerStale reports a failed check", func(t *testing.T) {
 		t.Parallel()
 
@@ -1788,21 +1897,21 @@ func TestClientWrappers(t *testing.T) {
 			Return(dockerClient.ImageInspectResult{}, daemonError("inspect failed")).Once()
 
 		_, _, _, err := (&client{log: newTestLogger(t), api: api}).IsContainerStale(
-			t.Context(), runningImage("sha256:"+randomSHA256()), types.UpdateParams{NoPull: true},
+			t.Context(), runningImage("sha256:"+containerfixture.RandomID()), updateConfig.Policy{NoPull: true},
 		)
-		require.Error(t, err)
+		require.EqualError(t, err, "failed to inspect image: test-image:latest: Error response from daemon: inspect failed")
 	})
 
 	t.Run("CheckContainerUpdate checks the local image with no-pull", func(t *testing.T) {
 		t.Parallel()
 
-		currentImageID := "sha256:" + randomSHA256()
+		currentImageID := "sha256:" + containerfixture.RandomID()
 
 		api := newImageAPI(t)
 		api.EXPECT().ImageInspect(mock.Anything, "test-image:latest").Return(inspected(currentImageID), nil).Once()
 
 		available, latestID, _, err := (&client{log: newTestLogger(t), api: api}).CheckContainerUpdate(
-			t.Context(), runningImage(currentImageID), types.UpdateParams{NoPull: true},
+			t.Context(), runningImage(currentImageID), updateConfig.Policy{NoPull: true},
 		)
 		require.NoError(t, err)
 		assert.False(t, available)
@@ -1817,7 +1926,7 @@ func TestClientWrappers(t *testing.T) {
 			Return(dockerClient.ImageInspectResult{}, daemonError("inspect failed")).Once()
 
 		_, _, _, err := (&client{log: newTestLogger(t), api: api}).CheckContainerUpdate(
-			t.Context(), runningImage("sha256:"+randomSHA256()), types.UpdateParams{NoPull: true},
+			t.Context(), runningImage("sha256:"+containerfixture.RandomID()), updateConfig.Policy{NoPull: true},
 		)
 		require.Error(t, err)
 	})
@@ -1825,7 +1934,7 @@ func TestClientWrappers(t *testing.T) {
 	t.Run("RemoveImageByID removes an unused image", func(t *testing.T) {
 		t.Parallel()
 
-		imageID := types.ImageID("sha256:" + randomSHA256())
+		imageID := types.ImageID("sha256:" + containerfixture.RandomID())
 
 		api := newDockerAPI(t)
 		api.EXPECT().ContainerList(mock.Anything, dockerClient.ContainerListOptions{All: true}).
@@ -1840,7 +1949,7 @@ func TestClientWrappers(t *testing.T) {
 	t.Run("RemoveImageByID reports an image still in use", func(t *testing.T) {
 		t.Parallel()
 
-		imageID := types.ImageID("sha256:" + randomSHA256())
+		imageID := types.ImageID("sha256:" + containerfixture.RandomID())
 
 		api := newDockerAPI(t)
 		api.EXPECT().ContainerList(mock.Anything, dockerClient.ContainerListOptions{All: true}).
@@ -2179,6 +2288,8 @@ func TestPingUntilServing(t *testing.T) {
 		notReadyStatus int
 		transportErr   error
 		status         int
+		// callerTimeout bounds the caller's context. Zero leaves it unbounded.
+		callerTimeout time.Duration
 		// wantWait is how long the wait takes, and wantRequests how many
 		// requests it sends. A ping that gets no answer sends a HEAD and
 		// then a GET.
@@ -2248,6 +2359,26 @@ func TestPingUntilServing(t *testing.T) {
 			wantErr:      true,
 		},
 		{
+			name:          "caller's deadline ends the wait early",
+			ready:         time.Hour,
+			callerTimeout: 5 * time.Second,
+			wantWait:      5 * time.Second,
+			wantRequests:  2,
+			wantErr:       true,
+		},
+		{
+			// Pings at 0, 1, and 3 seconds are refused. The next would come
+			// after the caller's deadline.
+			name:          "caller's deadline ends the retries early",
+			ready:         time.Hour,
+			notReadyErr:   refused,
+			callerTimeout: 5 * time.Second,
+			wantWait:      5 * time.Second,
+			wantRequests:  6,
+			wantErr:       true,
+			wantLog:       "timeout=5s",
+		},
+		{
 			name:         "daemon that rejects the ping ends the wait at once",
 			status:       http.StatusForbidden,
 			wantRequests: 2,
@@ -2276,7 +2407,16 @@ func TestPingUntilServing(t *testing.T) {
 				}
 				log, logOutput := logcapture.New(zerolog.DebugLevel)
 
-				result, err := pingUntilServing(log, newStartingDaemonClient(t, daemon))
+				ctx := t.Context()
+
+				if tt.callerTimeout != 0 {
+					var cancel context.CancelFunc
+
+					ctx, cancel = context.WithTimeout(ctx, tt.callerTimeout)
+					defer cancel()
+				}
+
+				result, err := pingUntilServing(ctx, log, newStartingDaemonClient(t, daemon))
 
 				assert.Equal(t, tt.wantWait, time.Since(start))
 				assert.Equal(t, tt.wantRequests, daemon.requests)
@@ -2304,7 +2444,7 @@ func TestNegotiateDockerAPI_WaitsForDaemon(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		daemon := &startingDaemon{ready: time.Now().Add(75 * time.Second)}
 
-		cli, result, err := negotiateDockerAPI(newTestLogger(t), newStartingDaemonClient(t, daemon))
+		cli, result, err := negotiateDockerAPI(t.Context(), newTestLogger(t), newStartingDaemonClient(t, daemon))
 		require.NoError(t, err)
 		assert.Equal(t, "1.45", result.APIVersion)
 		assert.Equal(t, "1.45", cli.ClientVersion())

@@ -1,5 +1,7 @@
 package labels
 
+import "math"
+
 // Watchtower labels identify the containers Watchtower manages and configure how it updates them.
 const (
 	// Watchtower marks a container as the Watchtower instance itself when set to "true".
@@ -39,6 +41,10 @@ const (
 	LifecyclePreUpdate = "com.centurylinklabs.watchtower.lifecycle.pre-update"
 	// LifecyclePostUpdate specifies a command to run after updating the container.
 	LifecyclePostUpdate = "com.centurylinklabs.watchtower.lifecycle.post-update"
+	// LifecyclePreCheckTimeout sets the timeout (in minutes) for the pre-check command.
+	LifecyclePreCheckTimeout = "com.centurylinklabs.watchtower.lifecycle.pre-check-timeout"
+	// LifecyclePostCheckTimeout sets the timeout (in minutes) for the post-check command.
+	LifecyclePostCheckTimeout = "com.centurylinklabs.watchtower.lifecycle.post-check-timeout"
 	// LifecyclePreUpdateTimeout sets the timeout (in minutes) for the pre-update command.
 	LifecyclePreUpdateTimeout = "com.centurylinklabs.watchtower.lifecycle.pre-update-timeout"
 	// LifecyclePostUpdateTimeout sets the timeout (in minutes) for the post-update command.
@@ -78,3 +84,32 @@ const (
 	// ComposeDir is a path inside Watchtower to the Compose project directory.
 	ComposeDir = "com.centurylinklabs.watchtower.compose-dir"
 )
+
+// Label values with a fixed meaning.
+const (
+	// NoScope is the scope of a container whose scope label is unset, empty, or
+	// set to "none".
+	NoScope = "none"
+)
+
+// Limits on label values.
+const (
+	// MaxLifecycleID is the highest UID or GID that lifecycle hooks can run as.
+	// The container runtime rejects a larger numeric ID.
+	MaxLifecycleID = math.MaxInt32
+)
+
+// NormalizeScope returns scope, or [NoScope] when scope is empty.
+//
+// Parameters:
+//   - scope: A scope label value or a configured scope.
+//
+// Returns:
+//   - string: The scope, with an empty one as [NoScope].
+func NormalizeScope(scope string) string {
+	if scope == "" {
+		return NoScope
+	}
+
+	return scope
+}

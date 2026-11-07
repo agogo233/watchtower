@@ -41,6 +41,7 @@ func (r stubReport) Stale() []report.ContainerReport     { return nil }
 func (r stubReport) Fresh() []report.ContainerReport     { return nil }
 func (r stubReport) Restarted() []report.ContainerReport { return nil }
 func (r stubReport) All() []report.ContainerReport       { return r.scanned }
+func (r stubReport) Focus() report.ContainerReport       { return nil }
 
 func (c stubContainerError) ID() report.ContainerID             { return c.id }
 func (c stubContainerError) Name() string                       { return c.name }

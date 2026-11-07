@@ -1,13 +1,10 @@
-// Package schedule runs container updates on a schedule.
-//
-// It serializes scheduled updates with updates triggered through the HTTP API,
-// and lets a running update finish when the process shuts down.
 package schedule
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -17,6 +14,7 @@ import (
 
 	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
 	"github.com/nicholas-fedor/watchtower/internal/observability/metrics"
+	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
@@ -57,10 +55,117 @@ func waitForRunningUpdate(log *zerolog.Logger, ctx context.Context, lock *Update
 	log.Debug().Msg("Lock check completed.")
 }
 
+// skipIfStillRunning returns a cron job wrapper that skips a scheduled run
+// while the previous one is still running, including while it waits for an
+// update started through the HTTP API.
+//
+// Each skip is logged at debug and counted as a skipped scan.
+//
+// Parameters:
+//   - log: Scheduler logger.
+//
+// Returns:
+//   - cron.JobWrapper: Wrapper for the scheduler's job chain.
+func skipIfStillRunning(log *zerolog.Logger) cron.JobWrapper {
+	return func(job cron.Job) cron.Job {
+		running := make(chan struct{}, 1)
+
+		return cron.FuncJob(func() {
+			select {
+			case running <- struct{}{}:
+				defer func() { <-running }()
+
+				job.Run()
+			default:
+				log.Debug().Msg("Update skipped: the previous scheduled update is still running")
+				metrics.Default().RegisterSkippedScan()
+			}
+		})
+	}
+}
+
+// recoverPanics returns a cron job wrapper that recovers a panic in a
+// scheduled run, so later runs still start on schedule.
+//
+// The update session recovers and notifies its own panics. This wrapper covers
+// the scheduler code around the session, so it logs the panic value and stack
+// at error without notifying.
+//
+// Parameters:
+//   - log: Scheduler logger.
+//
+// Returns:
+//   - cron.JobWrapper: Wrapper for the scheduler's job chain.
+func recoverPanics(log *zerolog.Logger) cron.JobWrapper {
+	return func(job cron.Job) cron.Job {
+		return cron.FuncJob(func() {
+			defer func() {
+				recovered := recover()
+				if recovered == nil {
+					return
+				}
+
+				log.Error().
+					Str("notify", "no").
+					Str("error", fmt.Sprint(recovered)).
+					Str("stack", string(debug.Stack())).
+					Msg("Scheduled run panicked")
+			}()
+
+			job.Run()
+		})
+	}
+}
+
+// writeStartupMessage writes the startup message while it holds the update
+// lock.
+//
+// The HTTP API can start an update as soon as it serves, before this message.
+// Because every update holds the lock, the message never opens its
+// notification batch while an update's batch is open. It waits for an update
+// that holds the lock and writes nothing when ctx is done first. The first
+// scheduled run time is read once the lock is taken, after any such wait.
+//
+// Parameters:
+//   - ctx: Context that ends the wait for the lock.
+//   - lock: Update lock shared with every caller that starts updates.
+//   - scheduler: Cron scheduler that holds the update schedule.
+//   - deps: Schedule dependencies. Startup holds the message's fields.
+//     WriteStartupMessage writes it.
+//
+// Returns:
+//   - bool: True when another update held the lock and the message waited for
+//     it.
+func writeStartupMessage(ctx context.Context, lock *UpdateLock, scheduler *cron.Cron, deps ScheduleDeps) bool {
+	waited := !lock.TryLock()
+	if waited && lock.Lock(ctx) != nil {
+		return waited
+	}
+	defer lock.Unlock()
+
+	var nextRun time.Time
+	if entries := scheduler.Entries(); len(entries) > 0 {
+		nextRun = entries[0].Schedule.Next(time.Now())
+	}
+
+	// The update at startup is skipped after a wait, so the message does not
+	// announce it.
+	updateOnStart := deps.UpdateOnStart && !waited
+
+	// Startup holds every other field of the message. Only the scheduler's
+	// own values are set here.
+	startup := deps.Startup
+	startup.Sched = nextRun
+	startup.UpdateOnStart = &updateOnStart
+	deps.WriteStartupMessage(startup)
+
+	return waited
+}
+
 // ScheduleDeps holds dependencies for scheduled update runs.
 //
-// BaseParams must be a complete types.UpdateParams snapshot from config.UpdateParams
-// (or an equivalent full construction).
+// BaseParams must be a complete [updateParams.Params] snapshot built from the
+// process configuration.
 // Each tick copies BaseParams and applies only per-run fields such as SkipSelfUpdate.
 // A tick can disable self-updates, but never enables them when BaseParams disables them.
 type ScheduleDeps struct {
@@ -72,18 +177,20 @@ type ScheduleDeps struct {
 	// caller that starts updates, such as the HTTP API. Nil gives the scheduler
 	// a lock of its own.
 	Lock *UpdateLock
+	// WriteStartupMessage writes the startup message with scheduling information.
+	WriteStartupMessage func(logging.StartupParams)
+	// RunUpdate performs container updates and sends notifications.
+	RunUpdate func(context.Context, types.Filter, updateParams.Params) *metrics.Metric
 	// ScheduleSpec is the cron-formatted schedule string for periodic updates.
 	ScheduleSpec string
 	// Startup holds resolved values for startup messaging (no flag reads).
 	// Callers must set Filtering, Scope, Client, Notifier, and Version on Startup.
 	// RunUpgradesOnSchedule only applies Sched and UpdateOnStart at send time.
 	Startup logging.StartupParams
-	// WriteStartupMessage writes the startup message with scheduling information.
-	WriteStartupMessage func(logging.StartupParams)
-	// RunUpdate performs container updates and sends notifications.
-	RunUpdate func(context.Context, types.Filter, types.UpdateParams) *metrics.Metric
-	// Notifier is closed on schedule shutdown. Prefer Startup.Notifier for messaging.
-	Notifier types.Notifier
+	// BaseParams is the complete update policy snapshot for every scheduled tick.
+	// Must include Cleanup, MonitorOnly, UseComposeDependsOn, ReviveStopped, and
+	// all other process-wide [updateParams.Params] fields.
+	BaseParams updateParams.Params
 	// UpdateOnStart triggers an immediate update before the scheduler starts.
 	UpdateOnStart bool
 	// SkipFirstRun skips Watchtower self-update on the first scheduled run
@@ -92,10 +199,6 @@ type ScheduleDeps struct {
 	// StartupMessageSent is true when the startup message was already sent
 	// (for example by the HTTP API in blocking mode).
 	StartupMessageSent bool
-	// BaseParams is the complete update policy snapshot for every scheduled tick.
-	// Must include Cleanup, MonitorOnly, UseComposeDependsOn, ReviveStopped, and
-	// all other process-wide UpdateParams fields.
-	BaseParams types.UpdateParams
 }
 
 // RunUpgradesOnSchedule schedules and executes periodic container updates according to the cron specification.
@@ -130,8 +233,8 @@ func RunUpgradesOnSchedule(ctx context.Context, deps ScheduleDeps) error {
 			),
 		),
 		cron.WithChain(
-			cron.SkipIfStillRunning(cron.DefaultLogger),
-			cron.Recover(cron.DefaultLogger),
+			skipIfStillRunning(log),
+			recoverPanics(log),
 		),
 	)
 
@@ -149,6 +252,7 @@ func RunUpgradesOnSchedule(ctx context.Context, deps ScheduleDeps) error {
 			}
 		} else if !lock.TryLock() {
 			log.Debug().Msg("Update skipped: another update is currently running")
+			metrics.Default().RegisterSkippedScan()
 
 			return
 		}
@@ -183,10 +287,7 @@ func RunUpgradesOnSchedule(ctx context.Context, deps ScheduleDeps) error {
 			return
 		}
 
-		metric := deps.RunUpdate(ctx, updateFilter, params)
-		if metric != nil {
-			metrics.Default().RegisterScan(metric)
-		}
+		metrics.Default().RegisterScan(deps.RunUpdate(ctx, updateFilter, params))
 
 		log.Debug().Msg("Update operation completed")
 
@@ -227,33 +328,29 @@ func RunUpgradesOnSchedule(ctx context.Context, deps ScheduleDeps) error {
 			scheduledUpdateFunc,
 		)
 		if err != nil {
-			return fmt.Errorf("failed to schedule updates: %w", err)
+			return fmt.Errorf("invalid schedule %q: %w", scheduleSpec, err)
 		}
 	}
 
-	// Log startup message with the first scheduled run time.
-	// Skip if the startup message was already sent (e.g., by the HTTP API in blocking mode).
-	var nextRun time.Time
-	if len(scheduler.Entries()) > 0 {
-		nextRun = scheduler.Entries()[0].Schedule.Next(time.Now())
-	}
-
-	// Log startup message with the first scheduled run time.
-	// Skip if the startup message was already sent (for example by the HTTP API in blocking mode).
-	// Startup is the single source of truth for messaging fields (Filtering, Scope, Client,
-	// Notifier, Version). Only apply scheduler-owned runtime values here.
+	// Skip the startup message if it was already sent (for example by the HTTP
+	// API in blocking mode).
+	waitedForUpdate := false
 	if !deps.StartupMessageSent && deps.WriteStartupMessage != nil {
-		startup := deps.Startup
-		startup.Sched = nextRun
-		startup.UpdateOnStart = &deps.UpdateOnStart
-		deps.WriteStartupMessage(startup)
+		waitedForUpdate = writeStartupMessage(ctx, lock, scheduler, deps)
 	}
 
 	// Check if update-on-start is enabled and trigger immediate update if so.
 	// Skip it when the process is already stopping, so a canceled update is not
-	// reported as a failure.
+	// reported as a failure. The update at startup does not wait for another
+	// update. When the startup message had to wait for one, the update at
+	// startup is skipped as it is when it finds the lock taken.
 	if deps.UpdateOnStart && ctx.Err() == nil {
-		updateFunc(false, false)
+		if waitedForUpdate {
+			log.Debug().Msg("Update skipped: another update was running at startup")
+			metrics.Default().RegisterSkippedScan()
+		} else {
+			updateFunc(false, false)
+		}
 	}
 
 	// Start the scheduler to begin periodic execution if scheduling is enabled.
@@ -271,7 +368,7 @@ func RunUpgradesOnSchedule(ctx context.Context, deps ScheduleDeps) error {
 	log.Debug().Msg("Waiting for running update to be finished...")
 
 	// Original ctx is often already canceled at shutdown. Detach cancel and
-	// apply a bound so an active RunUpdate can finish before Notifier.Close().
+	// apply a bound so an active RunUpdate can finish and send its notifications.
 	waitCtx, waitCancel := context.WithTimeout(
 		context.WithoutCancel(ctx),
 		updateWaitTimeout,
@@ -279,11 +376,6 @@ func RunUpgradesOnSchedule(ctx context.Context, deps ScheduleDeps) error {
 	defer waitCancel()
 
 	waitForRunningUpdate(log, waitCtx, lock)
-
-	// Close the notification system to clean up resources during shutdown.
-	if deps.Notifier != nil {
-		deps.Notifier.Close()
-	}
 
 	log.Debug().Msg("Scheduler stopped and update completed.")
 

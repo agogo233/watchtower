@@ -63,6 +63,13 @@ task lint
 ```
 
 This runs Golangci-lint with the project configuration and applies automatic fixes where possible (for example, `modernize` rewrites).
+It also checks struct field order with [betteralign](https://github.com/dkorunic/betteralign), which can be installed with:
+
+```bash
+go install github.com/dkorunic/betteralign/cmd/betteralign@latest
+```
+
+A struct whose field order must stay fixed, such as one that mirrors an external binary layout, opts out with a `// betteralign:ignore` comment on its opening-brace line.
 To check for issues without modifying any files, run:
 
 ```bash
@@ -71,7 +78,7 @@ task lint:check
 
 ## Formatting
 
-Golangci-lint can also be used to format the codebase:
+The following task formats the codebase with Golangci-lint and orders struct fields with betteralign to reduce padding:
 
 ```bash
 task fmt
@@ -160,7 +167,7 @@ task test:update-golden
 ```
 
 The template preview module in `tools/tplprev` cannot import Watchtower, so it keeps a generated copy of the built-in notification templates, along with generated lists of the container report methods templates can call and the container keys in the JSON output.
-A test fails when these copies differ from `pkg/notifications`, and the preview module's own tests check its report type and JSON output against the lists.
+A test fails when these copies differ from the originals in `internal/observability/notify/format`, and the preview module's own tests check its report type and JSON output against the lists.
 After changing a built-in template, the container report, or the JSON output, regenerate the copies with `task tplprev:gen` (or `task test:update-golden`), update the preview module to match, and commit both.
 
 ## Building

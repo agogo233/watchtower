@@ -11,6 +11,9 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/nicholas-fedor/watchtower/internal/container/labels"
+	"github.com/nicholas-fedor/watchtower/internal/testutil/containerfixture"
+	"github.com/nicholas-fedor/watchtower/internal/testutil/modelfixture"
+	"github.com/nicholas-fedor/watchtower/pkg/types"
 	mockTypes "github.com/nicholas-fedor/watchtower/pkg/types/mocks"
 )
 
@@ -29,6 +32,17 @@ func newTestLogger(t *testing.T) *zerolog.Logger {
 	w := zerolog.TestWriter{T: t, Frame: 4}
 
 	return new(zerolog.New(w))
+}
+
+// scopeTestContainer returns a model container whose scope label is set to
+// scope when exists is true, so the filter reads the model's own scope rule.
+func scopeTestContainer(scope string, exists bool) types.FilterableContainer {
+	containerLabels := map[string]string{}
+	if exists {
+		containerLabels[labels.Scope] = scope
+	}
+
+	return modelfixture.Container(containerfixture.WithLabels(containerLabels))
 }
 
 func TestExcludeOldWatchtowerFilter(t *testing.T) {
@@ -112,41 +126,6 @@ func TestWatchtowerContainersFilter(t *testing.T) {
 	container.On("IsWatchtower").Return(true)
 	assert.True(t, WatchtowerContainersFilter(container))
 	container.AssertExpectations(t)
-}
-
-func TestUnscopedWatchtowerContainersFilter(t *testing.T) {
-	t.Parallel()
-
-	// Test unscoped Watchtower container (should pass)
-	unscoped := new(mockTypes.MockFilterableContainer)
-	unscoped.On("IsWatchtower").Return(true)
-	unscoped.On("Scope").Return("", false) // No scope set
-	unscoped.On("Name").Return("/unscoped-watchtower").Maybe()
-	assert.True(t, UnscopedWatchtowerContainersFilter(unscoped))
-	unscoped.AssertExpectations(t)
-
-	// Test explicitly scoped Watchtower container (should fail)
-	scoped := new(mockTypes.MockFilterableContainer)
-	scoped.On("IsWatchtower").Return(true)
-	scoped.On("Scope").Return("prod", true) // Has scope
-	scoped.On("Name").Return("/scoped-watchtower").Maybe()
-	assert.False(t, UnscopedWatchtowerContainersFilter(scoped))
-	scoped.AssertExpectations(t)
-
-	// Test none-scoped Watchtower container (should pass)
-	noneScoped := new(mockTypes.MockFilterableContainer)
-	noneScoped.On("IsWatchtower").Return(true)
-	noneScoped.On("Scope").Return("none", true) // Explicitly none scope
-	noneScoped.On("Name").Return("/none-scoped-watchtower").Maybe()
-	assert.True(t, UnscopedWatchtowerContainersFilter(noneScoped))
-	noneScoped.AssertExpectations(t)
-
-	// Test non-Watchtower container (should fail)
-	nonWatchtower := new(mockTypes.MockFilterableContainer)
-	nonWatchtower.On("IsWatchtower").Return(false)
-	nonWatchtower.On("Name").Return("/regular-app").Maybe()
-	assert.False(t, UnscopedWatchtowerContainersFilter(nonWatchtower))
-	nonWatchtower.AssertExpectations(t)
 }
 
 func TestNoFilter(t *testing.T) {
@@ -314,22 +293,68 @@ func TestFilterByScope(t *testing.T) {
 	assert.NotNil(t, filter)
 
 	container := new(mockTypes.MockFilterableContainer)
-	container.On("Scope").Return("testscope", true)
+	container.On("NormalizedScope").Return("testscope")
 	container.On("Name").Return("/test")
 	assert.True(t, filter(container))
 	container.AssertExpectations(t)
 
 	container = new(mockTypes.MockFilterableContainer)
-	container.On("Scope").Return("nottestscope", true)
+	container.On("NormalizedScope").Return("nottestscope")
 	container.On("Name").Return("/test")
 	assert.False(t, filter(container))
 	container.AssertExpectations(t)
 
-	container = new(mockTypes.MockFilterableContainer)
-	container.On("Scope").Return("", false)
-	container.On("Name").Return("/test")
-	assert.False(t, filter(container))
-	container.AssertExpectations(t)
+	assert.False(t, filter(scopeTestContainer("", false)))
+}
+
+// TestFilterByScope_EmptyScope verifies that an empty requested scope selects
+// the containers without a scope, as "none" does, so a Watchtower container
+// filter chained after it keeps only unscoped Watchtower containers.
+func TestFilterByScope_EmptyScope(t *testing.T) {
+	t.Parallel()
+
+	filter := FilterByScope(newTestLogger(t), "", WatchtowerContainersFilter)
+
+	tests := []struct {
+		labels map[string]string
+		name   string
+		want   bool
+	}{
+		{
+			name:   "unscoped Watchtower container",
+			labels: map[string]string{labels.Watchtower: "true"},
+			want:   true,
+		},
+		{
+			name:   "Watchtower container with an empty scope",
+			labels: map[string]string{labels.Watchtower: "true", labels.Scope: ""},
+			want:   true,
+		},
+		{
+			name:   "Watchtower container in scope none",
+			labels: map[string]string{labels.Watchtower: "true", labels.Scope: "none"},
+			want:   true,
+		},
+		{
+			name:   "scoped Watchtower container",
+			labels: map[string]string{labels.Watchtower: "true", labels.Scope: "prod"},
+			want:   false,
+		},
+		{
+			name:   "unscoped container that is not Watchtower",
+			labels: map[string]string{},
+			want:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			c := modelfixture.Container(containerfixture.WithLabels(tt.labels))
+			assert.Equal(t, tt.want, filter(c))
+		})
+	}
 }
 
 func TestFilterByNoneScope(t *testing.T) {
@@ -340,29 +365,10 @@ func TestFilterByNoneScope(t *testing.T) {
 	filter := FilterByScope(newTestLogger(t), scope, NoFilter)
 	assert.NotNil(t, filter)
 
-	container := new(mockTypes.MockFilterableContainer)
-	container.On("Scope").Return("anyscope", true)
-	container.On("Name").Return("/test")
-	assert.False(t, filter(container))
-	container.AssertExpectations(t)
-
-	container = new(mockTypes.MockFilterableContainer)
-	container.On("Scope").Return("", false)
-	container.On("Name").Return("/test")
-	assert.True(t, filter(container))
-	container.AssertExpectations(t)
-
-	container = new(mockTypes.MockFilterableContainer)
-	container.On("Scope").Return("", true)
-	container.On("Name").Return("/test")
-	assert.True(t, filter(container))
-	container.AssertExpectations(t)
-
-	container = new(mockTypes.MockFilterableContainer)
-	container.On("Scope").Return("none", true)
-	container.On("Name").Return("/test")
-	assert.True(t, filter(container))
-	container.AssertExpectations(t)
+	assert.False(t, filter(scopeTestContainer("anyscope", true)))
+	assert.True(t, filter(scopeTestContainer("", false)))
+	assert.True(t, filter(scopeTestContainer("", true)))
+	assert.True(t, filter(scopeTestContainer("none", true)))
 }
 
 func TestFilterByNoneScope_TransitionScenarios(t *testing.T) {
@@ -419,13 +425,8 @@ func TestFilterByNoneScope_TransitionScenarios(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			container := new(mockTypes.MockFilterableContainer)
-			container.On("Scope").Return(tt.containerScope, tt.scopeExists)
-			container.On("Name").Return("/test-container")
-
-			result := filter(container)
+			result := filter(scopeTestContainer(tt.containerScope, tt.scopeExists))
 			assert.Equal(t, tt.expected, result, tt.description)
-			container.AssertExpectations(t)
 		})
 	}
 }
@@ -453,11 +454,7 @@ func TestFilterByNoneScope_MixedHandling(t *testing.T) {
 
 	results := make([]bool, len(containers))
 	for i, tc := range containers {
-		container := new(mockTypes.MockFilterableContainer)
-		container.On("Scope").Return(tc.containerScope, tc.scopeExists)
-		container.On("Name").Return("/" + tc.name)
-		results[i] = filter(container)
-		container.AssertExpectations(t)
+		results[i] = filter(scopeTestContainer(tc.containerScope, tc.scopeExists))
 	}
 
 	// Verify results
@@ -485,14 +482,14 @@ func TestBuildFilterNoneScope(t *testing.T) {
 	scoped := new(mockTypes.MockFilterableContainer)
 	scoped.On("IsWatchtower").Return(false).Maybe()
 	scoped.On("Enabled").Return(false, false).Maybe()
-	scoped.On("Scope").Return("anyscope", true)
+	scoped.On("NormalizedScope").Return("anyscope")
 	scoped.On("GetLabel", labels.Enable).Return("", false).Maybe()
 	scoped.On("Name").Return("/scoped")
 
 	unscoped := new(mockTypes.MockFilterableContainer)
 	unscoped.On("IsWatchtower").Return(false).Maybe()
 	unscoped.On("Enabled").Return(false, false).Maybe()
-	unscoped.On("Scope").Return("", false)
+	unscoped.On("NormalizedScope").Return("none")
 	unscoped.On("GetLabel", labels.Enable).Return("", false).Maybe()
 	unscoped.On("Name").Return("/unscoped")
 
@@ -760,7 +757,7 @@ func TestBuildFilter(t *testing.T) {
 	container.On("IsWatchtower").Return(false).Maybe()
 	container.On("Name").Return("Invalid").Maybe()
 	container.On("Enabled").Return(false, false).Maybe()
-	container.On("Scope").Return("", false).Maybe() // No scope set, defaults to "none"
+	container.On("NormalizedScope").Return("none").Maybe() // No scope set
 	container.On("GetLabel", labels.Enable).Return("", false).Maybe()
 	container.On("Name").Return("/test").Maybe()
 	assert.False(t, filter(container))
@@ -770,7 +767,7 @@ func TestBuildFilter(t *testing.T) {
 	container.On("IsWatchtower").Return(false).Maybe()
 	container.On("Name").Return("test").Maybe()
 	container.On("Enabled").Return(false, false).Maybe()
-	container.On("Scope").Return("", false).Maybe() // No scope set, defaults to "none"
+	container.On("NormalizedScope").Return("none").Maybe() // No scope set
 	container.On("GetLabel", labels.Enable).Return("", false).Maybe()
 	container.On("Name").Return("/test").Maybe()
 	assert.True(t, filter(container))
@@ -780,7 +777,7 @@ func TestBuildFilter(t *testing.T) {
 	container.On("IsWatchtower").Return(false).Maybe()
 	container.On("Name").Return("Invalid").Maybe()
 	container.On("Enabled").Return(true, true).Maybe()
-	container.On("Scope").Return("", false).Maybe() // No scope set, defaults to "none"
+	container.On("NormalizedScope").Return("none").Maybe() // No scope set
 	container.On("GetLabel", labels.Enable).Return("", false).Maybe()
 	container.On("Name").Return("/test").Maybe()
 	assert.False(t, filter(container))
@@ -790,7 +787,7 @@ func TestBuildFilter(t *testing.T) {
 	container.On("IsWatchtower").Return(false).Maybe()
 	container.On("Name").Return("test").Maybe()
 	container.On("Enabled").Return(true, true).Maybe()
-	container.On("Scope").Return("", false).Maybe() // No scope set, defaults to "none"
+	container.On("NormalizedScope").Return("none").Maybe() // No scope set
 	container.On("GetLabel", labels.Enable).Return("", false).Maybe()
 	container.On("Name").Return("/test").Maybe()
 	assert.True(t, filter(container))
@@ -799,7 +796,7 @@ func TestBuildFilter(t *testing.T) {
 	container = new(mockTypes.MockFilterableContainer)
 	container.On("IsWatchtower").Return(false).Maybe()
 	container.On("Enabled").Return(true, true).Maybe()
-	container.On("Scope").Return("", false).Maybe() // No scope set, defaults to "none"
+	container.On("NormalizedScope").Return("none").Maybe() // No scope set
 	container.On("GetLabel", labels.Enable).Return("", false).Maybe()
 	container.On("Name").Return("/test").Maybe()
 	assert.False(t, filter(container))
@@ -821,7 +818,7 @@ func TestBuildFilterEnableLabel(t *testing.T) {
 	container := new(mockTypes.MockFilterableContainer)
 	container.On("IsWatchtower").Return(false).Maybe()
 	container.On("Enabled").Return(false, false).Maybe()
-	container.On("Scope").Return("", false).Maybe()
+	container.On("NormalizedScope").Return("none").Maybe()
 	container.On("Name").Return("test").Maybe()
 	assert.False(t, filter(container))
 	container.AssertExpectations(t)
@@ -830,7 +827,7 @@ func TestBuildFilterEnableLabel(t *testing.T) {
 	container = new(mockTypes.MockFilterableContainer)
 	container.On("IsWatchtower").Return(false).Maybe()
 	container.On("Enabled").Return(false, true).Maybe()
-	container.On("Scope").Return("", false).Maybe()
+	container.On("NormalizedScope").Return("none").Maybe()
 	container.On("Name").Return("test").Maybe()
 	assert.False(t, filter(container))
 	container.AssertExpectations(t)
@@ -839,7 +836,7 @@ func TestBuildFilterEnableLabel(t *testing.T) {
 	container = new(mockTypes.MockFilterableContainer)
 	container.On("IsWatchtower").Return(false).Once()
 	container.On("Enabled").Return(true, true).Maybe()
-	container.On("Scope").Return("", false).Once()
+	container.On("NormalizedScope").Return("none").Once()
 	container.On("Name").Return("test").Maybe()
 	result := filter(container)
 	assert.True(t, result)
@@ -871,7 +868,7 @@ func TestBuildFilterEnableLabelPreservesUserCriteria(t *testing.T) {
 	container.On("IsWatchtower").Return(false).Maybe()
 	container.On("Enabled").Return(true, true).Maybe()
 	container.On("GetLabel", labels.Enable).Return("true", true).Once()
-	container.On("Scope").Return("", false).Maybe()
+	container.On("NormalizedScope").Return("none").Maybe()
 	container.On("Name").Return("test").Maybe()
 	assert.False(t, filter(container))
 	container.AssertExpectations(t)
@@ -891,7 +888,7 @@ func TestBuildFilterDisableContainer(t *testing.T) {
 	container.On("IsWatchtower").Return(false).Maybe()
 	container.On("Name").Return("Another").Maybe()
 	container.On("Enabled").Return(false, false).Maybe()
-	container.On("Scope").Return("", false).Maybe() // No scope set, defaults to "none"
+	container.On("NormalizedScope").Return("none").Maybe() // No scope set
 	container.On("GetLabel", labels.Enable).Return("", false).Maybe()
 	container.On("Name").Return("/test").Maybe()
 	assert.True(t, filter(container))
@@ -901,7 +898,7 @@ func TestBuildFilterDisableContainer(t *testing.T) {
 	container.On("IsWatchtower").Return(false).Maybe()
 	container.On("Name").Return("AnotherOne").Maybe()
 	container.On("Enabled").Return(true, true).Maybe()
-	container.On("Scope").Return("", false).Maybe() // No scope set, defaults to "none"
+	container.On("NormalizedScope").Return("none").Maybe() // No scope set
 	container.On("GetLabel", labels.Enable).Return("", false).Maybe()
 	container.On("Name").Return("/test").Maybe()
 	assert.True(t, filter(container))
@@ -911,7 +908,7 @@ func TestBuildFilterDisableContainer(t *testing.T) {
 	container.On("IsWatchtower").Return(false).Maybe()
 	container.On("Name").Return("test").Maybe()
 	container.On("Enabled").Return(false, false).Maybe()
-	container.On("Scope").Return("", false).Maybe() // No scope set, defaults to "none"
+	container.On("NormalizedScope").Return("none").Maybe() // No scope set
 	container.On("GetLabel", labels.Enable).Return("", false).Maybe()
 	container.On("Name").Return("/test").Maybe()
 	assert.True(t, filter(container))
@@ -921,7 +918,7 @@ func TestBuildFilterDisableContainer(t *testing.T) {
 	container.On("IsWatchtower").Return(false).Maybe()
 	container.On("Name").Return("excluded").Maybe()
 	container.On("Enabled").Return(true, true).Maybe()
-	container.On("Scope").Return("", false).Maybe() // No scope set, defaults to "none"
+	container.On("NormalizedScope").Return("none").Maybe() // No scope set
 	container.On("GetLabel", labels.Enable).Return("", false).Maybe()
 	container.On("Name").Return("/test").Maybe()
 	assert.False(t, filter(container))
@@ -931,7 +928,7 @@ func TestBuildFilterDisableContainer(t *testing.T) {
 	container.On("IsWatchtower").Return(false).Maybe()
 	container.On("Name").Return("excludedAsSubstring").Maybe()
 	container.On("Enabled").Return(true, true).Maybe()
-	container.On("Scope").Return("", false).Maybe() // No scope set, defaults to "none"
+	container.On("NormalizedScope").Return("none").Maybe() // No scope set
 	container.On("GetLabel", labels.Enable).Return("", false).Maybe()
 	container.On("Name").Return("/test").Maybe()
 	assert.True(t, filter(container))
@@ -941,7 +938,7 @@ func TestBuildFilterDisableContainer(t *testing.T) {
 	container.On("IsWatchtower").Return(false).Maybe()
 	container.On("Name").Return("notfound").Maybe()
 	container.On("Enabled").Return(true, true).Maybe()
-	container.On("Scope").Return("", false).Maybe() // No scope set, defaults to "none"
+	container.On("NormalizedScope").Return("none").Maybe() // No scope set
 	container.On("GetLabel", labels.Enable).Return("", false).Maybe()
 	container.On("Name").Return("/test").Maybe()
 	assert.False(t, filter(container))
@@ -950,7 +947,7 @@ func TestBuildFilterDisableContainer(t *testing.T) {
 	container = new(mockTypes.MockFilterableContainer)
 	container.On("IsWatchtower").Return(false).Maybe()
 	container.On("Enabled").Return(false, true).Maybe()
-	container.On("Scope").Return("", false).Maybe()
+	container.On("NormalizedScope").Return("none").Maybe()
 	container.On("Name").Return("/test").Maybe()
 	assert.False(t, filter(container))
 	container.AssertExpectations(t)
@@ -1074,7 +1071,7 @@ func TestBuildFilterImageNames(t *testing.T) {
 	container.On("Name").Return("/web").Maybe()
 	container.On("ImageName").Return("nginx:1.25").Maybe()
 	container.On("Enabled").Return(false, false).Maybe()
-	container.On("Scope").Return("", false).Maybe()
+	container.On("NormalizedScope").Return("none").Maybe()
 	container.On("GetLabel", labels.Enable).Return("", false).Maybe()
 	assert.True(t, filter(container))
 	container.AssertExpectations(t)
@@ -1085,7 +1082,7 @@ func TestBuildFilterImageNames(t *testing.T) {
 	container.On("Name").Return("/api").Maybe()
 	container.On("ImageName").Return("api:latest").Maybe()
 	container.On("Enabled").Return(false, false).Maybe()
-	container.On("Scope").Return("", false).Maybe()
+	container.On("NormalizedScope").Return("none").Maybe()
 	container.On("GetLabel", labels.Enable).Return("", false).Maybe()
 	assert.False(t, filter(container))
 	container.AssertExpectations(t)
@@ -1096,7 +1093,7 @@ func TestBuildFilterImageNames(t *testing.T) {
 	container.On("Name").Return("/cache").Maybe()
 	container.On("ImageName").Return("redis:latest").Maybe()
 	container.On("Enabled").Return(false, false).Maybe()
-	container.On("Scope").Return("", false).Maybe()
+	container.On("NormalizedScope").Return("none").Maybe()
 	container.On("GetLabel", labels.Enable).Return("", false).Maybe()
 	assert.False(t, filter(container))
 	container.AssertExpectations(t)
@@ -1107,7 +1104,7 @@ func TestBuildFilterImageNames(t *testing.T) {
 	container.On("Name").Return("/cache2").Maybe()
 	container.On("ImageName").Return("redis:7").Maybe()
 	container.On("Enabled").Return(false, false).Maybe()
-	container.On("Scope").Return("", false).Maybe()
+	container.On("NormalizedScope").Return("none").Maybe()
 	container.On("GetLabel", labels.Enable).Return("", false).Maybe()
 	assert.True(t, filter(container))
 	container.AssertExpectations(t)
@@ -1136,7 +1133,7 @@ func TestBuildFilterImageNamesWithContainerNames(t *testing.T) {
 	container.On("Name").Return("web").Maybe()
 	container.On("ImageName").Return("nginx:1.25").Maybe()
 	container.On("Enabled").Return(false, false).Maybe()
-	container.On("Scope").Return("", false).Maybe()
+	container.On("NormalizedScope").Return("none").Maybe()
 	container.On("GetLabel", labels.Enable).Return("", false).Maybe()
 	assert.True(t, filter(container))
 	container.AssertExpectations(t)
@@ -1147,7 +1144,7 @@ func TestBuildFilterImageNamesWithContainerNames(t *testing.T) {
 	container.On("Name").Return("web").Maybe()
 	container.On("ImageName").Return("redis:latest").Maybe()
 	container.On("Enabled").Return(false, false).Maybe()
-	container.On("Scope").Return("", false).Maybe()
+	container.On("NormalizedScope").Return("none").Maybe()
 	container.On("GetLabel", labels.Enable).Return("", false).Maybe()
 	assert.False(t, filter(container))
 	container.AssertExpectations(t)
@@ -1158,7 +1155,7 @@ func TestBuildFilterImageNamesWithContainerNames(t *testing.T) {
 	container.On("Name").Return("api").Maybe()
 	container.On("ImageName").Return("nginx:1.25").Maybe()
 	container.On("Enabled").Return(false, false).Maybe()
-	container.On("Scope").Return("", false).Maybe()
+	container.On("NormalizedScope").Return("none").Maybe()
 	container.On("GetLabel", labels.Enable).Return("", false).Maybe()
 	assert.False(t, filter(container))
 	container.AssertExpectations(t)
@@ -1263,7 +1260,7 @@ func TestBuildFilterEnabledLabels(t *testing.T) {
 	container.On("Name").Return("/pelican-1").Maybe()
 	container.On("GetLabel", "Service").Return("Pelican", true)
 	container.On("Enabled").Return(false, false).Maybe()
-	container.On("Scope").Return("", false).Maybe()
+	container.On("NormalizedScope").Return("none").Maybe()
 	container.On("GetLabel", labels.Enable).Return("", false).Maybe()
 	assert.True(t, filter(container))
 	container.AssertExpectations(t)
@@ -1273,7 +1270,7 @@ func TestBuildFilterEnabledLabels(t *testing.T) {
 	container.On("Name").Return("/other").Maybe()
 	container.On("GetLabel", "Service").Return("Other", true)
 	container.On("Enabled").Return(false, false).Maybe()
-	container.On("Scope").Return("", false).Maybe()
+	container.On("NormalizedScope").Return("none").Maybe()
 	container.On("GetLabel", labels.Enable).Return("", false).Maybe()
 	assert.False(t, filter(container))
 	container.AssertExpectations(t)
@@ -1292,7 +1289,7 @@ func TestBuildFilterDisabledLabels(t *testing.T) {
 	container.On("Name").Return("/pelican-1").Maybe()
 	container.On("GetLabel", "Service").Return("Pelican", true)
 	container.On("Enabled").Return(false, false).Maybe()
-	container.On("Scope").Return("", false).Maybe()
+	container.On("NormalizedScope").Return("none").Maybe()
 	container.On("GetLabel", labels.Enable).Return("", false).Maybe()
 	assert.False(t, filter(container))
 	container.AssertExpectations(t)
@@ -1302,7 +1299,7 @@ func TestBuildFilterDisabledLabels(t *testing.T) {
 	container.On("Name").Return("/other").Maybe()
 	container.On("GetLabel", "Service").Return("Other", true)
 	container.On("Enabled").Return(false, false).Maybe()
-	container.On("Scope").Return("", false).Maybe()
+	container.On("NormalizedScope").Return("none").Maybe()
 	container.On("GetLabel", labels.Enable).Return("", false).Maybe()
 	assert.True(t, filter(container))
 	container.AssertExpectations(t)
@@ -1619,7 +1616,7 @@ func TestFilters_QuietLoggers(t *testing.T) {
 			labeled.AssertExpectations(t)
 
 			scoped := new(mockTypes.MockFilterableContainer)
-			scoped.On("Scope").Return("prod", true)
+			scoped.On("NormalizedScope").Return("prod")
 			assert.True(t, FilterByScope(log, "prod", NoFilter)(scoped))
 			assert.False(t, FilterByScope(log, "dev", NoFilter)(scoped))
 			scoped.AssertExpectations(t)
@@ -1638,7 +1635,7 @@ func TestFilters_QuietLoggers(t *testing.T) {
 			built.On("IsWatchtower").Return(false)
 			built.On("GetLabel", "env").Return("prod", true)
 			built.On("Enabled").Return(false, false)
-			built.On("Scope").Return("", false)
+			built.On("NormalizedScope").Return("none")
 			assert.True(t, filter(built))
 			built.AssertExpectations(t)
 		})
@@ -1660,7 +1657,7 @@ func TestBuildFilterRepeatedLabelKey(t *testing.T) {
 		container.On("Name").Return("/app").Maybe()
 		container.On("GetLabel", "env").Return(value, true)
 		container.On("Enabled").Return(false, false).Maybe()
-		container.On("Scope").Return("", false).Maybe()
+		container.On("NormalizedScope").Return("none").Maybe()
 		assert.True(t, filter(container), "env=%s", value)
 		container.AssertExpectations(t)
 	}

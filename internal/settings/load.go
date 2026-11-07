@@ -35,10 +35,6 @@ import (
 const diskSpacePercentBase = 100
 
 var (
-	// errNegativeStopTimeout indicates stop-timeout was set to a negative duration.
-	errNegativeStopTimeout = errors.New("stop-timeout must be non-negative")
-	// errNegativeCooldownDelay indicates cooldown-delay was set to a negative duration.
-	errNegativeCooldownDelay = errors.New("cooldown-delay must be non-negative")
 	// errRollingRestartWithMonitorOnly indicates incompatible rolling-restart and monitor-only flags.
 	errRollingRestartWithMonitorOnly = errors.New(
 		"rolling-restart and monitor-only cannot both be enabled",
@@ -80,9 +76,16 @@ func Load(log *zerolog.Logger, cmd *cobra.Command, args []string) (Config, error
 
 	vCfg := viper.New()
 
-	err := BindAll(vCfg, flagSet, AllSpecs())
+	specs := AllSpecs()
+
+	err := BindAll(vCfg, flagSet, specs)
 	if err != nil {
 		return Config{}, fmt.Errorf("bind configuration: %w", err)
+	}
+
+	err = checkRanges(vCfg, flagSet, specs)
+	if err != nil {
+		return Config{}, err
 	}
 
 	cfg := Config{}
@@ -90,6 +93,7 @@ func Load(log *zerolog.Logger, cmd *cobra.Command, args []string) (Config, error
 	cfg.Docker = loadDocker(vCfg)
 	cfg.Client = loadClient(vCfg)
 	cfg.Compatibility = loadCompat(vCfg)
+
 	cfg.Schedule = loadSchedule(vCfg)
 	cfg.Mode = loadMode(vCfg)
 
@@ -106,6 +110,7 @@ func Load(log *zerolog.Logger, cmd *cobra.Command, args []string) (Config, error
 	}
 
 	cfg.Registry = loadRegistry(vCfg)
+
 	cfg.API = loadAPI(vCfg, flagSet)
 	cfg.Notify = loadNotify(vCfg, flagSet)
 	cfg.Logging = loadLogging(vCfg, flagSet)
@@ -174,11 +179,7 @@ func loadMode(vCfg *viper.Viper) mode.Mode {
 
 // loadUpdate reads update policy settings from Viper.
 func loadUpdate(log *zerolog.Logger, vCfg *viper.Viper, flagSet *pflag.FlagSet) (update.Update, error) {
-	stopTimeout := durationValue(vCfg, flagSet, "stop-timeout", []string{"WATCHTOWER_TIMEOUT"})
-
-	if stopTimeout < 0 {
-		return update.Update{}, errNegativeStopTimeout
-	}
+	stopTimeout := durationValue(vCfg, flagSet, "stop-timeout")
 
 	if stopTimeout > 0 && stopTimeout < time.Second {
 		log.Warn().
@@ -194,10 +195,6 @@ func loadUpdate(log *zerolog.Logger, vCfg *viper.Viper, flagSet *pflag.FlagSet) 
 		parsed, err := units.ParseDuration(cooldownStr)
 		if err != nil {
 			return update.Update{}, fmt.Errorf("cooldown-delay: %w", err)
-		}
-
-		if parsed < 0 {
-			return update.Update{}, errNegativeCooldownDelay
 		}
 
 		cooldown = parsed
@@ -468,15 +465,9 @@ func loadAPI(vCfg *viper.Viper, flagSet *pflag.FlagSet) api.API {
 			[]string{"WATCHTOWER_HTTP_API_CORS_ORIGINS"},
 			spec.ListCommaOrSpace,
 		),
-		CheckTimeout: durationValue(
-			vCfg, flagSet, "http-api-check-timeout",
-			[]string{"WATCHTOWER_HTTP_API_CHECK_TIMEOUT"},
-		),
-		CheckTimeoutChanged: flagChanged(flagSet, "http-api-check-timeout"),
-		UpdateTimeout: durationValue(
-			vCfg, flagSet, "http-api-update-timeout",
-			[]string{"WATCHTOWER_HTTP_API_UPDATE_TIMEOUT"},
-		),
+		CheckTimeout:         durationValue(vCfg, flagSet, "http-api-check-timeout"),
+		CheckTimeoutChanged:  flagChanged(flagSet, "http-api-check-timeout"),
+		UpdateTimeout:        durationValue(vCfg, flagSet, "http-api-update-timeout"),
 		UpdateTimeoutChanged: flagChanged(flagSet, "http-api-update-timeout"),
 	}
 }
@@ -576,11 +567,6 @@ func loadGit(vCfg *viper.Viper, flagSet *pflag.FlagSet) (gitConfig.Git, error) {
 		return gitConfig.Git{}, fmt.Errorf("git-image: %w", err)
 	}
 
-	timeout := durationValue(
-		vCfg, flagSet, "git-timeout",
-		[]string{"WATCHTOWER_GIT_TIMEOUT"},
-	)
-
 	caBundle, err := readOptionalFile(vCfg.GetString("git-ca-bundle"))
 	if err != nil {
 		return gitConfig.Git{}, fmt.Errorf("git-ca-bundle: %w", err)
@@ -601,7 +587,10 @@ func loadGit(vCfg *viper.Viper, flagSet *pflag.FlagSet) (gitConfig.Git, error) {
 		Enable:          vCfg.GetBool("git-enable"),
 		DefaultRef:      gitConfig.DefaultRef,
 		SemverPolicy:    gitConfig.DefaultPolicy,
-		Timeout:         timeout,
+		Images:          images,
+		Dockerfile:      strings.TrimSpace(vCfg.GetString("git-dockerfile")),
+		Context:         strings.TrimSpace(vCfg.GetString("git-context")),
+		Timeout:         durationValue(vCfg, flagSet, "git-timeout"),
 		Token:           vCfg.GetString("git-auth-token"),
 		Username:        vCfg.GetString("git-username"),
 		Password:        vCfg.GetString("git-password"),
@@ -609,9 +598,6 @@ func loadGit(vCfg *viper.Viper, flagSet *pflag.FlagSet) (gitConfig.Git, error) {
 		SSHKnownHosts:   vCfg.GetString("git-ssh-known-hosts"),
 		CABundle:        caBundle,
 		InsecureSkipTLS: vCfg.GetBool("git-insecure-skip-tls"),
-		Dockerfile:      strings.TrimSpace(vCfg.GetString("git-dockerfile")),
-		Context:         strings.TrimSpace(vCfg.GetString("git-context")),
-		Images:          images,
 		ComposeStash:    vCfg.GetBool("git-compose-stash"),
 		ComposeProjects: projects,
 	}, nil

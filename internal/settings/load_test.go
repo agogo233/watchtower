@@ -3,6 +3,7 @@ package settings
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -14,10 +15,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/nicholas-fedor/watchtower/internal/git/semver"
 	"github.com/nicholas-fedor/watchtower/internal/settings/config/git"
 	"github.com/nicholas-fedor/watchtower/internal/settings/config/registry"
 	"github.com/nicholas-fedor/watchtower/internal/settings/config/update"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
+	"github.com/nicholas-fedor/watchtower/internal/settings/flags/spec"
 )
 
 // newNopLogger returns a discarded logger for Load and validate tests.
@@ -150,11 +152,98 @@ func TestLoad_InvalidFilterLabel(t *testing.T) {
 	assert.ErrorContains(t, err, "build filter:")
 }
 
-func TestLoad_NegativeStopTimeout(t *testing.T) {
-	_, _, cmd := bindLoad(t, "--stop-timeout", "-1s")
+// TestLoad_NegativeDurations verifies that a negative value for any duration
+// setting stops Load with an error naming the setting. The value comes from a
+// flag or an environment variable. Environment values cover both a unit
+// suffix and a bare number of seconds. The test runs sequentially because the
+// environment cases set variables.
+func TestLoad_NegativeDurations(t *testing.T) {
+	tests := []struct {
+		name    string
+		setting string
+		args    []string
+		env     map[string]string
+	}{
+		{name: "stop-timeout flag", setting: "stop-timeout", args: []string{"--stop-timeout", "-1s"}},
+		{
+			name:    "stop-timeout env in bare seconds",
+			setting: "stop-timeout",
+			env:     map[string]string{"WATCHTOWER_TIMEOUT": "-10"},
+		},
+		{name: "git-timeout flag", setting: "git-timeout", args: []string{"--git-timeout", "-1m"}},
+		{
+			name:    "git-timeout env",
+			setting: "git-timeout",
+			env:     map[string]string{"WATCHTOWER_GIT_TIMEOUT": "-30s"},
+		},
+		{
+			name:    "http-api-check-timeout flag",
+			setting: "http-api-check-timeout",
+			args:    []string{"--http-api-check-timeout", "-5m"},
+		},
+		{
+			name:    "http-api-update-timeout env in bare seconds",
+			setting: "http-api-update-timeout",
+			env:     map[string]string{"WATCHTOWER_HTTP_API_UPDATE_TIMEOUT": "-600"},
+		},
+	}
 
-	_, err := Load(newNopLogger(), cmd, nil)
-	require.ErrorIs(t, err, errNegativeStopTimeout)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := loadWithEnv(t, tt.env, tt.args...)
+			require.ErrorContains(t, err, tt.setting+" must be non-negative, got -")
+		})
+	}
+}
+
+// TestLoad_SettingRanges verifies that every integer and duration setting is
+// range-checked when the configuration loads. Each setting is set just below
+// its minimum and, when it has one, just above its maximum. The minimum itself
+// loads. A new setting is covered without a test of its own. The spec package
+// tests the messages.
+func TestLoad_SettingRanges(t *testing.T) {
+	for _, flagSpec := range AllSpecs() {
+		var accepted, rejected []string
+
+		switch flagSpec.Kind {
+		case spec.KindInt:
+			accepted = []string{strconv.Itoa(flagSpec.Min)}
+			rejected = []string{strconv.Itoa(flagSpec.Min - 1)}
+
+			if flagSpec.Max != 0 {
+				accepted = append(accepted, strconv.Itoa(flagSpec.Max))
+				rejected = append(rejected, strconv.Itoa(flagSpec.Max+1))
+			}
+		case spec.KindDuration:
+			accepted = []string{"0s"}
+			rejected = []string{"-1s"}
+		case spec.KindBool, spec.KindString, spec.KindStringSlice, spec.KindStringArray:
+			continue
+		default:
+			t.Fatalf("flag %q has unknown kind %d", flagSpec.Name, flagSpec.Kind)
+		}
+
+		t.Run(flagSpec.Name, func(t *testing.T) {
+			for _, value := range accepted {
+				_, err := loadWithEnv(t, nil, "--"+flagSpec.Name+"="+value)
+				require.NoError(t, err, "value %s", value)
+			}
+
+			for _, value := range rejected {
+				_, err := loadWithEnv(t, nil, "--"+flagSpec.Name+"="+value)
+				require.ErrorContains(t, err, flagSpec.Name+" must be", "value %s", value)
+				require.ErrorContains(t, err, "got "+value)
+			}
+		})
+	}
+}
+
+// TestLoad_ZeroRateLimit verifies that an HTTP API rate limit of zero stops
+// Load. Zero has no defined meaning. The rate limiter would replace it with
+// its own default of 5 requests per minute.
+func TestLoad_ZeroRateLimit(t *testing.T) {
+	_, err := loadWithEnv(t, nil, "--http-api-rate-limit", "0")
+	require.ErrorContains(t, err, "http-api-rate-limit must be at least 1, got 0")
 }
 
 func TestLoad_InvalidAndNegativeCooldown(t *testing.T) {
@@ -258,12 +347,6 @@ func TestLoadUpdate(t *testing.T) {
 		assert.Equal(t, 500*time.Millisecond, got.StopTimeout)
 	})
 
-	t.Run("negative timeout", func(t *testing.T) {
-		vCfg, flagSet, _ := bindLoad(t, "--stop-timeout", "-5s")
-		_, err := loadUpdate(newNopLogger(), vCfg, flagSet)
-		require.ErrorIs(t, err, errNegativeStopTimeout)
-	})
-
 	t.Run("invalid cooldown", func(t *testing.T) {
 		vCfg, flagSet, _ := bindLoad(t, "--cooldown-delay", "nope")
 		_, err := loadUpdate(newNopLogger(), vCfg, flagSet)
@@ -272,8 +355,7 @@ func TestLoadUpdate(t *testing.T) {
 	})
 
 	t.Run("negative cooldown", func(t *testing.T) {
-		// units.ParseDuration rejects a leading '-' before loadUpdate can return
-		// errNegativeCooldownDelay.
+		// units.ParseDuration rejects a leading '-'.
 		vCfg, flagSet, _ := bindLoad(t, "--cooldown-delay", "-2d")
 		_, err := loadUpdate(newNopLogger(), vCfg, flagSet)
 		require.Error(t, err)
@@ -592,7 +674,7 @@ func TestLoadGit(t *testing.T) {
 		assert.True(t, got.InsecureSkipTLS)
 		assert.Equal(t, "build/docker/Dockerfile", got.Dockerfile)
 		assert.Equal(t, ".", got.Context)
-		assert.Equal(t, types.GitPolicyMinor, got.Images["myapp:latest"].Policy)
+		assert.Equal(t, semver.PolicyMinor, got.Images["myapp:latest"].Policy)
 		assert.True(t, got.ComposeStash)
 		assert.Equal(t, "/srv/web", got.ComposeProjects["web"])
 	})

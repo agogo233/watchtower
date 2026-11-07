@@ -9,9 +9,61 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/nicholas-fedor/watchtower/internal/container/labels"
+	"github.com/nicholas-fedor/watchtower/internal/git/semver"
+	gitConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/git"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 	typemocks "github.com/nicholas-fedor/watchtower/pkg/types/mocks"
 )
+
+// TestAssociation_Validate verifies that an invalid policy or git-host label
+// is reported with its own error and that the policy label is checked first.
+func TestAssociation_Validate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		assoc   Association
+		wantErr error
+		wantMsg string
+	}{
+		{name: "no labels", assoc: Association{Policy: semver.PolicyNone}},
+		{name: "valid host", assoc: Association{Host: "https://git.example.com:3000"}},
+		{
+			name:    "invalid policy",
+			assoc:   Association{Policy: semver.PolicyNone, invalidPolicy: "nightly"},
+			wantErr: semver.ErrInvalidPolicy,
+			wantMsg: "invalid git semver policy: nightly",
+		},
+		{
+			name:    "invalid host",
+			assoc:   Association{Host: "ftp://git.example.com"},
+			wantErr: ErrInvalidHost,
+			wantMsg: "invalid git-host: scheme must be http or https",
+		},
+		{
+			name:    "invalid policy reported before invalid host",
+			assoc:   Association{Host: "ftp://git.example.com", invalidPolicy: "nightly"},
+			wantErr: semver.ErrInvalidPolicy,
+			wantMsg: "invalid git semver policy: nightly",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := tt.assoc.Validate()
+			if tt.wantErr == nil {
+				require.NoError(t, err)
+
+				return
+			}
+
+			require.ErrorIs(t, err, tt.wantErr)
+			require.EqualError(t, err, tt.wantMsg)
+		})
+	}
+}
 
 func TestResolveAssociation(t *testing.T) {
 	t.Parallel()
@@ -19,7 +71,7 @@ func TestResolveAssociation(t *testing.T) {
 	t.Run("nil container", func(t *testing.T) {
 		t.Parallel()
 
-		got, ok := ResolveAssociation(nil, types.UpdateParams{})
+		got, ok := ResolveAssociation(nil, gitConfig.Defaults{})
 		assert.False(t, ok)
 		assert.Equal(t, Association{}, got)
 	})
@@ -34,12 +86,12 @@ func TestResolveAssociation(t *testing.T) {
 			labels.GitContext:    "src",
 		}, "myapp:latest")
 
-		got, ok := ResolveAssociation(c, types.UpdateParams{
-			GitDefaultRef:   "main",
-			GitSemverPolicy: types.GitPolicyPatch,
-			GitDockerfile:   "Dockerfile",
-			GitContext:      ".",
-			GitImages: map[string]types.GitImage{
+		got, ok := ResolveAssociation(c, gitConfig.Defaults{
+			DefaultRef:   "main",
+			SemverPolicy: semver.PolicyPatch,
+			Dockerfile:   "Dockerfile",
+			Context:      ".",
+			Images: map[string]gitConfig.Image{
 				"myapp:latest": {Repo: "https://github.com/org/from-map.git", Ref: "mapped"},
 			},
 		})
@@ -47,7 +99,7 @@ func TestResolveAssociation(t *testing.T) {
 		assert.Equal(t, Association{
 			Repo:              "https://github.com/org/from-label.git",
 			Ref:               "release",
-			Policy:            types.GitPolicyPatch,
+			Policy:            semver.PolicyPatch,
 			Dockerfile:        "build/Dockerfile",
 			Context:           "src",
 			PolicyFromDefault: true,
@@ -62,7 +114,7 @@ func TestResolveAssociation(t *testing.T) {
 			labels.GitHost: "https://git.example.com:3000",
 		}, "myapp:latest")
 
-		got, ok := ResolveAssociation(c, types.UpdateParams{})
+		got, ok := ResolveAssociation(c, gitConfig.Defaults{})
 		require.True(t, ok)
 		assert.Equal(t, "https://git.example.com:3000", got.Host)
 	})
@@ -74,10 +126,10 @@ func TestResolveAssociation(t *testing.T) {
 			labels.GitRepo: "https://github.com/org/app.git",
 		}, "myapp:latest")
 
-		got, ok := ResolveAssociation(c, types.UpdateParams{})
+		got, ok := ResolveAssociation(c, gitConfig.Defaults{})
 		require.True(t, ok)
 		assert.Equal(t, "main", got.Ref)
-		assert.Equal(t, types.GitPolicyNone, got.Policy)
+		assert.Equal(t, semver.PolicyNone, got.Policy)
 		assert.Empty(t, got.Dockerfile)
 		assert.Empty(t, got.Context)
 	})
@@ -90,9 +142,40 @@ func TestResolveAssociation(t *testing.T) {
 			labels.GitBranch: "develop",
 		}, "myapp:latest")
 
-		got, ok := ResolveAssociation(c, types.UpdateParams{})
+		got, ok := ResolveAssociation(c, gitConfig.Defaults{})
 		require.True(t, ok)
 		assert.Equal(t, "develop", got.Ref)
+	})
+
+	t.Run("invalid policy label falls back and is recorded", func(t *testing.T) {
+		t.Parallel()
+
+		c := testContainer(t, map[string]string{
+			labels.GitRepo:         "https://github.com/org/app.git",
+			labels.GitSemverPolicy: " Nightly ",
+		}, "myapp:latest")
+
+		got, ok := ResolveAssociation(c, gitConfig.Defaults{})
+		require.True(t, ok)
+		assert.Equal(t, semver.PolicyNone, got.Policy)
+		assert.Equal(t, "Nightly", got.invalidPolicy)
+	})
+
+	t.Run("invalid policy label on a mapped image is recorded", func(t *testing.T) {
+		t.Parallel()
+
+		c := testContainer(t, map[string]string{
+			labels.GitSemverPolicy: "nightly",
+		}, "myapp:latest")
+
+		got, ok := ResolveAssociation(c, gitConfig.Defaults{
+			Images: map[string]gitConfig.Image{
+				"myapp:latest": {Repo: "https://github.com/org/mapped.git", Policy: semver.PolicyMinor},
+			},
+		})
+		require.True(t, ok)
+		assert.Equal(t, semver.PolicyMinor, got.Policy)
+		assert.Equal(t, "nightly", got.invalidPolicy)
 	})
 
 	t.Run("image mapping", func(t *testing.T) {
@@ -102,12 +185,12 @@ func TestResolveAssociation(t *testing.T) {
 			labels.GitDockerfile: "label.Dockerfile",
 		}, "myapp:latest")
 
-		got, ok := ResolveAssociation(c, types.UpdateParams{
-			GitImages: map[string]types.GitImage{
+		got, ok := ResolveAssociation(c, gitConfig.Defaults{
+			Images: map[string]gitConfig.Image{
 				"myapp:latest": {
 					Repo:       "https://github.com/org/mapped.git",
 					Ref:        "v1",
-					Policy:     types.GitPolicyMinor,
+					Policy:     semver.PolicyMinor,
 					Dockerfile: "map.Dockerfile",
 					Context:    "app",
 				},
@@ -117,7 +200,7 @@ func TestResolveAssociation(t *testing.T) {
 		assert.Equal(t, Association{
 			Repo:       "https://github.com/org/mapped.git",
 			Ref:        "v1",
-			Policy:     types.GitPolicyMinor,
+			Policy:     semver.PolicyMinor,
 			Dockerfile: "label.Dockerfile",
 			Context:    "app",
 		}, got)
@@ -127,12 +210,12 @@ func TestResolveAssociation(t *testing.T) {
 		t.Parallel()
 
 		c := testContainer(t, nil, "myapp:latest")
-		got, ok := ResolveAssociation(c, types.UpdateParams{
-			GitDefaultRef:   "trunk",
-			GitSemverPolicy: types.GitPolicyMajor,
-			GitDockerfile:   "ci/Dockerfile",
-			GitContext:      "docker",
-			GitImages: map[string]types.GitImage{
+		got, ok := ResolveAssociation(c, gitConfig.Defaults{
+			DefaultRef:   "trunk",
+			SemverPolicy: semver.PolicyMajor,
+			Dockerfile:   "ci/Dockerfile",
+			Context:      "docker",
+			Images: map[string]gitConfig.Image{
 				"myapp:latest": {Repo: "https://github.com/org/mapped.git"},
 			},
 		})
@@ -140,7 +223,7 @@ func TestResolveAssociation(t *testing.T) {
 		assert.Equal(t, Association{
 			Repo:                  "https://github.com/org/mapped.git",
 			Ref:                   "trunk",
-			Policy:                types.GitPolicyMajor,
+			Policy:                semver.PolicyMajor,
 			Dockerfile:            "ci/Dockerfile",
 			Context:               "docker",
 			RefFromDefault:        true,
@@ -154,7 +237,7 @@ func TestResolveAssociation(t *testing.T) {
 		t.Parallel()
 
 		c := testContainer(t, nil, "nginx:latest")
-		got, ok := ResolveAssociation(c, types.UpdateParams{})
+		got, ok := ResolveAssociation(c, gitConfig.Defaults{})
 		assert.False(t, ok)
 		assert.Equal(t, Association{}, got)
 	})
@@ -166,14 +249,14 @@ func TestShouldMonitor(t *testing.T) {
 	t.Run("nil container", func(t *testing.T) {
 		t.Parallel()
 
-		assert.False(t, ShouldMonitor(nil, nil, types.UpdateParams{EnableGitMonitoring: true}))
+		assert.False(t, ShouldMonitor(nil, nil, gitConfig.Defaults{Enable: true}))
 	})
 
 	t.Run("associated and process watch", func(t *testing.T) {
 		t.Parallel()
 
 		c := testContainer(t, map[string]string{labels.GitRepo: "https://github.com/org/app.git"}, "myapp:latest")
-		assert.True(t, ShouldMonitor(nil, c, types.UpdateParams{EnableGitMonitoring: true}))
+		assert.True(t, ShouldMonitor(nil, c, gitConfig.Defaults{Enable: true}))
 	})
 
 	t.Run("associated but watch off", func(t *testing.T) {
@@ -183,7 +266,7 @@ func TestShouldMonitor(t *testing.T) {
 			labels.GitRepo:  "https://github.com/org/app.git",
 			labels.GitWatch: "false",
 		}, "myapp:latest")
-		assert.False(t, ShouldMonitor(nil, c, types.UpdateParams{EnableGitMonitoring: true}))
+		assert.False(t, ShouldMonitor(nil, c, gitConfig.Defaults{Enable: true}))
 	})
 
 	t.Run("watchtower is excluded", func(t *testing.T) {
@@ -191,7 +274,7 @@ func TestShouldMonitor(t *testing.T) {
 
 		c := typemocks.NewMockContainer(t)
 		c.EXPECT().IsWatchtower().Return(true)
-		assert.False(t, ShouldMonitor(nil, c, types.UpdateParams{EnableGitMonitoring: true}))
+		assert.False(t, ShouldMonitor(nil, c, gitConfig.Defaults{Enable: true}))
 	})
 
 	t.Run("watch without association", func(t *testing.T) {
@@ -199,8 +282,8 @@ func TestShouldMonitor(t *testing.T) {
 
 		c := testContainer(t, map[string]string{labels.GitWatch: "true"}, "nginx:latest")
 		nop := zerolog.Nop()
-		assert.False(t, ShouldMonitor(&nop, c, types.UpdateParams{}))
-		assert.False(t, ShouldMonitor(nil, c, types.UpdateParams{}))
+		assert.False(t, ShouldMonitor(&nop, c, gitConfig.Defaults{}))
+		assert.False(t, ShouldMonitor(nil, c, gitConfig.Defaults{}))
 	})
 }
 
@@ -227,29 +310,17 @@ func TestRefLabel(t *testing.T) {
 	assert.Empty(t, refLabel(testContainer(t, nil, "app:latest")))
 }
 
-func TestPolicyLabel(t *testing.T) {
-	t.Parallel()
-
-	assert.Equal(t, types.GitPolicyPatch, policyLabel(testContainer(t, map[string]string{
-		labels.GitSemverPolicy: "Patch",
-	}, "app:latest")))
-	assert.Empty(t, policyLabel(testContainer(t, map[string]string{
-		labels.GitSemverPolicy: "nightly",
-	}, "app:latest")))
-	assert.Empty(t, policyLabel(testContainer(t, nil, "app:latest")))
-}
-
 func TestImageMapping(t *testing.T) {
 	t.Parallel()
 
-	images := map[string]types.GitImage{
+	images := map[string]gitConfig.Image{
 		"myapp:latest": {Repo: "https://github.com/org/app.git"},
 	}
 
 	assert.Equal(t, images["myapp:latest"], imageMapping("myapp:latest", images))
-	assert.Equal(t, types.GitImage{}, imageMapping("other:latest", images))
-	assert.Equal(t, types.GitImage{}, imageMapping("myapp:latest", nil))
-	assert.Equal(t, types.GitImage{}, imageMapping("", images))
+	assert.Equal(t, gitConfig.Image{}, imageMapping("other:latest", images))
+	assert.Equal(t, gitConfig.Image{}, imageMapping("myapp:latest", nil))
+	assert.Equal(t, gitConfig.Image{}, imageMapping("", images))
 }
 
 func TestPersistWatch(t *testing.T) {
@@ -319,7 +390,7 @@ func TestIsWatch(t *testing.T) {
 				containerLabels[labels.GitWatch] = tt.label
 			}
 
-			got := isWatch(testContainer(t, containerLabels, "app:latest"), types.UpdateParams{EnableGitMonitoring: tt.process})
+			got := isWatch(testContainer(t, containerLabels, "app:latest"), gitConfig.Defaults{Enable: tt.process})
 			assert.Equal(t, tt.want, got)
 		})
 	}
@@ -328,16 +399,17 @@ func TestIsWatch(t *testing.T) {
 func TestDefaultRef(t *testing.T) {
 	t.Parallel()
 
-	assert.Equal(t, "main", defaultRef(types.UpdateParams{}))
-	assert.Equal(t, "develop", defaultRef(types.UpdateParams{GitDefaultRef: "develop"}))
+	assert.Equal(t, "main", defaultRef(gitConfig.Defaults{}))
+	assert.Equal(t, "develop", defaultRef(gitConfig.Defaults{DefaultRef: "develop"}))
 }
 
 func TestDefaultPolicy(t *testing.T) {
 	t.Parallel()
 
-	assert.Equal(t, types.GitPolicyNone, defaultPolicy(types.UpdateParams{}))
-	assert.Equal(t, types.GitPolicyMinor, defaultPolicy(types.UpdateParams{GitSemverPolicy: types.GitPolicyMinor}))
-	assert.Equal(t, types.GitPolicyNone, defaultPolicy(types.UpdateParams{GitSemverPolicy: "nightly"}))
+	assert.Equal(t, semver.PolicyNone, defaultPolicy(gitConfig.Defaults{}))
+	assert.Equal(t, semver.PolicyMinor, defaultPolicy(gitConfig.Defaults{SemverPolicy: semver.PolicyMinor}))
+	assert.Equal(t, semver.PolicyMajor, defaultPolicy(gitConfig.Defaults{SemverPolicy: " Major "}))
+	assert.Equal(t, semver.PolicyNone, defaultPolicy(gitConfig.Defaults{SemverPolicy: "nightly"}))
 }
 
 // testContainer returns a container whose labels and image name are fixed.

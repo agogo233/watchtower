@@ -28,10 +28,11 @@ import (
 	containerClient "github.com/nicholas-fedor/watchtower/internal/container/client"
 	mockContainerClient "github.com/nicholas-fedor/watchtower/internal/container/client/mocks"
 	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
+	"github.com/nicholas-fedor/watchtower/internal/observability/notify"
 	"github.com/nicholas-fedor/watchtower/internal/registry/ratelimit"
 	"github.com/nicholas-fedor/watchtower/internal/settings"
 	notifyConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/notify"
-	"github.com/nicholas-fedor/watchtower/pkg/notifications"
+	"github.com/nicholas-fedor/watchtower/internal/testutil/logcapture"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
@@ -63,8 +64,9 @@ type runTestState struct {
 }
 
 // setRunState sets the package variables run and runMain read, and restores
-// every one of them when the test ends. The Docker readiness sleep is skipped,
-// and the notifier has no services, so it sends nothing.
+// every one of them when the test ends. Watchtower runs as the main process of
+// its container. The Docker readiness sleep is skipped. The notifier has no
+// services, so it sends nothing.
 func setRunState(t *testing.T, state runTestState) {
 	t.Helper()
 
@@ -78,6 +80,8 @@ func setRunState(t *testing.T, state runTestState) {
 	savedRunUpdates := runUpdatesWithNotifications
 	savedSleep := sleepFunc
 	savedSignalContext := createSignalContext
+	savedProcessID := processID
+	savedParentProcessID := parentProcessID
 
 	t.Cleanup(func() {
 		appCfg = savedCfg
@@ -90,6 +94,8 @@ func setRunState(t *testing.T, state runTestState) {
 		runUpdatesWithNotifications = savedRunUpdates
 		sleepFunc = savedSleep
 		createSignalContext = savedSignalContext
+		processID = savedProcessID
+		parentProcessID = savedParentProcessID
 	})
 
 	appCfg = settings.Config{}
@@ -99,9 +105,36 @@ func setRunState(t *testing.T, state runTestState) {
 	currentWatchtowerContainerID = state.currentID
 	currentWatchtowerContainerUnknown = false
 	sleepFunc = func(time.Duration) {}
+	processID = func() int { return 1 }
+	parentProcessID = func() int { return 0 }
 
-	notifier = notifications.NewNotifier(new(zerolog.Nop()), notifyConfig.Notify{Level: "info"})
+	created, err := notify.NewNotifier(new(zerolog.Nop()), notifyConfig.Notify{Level: "info"})
+	require.NoError(t, err)
+
+	notifier = created
 	t.Cleanup(notifier.Close)
+}
+
+// newLoggerNotifier returns a notifier hooked to log whose logger:// service
+// writes each notification it sends to log. It registers the hook that starts
+// the sending worker and closes the notifier when the test ends.
+//
+// Parameters:
+//   - t: Test that owns the notifier.
+//   - log: Logger the notifier hooks and writes to.
+//
+// Returns:
+//   - *notify.Notifier: The hooked notifier.
+func newLoggerNotifier(t *testing.T, log *zerolog.Logger) *notify.Notifier {
+	t.Helper()
+
+	hooked, err := notify.NewNotifier(log, notifyConfig.Notify{Level: "info", URLs: []string{"logger://"}})
+	require.NoError(t, err)
+	t.Cleanup(hooked.Close)
+
+	hooked.RegisterHook(log)
+
+	return hooked
 }
 
 // runFixtureContainer returns a running container with the given ID, name,
@@ -231,7 +264,7 @@ func runUntilCanceled(t *testing.T, args ...string) {
 		done := make(chan struct{})
 
 		go func() {
-			newRunProcess().run(cmd, nil)
+			assert.NoError(t, newRunProcess().run(cmd, nil))
 			close(done)
 		}()
 
@@ -260,22 +293,27 @@ func newRunProcess() *process {
 }
 
 // TestRun_RunOnce records the Docker calls of a run-once update with no
-// containers to update. The restart policy is disabled at the end whether or
-// not Watchtower runs in a container.
+// containers to update. The restart policy is disabled at the end in a
+// container. A host binary has none to disable.
 func TestRun_RunOnce(t *testing.T) {
 	tests := []struct {
 		name    string
 		current types.Container
-		want    []string
+		// hostBinary runs Watchtower outside a container.
+		hostBinary bool
+		want       []string
 	}{
 		{
-			name: "outside a container",
-			want: []string{"GetVersion", "ListContainers filtered", "SetRestartPolicy none no"},
+			name:       "outside a container",
+			hostBinary: true,
+			want:       []string{"GetVersion", "ListContainers filtered"},
 		},
 		{
+			// The old-instance cleanup lists the containers again to find the
+			// current one's scope, and skips when it is not listed.
 			name:    "in a container",
 			current: currentWatchtower(),
-			want:    []string{"GetVersion", "ListContainers filtered", "SetRestartPolicy c0c0 no"},
+			want:    []string{"GetVersion", "ListContainers filtered", "ListContainers filtered", "SetRestartPolicy c0c0 no"},
 		},
 	}
 
@@ -284,7 +322,7 @@ func TestRun_RunOnce(t *testing.T) {
 			mockClient := mockContainerClient.NewMockClient(t)
 			mockClient.EXPECT().GetVersion().Return("1.47")
 			mockClient.EXPECT().ListContainers(mock.Anything, withFilter).Return(nil, nil)
-			mockClient.EXPECT().SetRestartPolicy(mock.Anything, mock.Anything, mock.Anything).Return(nil)
+			mockClient.EXPECT().SetRestartPolicy(mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
 
 			state := runTestState{client: mockClient, current: tt.current}
 			if tt.current != nil {
@@ -293,7 +331,11 @@ func TestRun_RunOnce(t *testing.T) {
 
 			setRunState(t, state)
 
-			newRunProcess().run(newTestRootCommand(t, "--run-once"), nil)
+			if tt.hostBinary {
+				processID = func() int { return 4242 }
+			}
+
+			require.NoError(t, newRunProcess().run(newTestRootCommand(t, "--run-once"), nil))
 
 			assert.Equal(t, tt.want, runCalls(mockClient))
 		})
@@ -477,7 +519,9 @@ func TestRun_PublishedPortsBlockSelfUpdates(t *testing.T) {
 // TestRun_WaitsForAPIDrain verifies that continuous mode with the HTTP API in
 // the background does not return until the API has finished a request it was
 // serving when the process was told to stop. The request lists containers, so
-// it does not hold the update lock that the scheduler also waits for.
+// it does not hold the update lock that the scheduler also waits for. A line
+// the request logs while the API drains still reaches the notifier, which
+// closes only after the API has stopped.
 func TestRun_WaitsForAPIDrain(t *testing.T) {
 	// stopTimeout bounds the wait for run to return after its context is
 	// canceled. It covers the HTTP API's shutdown grace period.
@@ -493,6 +537,9 @@ func TestRun_WaitsForAPIDrain(t *testing.T) {
 	releaseRequest := sync.OnceFunc(func() { close(release) })
 	t.Cleanup(releaseRequest)
 
+	notifierLog, notifierLogs := logcapture.New(zerolog.InfoLevel)
+	drainNotifier := newLoggerNotifier(t, notifierLog)
+
 	mockClient := mockContainerClient.NewMockClient(t)
 	// The startup cleanup of older instances lists the containers first.
 	mockClient.EXPECT().ListContainers(mock.Anything, withFilter).Return([]types.Container{current}, nil).Once()
@@ -503,11 +550,16 @@ func TestRun_WaitsForAPIDrain(t *testing.T) {
 			close(entered)
 			<-release
 
+			// The request logs through the hooked logger while the API drains.
+			notifierLog.Warn().Msg("Logged while the HTTP API drains")
+
 			return []types.Container{}, nil
 		}).Once()
 	mockClient.EXPECT().GetVersion().Return("1.47").Maybe()
 
 	setRunState(t, runTestState{client: mockClient, current: current, currentID: current.ID()})
+
+	notifier = drainNotifier
 
 	// run's process context, which the test cancels the way a signal would.
 	runCtx, cancelRun := context.WithCancel(context.Background())
@@ -539,7 +591,7 @@ func TestRun_WaitsForAPIDrain(t *testing.T) {
 	go func() {
 		defer close(done)
 
-		newRunProcess().run(cmd, nil)
+		assert.NoError(t, newRunProcess().run(cmd, nil))
 	}()
 
 	// Stop run before setRunState restores the package state it reads, so a
@@ -616,6 +668,13 @@ func TestRun_WaitsForAPIDrain(t *testing.T) {
 	case <-time.After(stopTimeout):
 		t.Fatal("run did not return after the HTTP API finished its request")
 	}
+
+	// The process closes the notifier when it ends, after run returns. Closing
+	// waits for the worker to send what is queued. A notifier closed during the
+	// drain would have dropped the line instead.
+	newRunProcess().exit(cmd, nil)
+
+	assert.Contains(t, notifierLogs.String(), "Shoutrrr: Logged while the HTTP API drains")
 }
 
 // TestRun_HealthCheck verifies that the health check mode returns without
@@ -624,13 +683,19 @@ func TestRun_HealthCheck(t *testing.T) {
 	mockClient := mockContainerClient.NewMockClient(t)
 	setRunState(t, runTestState{client: mockClient})
 
-	newRunProcess().run(newTestRootCommand(t, "--health-check"), nil)
+	// A health check probe runs beside the container's main process.
+	processID = func() int { return 42 }
+
+	require.NoError(t, newRunProcess().run(newTestRootCommand(t, "--health-check"), nil))
 
 	assert.Empty(t, runCalls(mockClient))
 }
 
-// TestRun_Exit verifies how run ends the process when it cannot continue, and
-// that the restart policy of the Watchtower container is disabled first.
+// TestRun_Exit verifies how run ends the process when it cannot continue. It
+// disables the restart policy of the Watchtower container first and reports
+// the exit in a notification. Watchtower holds every line until its startup
+// message. Because that message never comes, closing the notifier at the exit
+// is what sends the line.
 func TestRun_Exit(t *testing.T) {
 	if helperCase := os.Getenv(runExitHelperEnv); helperCase != "" {
 		runExitHelper(t, helperCase)
@@ -641,16 +706,30 @@ func TestRun_Exit(t *testing.T) {
 
 	tests := []struct {
 		helperCase string
+		// wantOutput is what the exit writes. For a failure that reaches
+		// notifications, it is the start of the notification, which gives the
+		// logged message and its cause.
 		wantOutput string
 	}{
 		{
 			// Loading the configuration rejects the combination, so runMain's own
-			// check for it is never reached through run.
+			// check for it is never reached through run. Because a real start
+			// rejects it in preRun before notifications are set up, the case
+			// runs without them.
 			helperCase: "rolling-restart-with-monitor-only",
 			wantOutput: "rolling-restart and monitor-only cannot both be enabled",
 		},
-		{helperCase: "rolling-restart-validation-fails", wantOutput: "Rolling restart compatibility validation failed"},
-		{helperCase: "api-without-token", wantOutput: "API setup failed"},
+		{
+			// The run configuration is checked after the configuration loads.
+			// A failure there happens again on the next start too.
+			helperCase: "invalid-run-configuration",
+			wantOutput: "Shoutrrr: Failed to build run configuration: invalid http-api-host",
+		},
+		{
+			helperCase: "rolling-restart-validation-fails",
+			wantOutput: "Shoutrrr: Rolling restart compatibility validation failed: " + errRunTestDocker.Error(),
+		},
+		{helperCase: "api-without-token", wantOutput: "Shoutrrr: API setup failed: API token is empty or unset"},
 	}
 
 	for _, tt := range tests {
@@ -668,9 +747,9 @@ func TestRun_Exit(t *testing.T) {
 
 			require.ErrorAs(t, err, &exitErr, "output:\n%s", out)
 			assert.Equal(t, 1, exitErr.ExitCode(), "output:\n%s", out)
-			assert.Contains(t, string(out), tt.wantOutput)
 			assert.Contains(t, string(out), "SetRestartPolicy c0c0 no",
 				"the restart policy is disabled before the process ends")
+			assert.Contains(t, string(out), tt.wantOutput)
 		})
 	}
 }
@@ -691,9 +770,16 @@ func runExitHelper(t *testing.T, helperCase string) {
 
 	var args []string
 
+	// notified gives the case a notifier, as when the failure comes after
+	// startup has set notifications up.
+	notified := true
+
 	switch helperCase {
 	case "rolling-restart-with-monitor-only":
 		args = []string{"--rolling-restart", "--monitor-only"}
+		notified = false
+	case "invalid-run-configuration":
+		args = []string{"--http-api-host", "not-an-ip"}
 	case "rolling-restart-validation-fails":
 		args = []string{"--rolling-restart"}
 
@@ -709,8 +795,20 @@ func runExitHelper(t *testing.T, helperCase string) {
 
 	setRunState(t, runTestState{client: mockClient, current: current, currentID: current.ID()})
 
-	proc := &process{log: logging.New(os.Stderr, logging.InfoLevel)}
-	proc.run(newTestRootCommand(t, args...), nil)
+	// Watchtower runs as the main process of its container.
+	processID = func() int { return 1 }
+
+	log := logging.New(os.Stderr, logging.InfoLevel)
+
+	// The notifier holds every line until the startup message, as at startup.
+	if notified {
+		notifier = newLoggerNotifier(t, log)
+	}
+
+	cmd := newTestRootCommand(t, args...)
+
+	proc := &process{log: log}
+	proc.exit(cmd, proc.run(cmd, nil))
 }
 
 // TestRun_OldInstanceStops verifies that continuous mode stops on its own
@@ -744,7 +842,7 @@ func TestRun_OldInstanceStops(t *testing.T) {
 		done := make(chan struct{})
 
 		go func() {
-			newRunProcess().run(cmd, nil)
+			assert.NoError(t, newRunProcess().run(cmd, nil))
 			close(done)
 		}()
 

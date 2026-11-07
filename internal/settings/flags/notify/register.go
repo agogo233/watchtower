@@ -1,4 +1,3 @@
-// Package notify registers notification-related CLI and environment flags.
 package notify
 
 import (
@@ -7,8 +6,13 @@ import (
 	"github.com/nicholas-fedor/watchtower/internal/settings/flags/spec"
 )
 
-// defaultEmailServerPort is the static default SMTP port.
-const defaultEmailServerPort = 25
+// Constants for the legacy email server port.
+const (
+	// defaultEmailServerPort is the static default SMTP port.
+	defaultEmailServerPort = 25
+	// maxPort is the highest TCP port, since a port is a 16-bit number.
+	maxPort = 65535
+)
 
 // Specs returns notify domain flag metadata with static defaults.
 //
@@ -29,7 +33,7 @@ func Specs() []spec.FlagSpec {
 			Kind:    spec.KindString,
 			Default: "info",
 			EnvKeys: []string{"WATCHTOWER_NOTIFICATIONS_LEVEL"},
-			Help:    "The log level used for sending notifications. Possible values: panic, fatal, error, warn, info or debug",
+			Help:    "The log level used for sending notifications. Possible values: panic, fatal, error, warn, info, debug or trace",
 		},
 		{
 			Name:    "notifications-delay",
@@ -92,7 +96,7 @@ func Specs() []spec.FlagSpec {
 			Kind:    spec.KindBool,
 			Default: false,
 			EnvKeys: []string{"WATCHTOWER_NOTIFICATION_SPLIT_BY_CONTAINER"},
-			Help:    "Send separate notifications for each updated container instead of grouping them",
+			Help:    "Send a separate notification for each container instead of grouping them",
 		},
 
 		{
@@ -141,6 +145,7 @@ func Specs() []spec.FlagSpec {
 			Name:       "notification-email-server-port",
 			Kind:       spec.KindInt,
 			Default:    defaultEmailServerPort,
+			Max:        maxPort,
 			EnvKeys:    []string{"WATCHTOWER_NOTIFICATION_EMAIL_SERVER_PORT"},
 			Deprecated: "Use --notification-url with an smtp:// URL.",
 			Help:       "SMTP server port to send notification emails through",

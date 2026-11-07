@@ -17,7 +17,9 @@ import (
 	mockContainerClient "github.com/nicholas-fedor/watchtower/internal/container/client/mocks"
 	"github.com/nicholas-fedor/watchtower/internal/container/oci"
 	"github.com/nicholas-fedor/watchtower/internal/registry/ratelimit"
+	updateConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/update"
 	mockUpdate "github.com/nicholas-fedor/watchtower/internal/update/mocks"
+	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
@@ -104,7 +106,7 @@ func TestUpdate_ComposeDependencyCycle(t *testing.T) {
 			client.EXPECT().GetContainer(mock.Anything, newID).Return(app, nil).Maybe()
 
 			report, _, err := update(newTestLogger(t), t.Context(), client,
-				types.UpdateParams{UseComposeDependsOn: true}, ratelimit.New())
+				updateParams.Params{UseComposeDependsOn: true}, ratelimit.New())
 			require.NoError(t, err)
 
 			assert.ElementsMatch(t, []string{"web-server", "api-server"}, reportNames(report.Skipped()),
@@ -151,7 +153,7 @@ func TestUpdate_LinkToCycleMember(t *testing.T) {
 	client.EXPECT().ListContainers(mock.Anything, mock.Anything).
 		Return([]types.Container{db, e, c, replica}, nil).Once()
 	client.EXPECT().IsContainerStale(mock.Anything, mock.Anything, mock.Anything).
-		RunAndReturn(func(_ context.Context, ct types.Container, _ types.UpdateParams) (bool, types.ImageID, string, error) {
+		RunAndReturn(func(_ context.Context, ct types.Container, _ updateConfig.Policy) (bool, types.ImageID, string, error) {
 			return ct.Name() == "c", types.ImageID("sha256:new"), "", nil
 		})
 	client.EXPECT().GetImageAnnotations(mock.Anything, mock.Anything).Return(oci.Annotations{}).Maybe()
@@ -178,7 +180,7 @@ func TestUpdate_LinkToCycleMember(t *testing.T) {
 			return nil, errNoContainer
 		}).Maybe()
 
-	report, _, err := update(newTestLogger(t), t.Context(), client, types.UpdateParams{}, ratelimit.New())
+	report, _, err := update(newTestLogger(t), t.Context(), client, updateParams.Params{}, ratelimit.New())
 	require.NoError(t, err)
 
 	assert.ElementsMatch(t, []string{"db", "e"}, reportNames(report.Skipped()), "both cycle members are skipped")
@@ -234,7 +236,7 @@ func TestUpdate_HostConfigDependencyCycle(t *testing.T) {
 	client.EXPECT().StartContainerByID(mock.Anything, mock.Anything).Return(nil).Maybe()
 	client.EXPECT().GetContainer(mock.Anything, mock.Anything).Return(web, nil).Maybe()
 
-	report, _, err := update(newTestLogger(t), t.Context(), client, types.UpdateParams{}, ratelimit.New())
+	report, _, err := update(newTestLogger(t), t.Context(), client, updateParams.Params{}, ratelimit.New())
 	require.NoError(t, err)
 
 	assert.ElementsMatch(t, []string{"app", "vpn"}, reportNames(report.Skipped()), "both cycle members are skipped")

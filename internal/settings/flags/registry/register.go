@@ -1,4 +1,3 @@
-// Package registry registers registry TLS flags.
 package registry
 
 import (
@@ -25,7 +24,7 @@ func Specs() []spec.FlagSpec {
 			Kind:    spec.KindString,
 			Default: "TLS1.2",
 			EnvKeys: []string{"WATCHTOWER_REGISTRY_TLS_MIN_VERSION"},
-			Help:    "Minimum TLS version for registry connections (e.g., TLS1.0, TLS1.1, TLS1.2, TLS1.3); default is TLS1.2",
+			Help:    "Minimum TLS version for registry connections (TLS1.2 or TLS1.3); default is TLS1.2",
 		},
 	}
 }

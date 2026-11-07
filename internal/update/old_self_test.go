@@ -12,8 +12,8 @@ import (
 	mockContainerClient "github.com/nicholas-fedor/watchtower/internal/container/client/mocks"
 	"github.com/nicholas-fedor/watchtower/internal/observability/events"
 	mockUpdate "github.com/nicholas-fedor/watchtower/internal/update/mocks"
+	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
-	mockTypes "github.com/nicholas-fedor/watchtower/pkg/types/mocks"
 )
 
 // TestRunUpdatesWithNotifications_OldSelfDetected verifies that when the
@@ -42,9 +42,10 @@ func TestRunUpdatesWithNotifications_OldSelfDetected(t *testing.T) {
 	client.EXPECT().SetRestartPolicy(mock.Anything, oldSelf.ID(),
 		dockerContainer.RestartPolicy{Name: dockerContainer.RestartPolicyDisabled}).Return(nil).Once()
 
-	// The notifier mock fails the test on any call other than starting the batch.
-	notifier := mockTypes.NewMockNotifier(t)
-	notifier.EXPECT().StartNotification(false).Once()
+	// The notifier mock fails the test on any call other than starting the
+	// batch and ending it without sending.
+	notifier := mockUpdate.NewMockNotifier(t)
+	expectSessionBatch(t, notifier)
 
 	broadcaster := events.NewBroadcaster()
 	published, _ := broadcaster.SubscribeWithDone()
@@ -56,7 +57,7 @@ func TestRunUpdatesWithNotifications_OldSelfDetected(t *testing.T) {
 		Client:            client,
 		Notifier:          notifier,
 		EventBroadcaster:  broadcaster,
-		Update:            types.UpdateParams{CurrentContainerID: types.ContainerID(oldID)},
+		Update:            updateParams.Params{CurrentContainerID: types.ContainerID(oldID)},
 		OnOldSelfDetected: func() { detected++ },
 	})
 

@@ -64,7 +64,7 @@
 # Each entry can carry its own config and interfaces maps, which override the top-level settings.
 # Default: null
 packages:
-  # Top-level pkg directory, recursively includes all subpackages (e.g., pkg/types, pkg/notifications)
+  # Top-level pkg directory, recursively includes all subpackages (e.g., pkg/types)
   github.com/nicholas-fedor/watchtower/pkg: {}
 
   # Top-level internal directory, recursively includes all subpackages (e.g., internal/update)
@@ -82,6 +82,17 @@ packages:
     interfaces:
       APIClient: {}
       ImagePullResponse: {}
+
+  # The Compose SDK's service, which the Compose apply tests use in place of Compose and a
+  # Docker daemon. Only this interface is generated. It goes into internal/compose/apply/mocks,
+  # which imports no Watchtower code, so the apply package's own tests can import it.
+  github.com/docker/compose/v5/pkg/api:
+    config:
+      all: false
+      recursive: false
+      dir: internal/compose/apply/mocks
+    interfaces:
+      Compose: {}
 
 # Generate mocks for every interface in the configured packages, exported or not.
 # When false, only interfaces listed under interfaces, matching include-interface-regex, or marked

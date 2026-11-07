@@ -7,7 +7,6 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/nicholas-fedor/watchtower/internal/settings/units"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // APIVersionProvider reports the Docker API version for startup messaging.
@@ -18,6 +17,17 @@ type APIVersionProvider interface {
 	GetVersion() string
 }
 
+// StartupNotifier sends the startup message as one notification.
+type StartupNotifier interface {
+	// StartNotification starts collecting log entries for the startup message.
+	// Entries collected before it, such as the lines logged before startup,
+	// are sent first. The returned end sends the entries collected since then
+	// without a report.
+	StartNotification() func()
+	// GetNames returns the names of the configured notification services.
+	GetNames() []string
+}
+
 // StartupParams holds resolved process values for startup messaging.
 //
 // Callers must populate these from settings.Load output. Do not read CLI flags here.
@@ -26,24 +36,25 @@ type StartupParams struct {
 	// ScheduleInfo holds run-once, update-on-start, HTTP API, and next-run schedule values.
 	ScheduleInfo
 
+	// Client is the Docker client used for API version reporting.
+	Client APIVersionProvider
+	// Notifier sends batched startup messages when not suppressed.
+	Notifier StartupNotifier
+
 	// Logger is the zerolog logger used for startup messages. Required when NoStartupMessage is false.
 	Logger *zerolog.Logger
-	// NoStartupMessage suppresses all startup logs and notifications when true.
-	NoStartupMessage bool
 	// Filtering is a human-readable description of the container filter.
 	Filtering string
 	// Scope is the operational scope name, or empty when unset.
 	Scope string
-	// Client is the Docker client used for API version reporting.
-	Client APIVersionProvider
-	// Notifier sends batched startup messages when not suppressed.
-	Notifier types.Notifier
 	// Version is the Watchtower version string.
 	Version string
 	// DiskSpaceMaxBytes is the parsed Docker image-usage block threshold, or 0 if unset.
 	DiskSpaceMaxBytes int64
 	// DiskSpaceWarnBytes is the parsed Docker image-usage warning threshold, or 0 if unset.
 	DiskSpaceWarnBytes int64
+	// NoStartupMessage suppresses all startup logs and notifications when true.
+	NoStartupMessage bool
 }
 
 // WriteStartupMessage logs or notifies startup information from resolved configuration.
@@ -57,31 +68,40 @@ type StartupParams struct {
 //     When NoStartupMessage is false, Logger must be non-nil and should be the hooked
 //     process logger (after Notifier.RegisterHook) so batching captures startup lines.
 func WriteStartupMessage(params StartupParams) {
-	// If startup messages are suppressed, skip all logging and notifier batching.
-	if params.NoStartupMessage {
-		return
-	}
-
-	if params.Logger == nil {
+	if !params.NoStartupMessage && params.Logger == nil {
 		panic("logging.WriteStartupMessage: Logger is required when NoStartupMessage is false")
 	}
 
-	// Batch startup lines through the notifier when present (suppression already returned).
-	startupLog := setupStartupLogger(params.Logger, params.Notifier)
+	// Startup collects its lines in a batch of its own and ends only that
+	// batch. Opening it sends the lines collected before startup.
+	end := func() {}
+	if params.Notifier != nil {
+		end = params.Notifier.StartNotification()
+	}
+
+	// With startup messages suppressed, startup logs nothing and ends its
+	// batch at once.
+	if params.NoStartupMessage {
+		end()
+
+		return
+	}
+
+	log := params.Logger
 
 	var apiVersion string
 	if params.Client != nil {
 		apiVersion = params.Client.GetVersion()
 	}
 
-	startupLog.Info().
+	log.Info().
 		Msg("Watchtower " + params.Version + " using Docker API v" + apiVersion)
 
 	if params.DiskSpaceMaxBytes > 0 || params.DiskSpaceWarnBytes > 0 {
-		startupLog.Info().
+		log.Info().
 			Int64("disk_space_max", params.DiskSpaceMaxBytes).
 			Int64("disk_space_warn", params.DiskSpaceWarnBytes).
-			Msg("Docker image usage budget enabled")
+			Msg(ImageUsageBudgetEnabled)
 	}
 
 	// Log details about configured notifiers or lack thereof.
@@ -90,50 +110,28 @@ func WriteStartupMessage(params StartupParams) {
 		notifierNames = params.Notifier.GetNames()
 	}
 
-	logNotifierInfo(startupLog, notifierNames)
+	logNotifierInfo(log, notifierNames)
 
 	// Log filtering information, using structured logging for scope when set.
 	if params.Scope != "" {
-		startupLog.Info().
+		log.Info().
 			Str("scope", params.Scope).
-			Msg("Only checking containers in scope")
+			Msg(ScopedToContainers)
 	} else {
-		startupLog.Debug().Msg(params.Filtering)
+		log.Debug().Msg(params.Filtering)
 	}
 
 	// Log scheduling or run mode information based on configuration.
-	logScheduleInfo(startupLog, params.ScheduleInfo)
+	logScheduleInfo(log, params.ScheduleInfo)
 
-	// Send batched notifications if not suppressed, ensuring startup info reaches users.
-	if params.Notifier != nil {
-		params.Notifier.SendNotification(nil)
-	}
+	// Send the startup lines.
+	end()
 
 	// Warn about trace-level logging if enabled, as it may expose sensitive data.
-	if startupLog.GetLevel() <= zerolog.TraceLevel {
-		startupLog.Warn().
+	if log.GetLevel() <= zerolog.TraceLevel {
+		log.Warn().
 			Msg("Trace-level logging enabled: Sensitive credentials and tokens may be included in logs")
 	}
-}
-
-// setupStartupLogger prepares the logger for startup messages and starts notifier batching.
-//
-// Callers that suppress startup messages must return before invoking this helper.
-// When notifier is non-nil, StartNotification batches subsequent startup lines for
-// a single SendNotification.
-//
-// Parameters:
-//   - log: The zerolog logger used for startup messages.
-//   - notifier: The notification system instance for batching messages, or nil.
-//
-// Returns:
-//   - *zerolog.Logger: The logger to use for writing startup messages.
-func setupStartupLogger(log *zerolog.Logger, notifier types.Notifier) *zerolog.Logger {
-	if notifier != nil {
-		notifier.StartNotification(false)
-	}
-
-	return log
 }
 
 // logNotifierInfo logs details about the notification setup for Watchtower.
@@ -156,16 +154,16 @@ func logNotifierInfo(log *zerolog.Logger, notifierNames []string) {
 //
 // Values come from settings.Load projections rather than CLI flag reads.
 type ScheduleInfo struct {
-	// RunOnce indicates a single update run then exit.
-	RunOnce bool
+	// Sched is the time of the first scheduled run, or zero if none.
+	Sched time.Time
 	// UpdateOnStart is the effective update-on-start value, or nil when unset or false.
 	UpdateOnStart *bool
+	// RunOnce indicates a single update run then exit.
+	RunOnce bool
 	// HTTPAPIUpdate is true when the HTTP update API is enabled.
 	HTTPAPIUpdate bool
 	// HTTPAPIPeriodicPolls is true when scheduled polls run with the HTTP API.
 	HTTPAPIPeriodicPolls bool
-	// Sched is the time of the first scheduled run, or zero if none.
-	Sched time.Time
 }
 
 // logScheduleInfo logs information about the scheduling or run mode configuration.

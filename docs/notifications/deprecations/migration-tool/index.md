@@ -6,6 +6,12 @@ Watchtower includes a `notify-upgrade` command to help convert legacy notificati
 
 It parses legacy Watchtower notification configurations and outputs Shoutrrr URLs to a temporary file inside the Watchtower container.
 
+!!! Note "Settings the file leaves out"
+    The file holds only the notification URL. It leaves out two legacy email settings, which are not part of a Shoutrrr URL. Watchtower applies both while your legacy settings are in place. When you switch to the generated URL, set their replacements yourself:
+
+    - [`notification-email-delay`](../../../configuration/notifications/index.md#email_delay) is replaced by [`notifications-delay`](../../../configuration/notifications/index.md#notifications_delay).
+    - [`notification-email-subjecttag`](../../../configuration/notifications/index.md#email_subject_tag) is replaced by [`notification-title-tag`](../../../configuration/notifications/index.md#notification_title_tag).
+
 ## Usage
 
 The `notify-upgrade` command converts legacy Watchtower notification configurations into Shoutrrr URLs and writes them to a temporary file inside the container.
@@ -220,6 +226,8 @@ docker cp <CONTAINER>:<FILE_PATH> ./watchtower-notifications.env
 
 The temporary file is automatically removed after **5 minutes** or when the container stops, so copy it promptly after generation.
 If you are running `notify-upgrade` as a one-off command (`docker run --rm ...`), the process will wait up to 5 minutes before exiting.
+Before it writes the file, `notify-upgrade` checks every URL with Shoutrrr, as Watchtower does at startup. If Shoutrrr rejects a URL, such as a Discord webhook whose ID is not a number, `notify-upgrade` writes no file. Its error never contains the URL. It usually names the service. It cannot when the URL has no scheme or does not parse. The same holds for a URL that ends in an empty `#` fragment. The error gives a notification URL's position, counting from 1. For a URL converted from a legacy notification type, it names that type instead. Shoutrrr's warnings about a URL, such as a deprecated key, appear in the log.
+When the conversion fails, `notify-upgrade` logs the error and exits with code 1. It removes any file it started to write. If it logs "Failed to remove temporary file" instead, delete the file named in that warning yourself, because it can hold your notification credentials.
 
 ## Migration Walkthrough
 
@@ -242,6 +250,8 @@ Select the tab that matches your legacy notification service.
                         WATCHTOWER_NOTIFICATION_EMAIL_SERVER_PASSWORD: secret
                         WATCHTOWER_NOTIFICATION_EMAIL_FROM: sender@example.com
                         WATCHTOWER_NOTIFICATION_EMAIL_TO: recipient@example.com
+                        WATCHTOWER_NOTIFICATION_EMAIL_DELAY: 10
+                        WATCHTOWER_NOTIFICATION_EMAIL_SUBJECTTAG: Watchtower
                     volumes:
                     - /var/run/docker.sock:/var/run/docker.sock
             ```
@@ -257,6 +267,8 @@ Select the tab that matches your legacy notification service.
               -e WATCHTOWER_NOTIFICATION_EMAIL_SERVER_PASSWORD=secret \
               -e WATCHTOWER_NOTIFICATION_EMAIL_FROM=sender@example.com \
               -e WATCHTOWER_NOTIFICATION_EMAIL_TO=recipient@example.com \
+              -e WATCHTOWER_NOTIFICATION_EMAIL_DELAY=10 \
+              -e WATCHTOWER_NOTIFICATION_EMAIL_SUBJECTTAG=Watchtower \
               nickfedor/watchtower
             ```
         === "Docker CLI (Flags)"
@@ -271,7 +283,9 @@ Select the tab that matches your legacy notification service.
               --notification-email-server-user user@example.com \
               --notification-email-server-password secret \
               --notification-email-from sender@example.com \
-              --notification-email-to recipient@example.com
+              --notification-email-to recipient@example.com \
+              --notification-email-delay 10 \
+              --notification-email-subjecttag Watchtower
             ```
 
     2. With the container running, execute the `notify-upgrade` command:
@@ -292,7 +306,7 @@ Select the tab that matches your legacy notification service.
         smtp://user@example.com:secret@smtp.example.com:587/?fromaddress=sender@example.com&toaddresses=recipient@example.com&encryption=ExplicitTLS&usestarttls=yes
         ```
 
-    4. Replace the deprecated configuration with the coverted Shoutrrr URL:
+    4. Replace the deprecated configuration with the converted Shoutrrr URL. The URL does not carry the email delay or the subject tag. Set the notifications delay and the title tag in their place:
 
         === "Docker Compose"
             ```yaml
@@ -389,7 +403,7 @@ Select the tab that matches your legacy notification service.
         gotify://my.gotify.tld/SuperSecretToken?title=
         ```
 
-    4. Replace the deprecated configuration with the coverted Shoutrrr URL:
+    4. Replace the deprecated configuration with the converted Shoutrrr URL:
 
         === "Docker Compose"
             ```yaml
@@ -473,7 +487,7 @@ Select the tab that matches your legacy notification service.
         slack://hook:AAA-BBB-CCC@webhook?botname=watchtower&color=%23406170
         ```
 
-    4. Replace the deprecated configuration with the coverted Shoutrrr URL:
+    4. Replace the deprecated configuration with the converted Shoutrrr URL:
 
         === "Docker Compose"
             ```yaml
@@ -554,7 +568,7 @@ Select the tab that matches your legacy notification service.
         teams://?host=https%3A%2F%2Fprod-00.westus.logic.azure.com%3A443%2Fworkflows%2Fabc123%2Ftriggers%2Fmanual%2Fpaths%2Finvoke%3Fapi-version%3D2016-06-00%26sp%3D%2Ftriggers%2Fmanual%2Frun%26sv%3D1.0%26sig%3DXXXXXXXX&color=%23406170
         ```
 
-    4. Replace the deprecated configuration with the coverted Shoutrrr URL:
+    4. Replace the deprecated configuration with the converted Shoutrrr URL:
 
         === "Docker Compose"
             ```yaml

@@ -30,6 +30,7 @@ import (
 	containerRuntime "github.com/nicholas-fedor/watchtower/internal/container/runtime"
 	"github.com/nicholas-fedor/watchtower/internal/registry/ratelimit"
 	registryConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/registry"
+	updateConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/update"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
@@ -211,7 +212,7 @@ type Client interface {
 	// Parameters:
 	//   - ctx: Context for cancellation and timeout control.
 	//   - container: Container to check.
-	//   - params: Update parameters for staleness check.
+	//   - policy: Update policy for staleness check.
 	//
 	// Returns:
 	//   - bool: True if image is stale, false otherwise.
@@ -221,7 +222,7 @@ type Client interface {
 	IsContainerStale(
 		ctx context.Context,
 		container types.Container,
-		params types.UpdateParams,
+		policy updateConfig.Policy,
 	) (bool, types.ImageID, string, error)
 
 	// CheckContainerUpdate reports whether a newer image is available without
@@ -231,7 +232,7 @@ type Client interface {
 	// Parameters:
 	//   - ctx: Context for cancellation and timeout control.
 	//   - container: Container to check.
-	//   - params: Update parameters (NoPull, LabelPrecedence).
+	//   - policy: Update policy (NoPull, LabelPrecedence).
 	//
 	// Returns:
 	//   - bool: True if an update is available, false otherwise.
@@ -241,7 +242,7 @@ type Client interface {
 	CheckContainerUpdate(
 		ctx context.Context,
 		container types.Container,
-		params types.UpdateParams,
+		policy updateConfig.Policy,
 	) (bool, types.ImageID, string, error)
 
 	// GetImageAnnotations reads the OCI annotations of an image by reference.
@@ -438,10 +439,13 @@ type Client interface {
 //
 // It wraps the Docker API client and applies custom behavior via ClientOptions.
 type client struct {
-	ClientOptions
-
 	api dockerClient.APIClient
 	log *zerolog.Logger
+
+	// copyFiles holds labeled file snapshots between stop and create of a recreation.
+	copyFiles copyfile.Pending
+
+	ClientOptions
 
 	// runtimeMu protects the cached runtime detection result.
 	runtimeMu sync.Mutex
@@ -449,28 +453,25 @@ type client struct {
 	runtimeDetected bool
 	// isPodman caches the result of Podman runtime detection.
 	isPodman bool
-
-	// copyFiles holds labeled file snapshots between stop and create of a recreation.
-	copyFiles copyfile.Pending
 }
 
 // ClientOptions configures container management behavior for the Docker client.
 type ClientOptions struct {
+	// Fs is the filesystem rooted at "/" that holds the container runtime
+	// marker files. The host filesystem is used when it is nil.
+	Fs fs.FS
+	// RateLimiter paces image pulls, digest checks, and image age requests per
+	// registry host. NewClient creates one when it is nil.
+	RateLimiter      *ratelimit.Limiter
+	CPUCopyMode      string
+	WarnOnHeadFailed containerImage.WarningStrategy
+	// Registry holds the settings for registry digest and image age requests.
+	Registry                registryConfig.Registry
 	RemoveVolumes           bool
 	IncludeStopped          bool
 	ReviveStopped           bool
 	IncludeRestarting       bool
 	DisableMemorySwappiness bool
-	CPUCopyMode             string
-	WarnOnHeadFailed        containerImage.WarningStrategy
-	// Fs is the filesystem rooted at "/" that holds the container runtime
-	// marker files. The host filesystem is used when it is nil.
-	Fs fs.FS
-	// Registry holds the settings for registry digest and image age requests.
-	Registry registryConfig.Registry
-	// RateLimiter paces image pulls, digest checks, and image age requests per
-	// registry host. NewClient creates one when it is nil.
-	RateLimiter *ratelimit.Limiter
 }
 
 // NewClient initializes a new Client instance for Docker API interactions.
@@ -479,34 +480,35 @@ type ClientOptions struct {
 // and validates the API version, falling back to autonegotiation if necessary.
 //
 // Parameters:
+//   - ctx: Bounds the wait for a daemon that is not serving its API yet. The wait ends after
+//     three minutes at most.
+//   - log: Process logger.
 //   - opts: Options to customize container management behavior.
 //
 // Returns:
-//   - Client: Initialized client instance (exits on failure).
-func NewClient(log *zerolog.Logger, opts ClientOptions) Client {
+//   - Client: The initialized client. It is nil when the error is not.
+//   - error: Non-nil when the client cannot be built or rebuilt. An unanswered ping is not an
+//     error.
+func NewClient(ctx context.Context, log *zerolog.Logger, opts ClientOptions) (Client, error) {
 	// Initialize client from environment. FromEnv reads DOCKER_HOST, DOCKER_TLS_VERIFY,
 	// DOCKER_CERT_PATH, and DOCKER_API_VERSION. When DOCKER_API_VERSION is set, the client
 	// uses that fixed version. Otherwise, it defaults to the maximum supported version
 	// with automatic negotiation enabled.
 	//
-	// Construction does not use a context. A timeout is applied only to the subsequent
-	// ping and API negotiation step.
+	// Construction does not use the context. It bounds only the ping and API negotiation
+	// that follow.
 	cli, err := dockerClient.New(dockerClient.FromEnv)
 	if err != nil {
-		log.Fatal().
-			Err(err).
-			Msg("Failed to initialize Docker client")
+		return nil, fmt.Errorf("create Docker client: %w", err)
 	}
 
 	if opts.RateLimiter == nil {
 		opts.RateLimiter = ratelimit.New()
 	}
 
-	cli, result, err := negotiateDockerAPI(log, cli)
+	cli, result, err := negotiateDockerAPI(ctx, log, cli)
 	if err != nil {
-		log.Fatal().
-			Err(err).
-			Msg("Failed to recreate Docker client")
+		return nil, err
 	}
 
 	log.Debug().
@@ -518,11 +520,12 @@ func NewClient(log *zerolog.Logger, opts ClientOptions) Client {
 		api:           cli,
 		log:           log,
 		ClientOptions: opts,
-	}
+	}, nil
 }
 
 // negotiateDockerAPI pings the daemon to validate connectivity and negotiate the API version.
-// It waits up to three minutes for a daemon that is not serving its API yet.
+// It waits for a daemon that is not serving its API yet until ctx ends, for three minutes at
+// most.
 //
 // When DOCKER_API_VERSION is incompatible with the server, it recreates the client without a
 // fixed version so negotiation can select a supported API. A fixed version is incompatible when
@@ -531,6 +534,7 @@ func NewClient(log *zerolog.Logger, opts ClientOptions) Client {
 // deferred until the first API call.
 //
 // Parameters:
+//   - ctx: Bounds the wait for the daemon.
 //   - log: Process logger.
 //   - cli: Docker client created from the environment.
 //
@@ -539,12 +543,13 @@ func NewClient(log *zerolog.Logger, opts ClientOptions) Client {
 //   - dockerClient.PingResult: Result of a successful ping, or zero when ping failed.
 //   - error: Non-nil only when the client cannot be recreated after an incompatible API version.
 func negotiateDockerAPI(
+	ctx context.Context,
 	log *zerolog.Logger,
 	cli *dockerClient.Client,
 ) (*dockerClient.Client, dockerClient.PingResult, error) {
 	// Ping triggers API version negotiation, or only pings when DOCKER_API_VERSION fixes the
 	// version.
-	result, err := pingUntilServing(log, cli)
+	result, err := pingUntilServing(ctx, log, cli)
 
 	// The ping uses the unversioned endpoint, so a daemon older than the fixed version still
 	// answers it. A negotiated version never exceeds the daemon's.
@@ -569,7 +574,7 @@ func negotiateDockerAPI(
 		}
 
 		cli = recreated
-		result, err = pingUntilServing(log, cli)
+		result, err = pingUntilServing(ctx, log, cli)
 	}
 
 	if err != nil {
@@ -583,24 +588,34 @@ func negotiateDockerAPI(
 	return cli, result, nil
 }
 
-// pingUntilServing pings the daemon until it answers, for up to three minutes.
+// pingUntilServing pings the daemon until it answers, for up to three minutes or until ctx
+// ends.
 // A daemon that is restoring its containers holds the connection and answers
 // the queued ping once it serves its API. A ping that fails without an answer
 // is sent again. The wait ends early on an error that a later ping cannot fix,
 // such as a TLS error or a 4xx answer.
 //
 // Parameters:
+//   - ctx: Bounds the wait for the daemon.
 //   - log: Process logger.
 //   - cli: Docker client to ping.
 //
 // Returns:
 //   - dockerClient.PingResult: Result of the first successful ping.
 //   - error: The last ping error, nil on success.
-func pingUntilServing(log *zerolog.Logger, cli *dockerClient.Client) (dockerClient.PingResult, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), daemonStartupTimeout)
+func pingUntilServing(
+	ctx context.Context,
+	log *zerolog.Logger,
+	cli *dockerClient.Client,
+) (dockerClient.PingResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, daemonStartupTimeout)
 	defer cancel()
 
 	start := time.Now()
+
+	// The caller's deadline can end the wait before three minutes.
+	deadline, _ := ctx.Deadline()
+	timeout := deadline.Sub(start).Round(time.Second)
 
 	var (
 		retries    int
@@ -611,7 +626,7 @@ func pingUntilServing(log *zerolog.Logger, cli *dockerClient.Client) (dockerClie
 		noticeOnce.Do(func() {
 			log.Info().
 				Err(err).
-				Str("timeout", daemonStartupTimeout.String()).
+				Str("timeout", timeout.String()).
 				Msg("Docker daemon is not answering yet. Waiting for it")
 		})
 	}
@@ -1110,8 +1125,8 @@ func (c *client) StartContainer(ctx context.Context, container types.Container) 
 // Unlike StartContainer, this does not create a new container from a source
 // configuration. It directly starts an existing, already-created container
 // using the Docker API's ContainerStart method. Callers are responsible for
-// checking whether the container should be started (e.g., the ReviveStopped
-// and NoRestart checks in restartStaleContainer).
+// checking whether the container should be started, for example under the
+// revive-stopped and no-restart configuration options.
 //
 // Callers use it to start a created replacement, to recover an orphaned
 // Watchtower container, and, in the ephemeral orchestrator, to start the new
@@ -1281,7 +1296,7 @@ func (c *client) RenameContainer(ctx context.Context, container types.Container,
 //
 // Parameters:
 //   - container: Container to check.
-//   - params: Update parameters for staleness check.
+//   - policy: Update policy for staleness check.
 //
 // Returns:
 //   - bool: True if stale, false otherwise.
@@ -1290,7 +1305,7 @@ func (c *client) RenameContainer(ctx context.Context, container types.Container,
 func (c *client) IsContainerStale(
 	ctx context.Context,
 	container types.Container,
-	params types.UpdateParams,
+	policy updateConfig.Policy,
 ) (bool, types.ImageID, string, error) {
 	// Use image client to perform staleness check.
 	imgClient := containerImage.NewClient(c.api, c.logger(), c.Registry, c.RateLimiter)
@@ -1298,7 +1313,7 @@ func (c *client) IsContainerStale(
 	stale, newestImage, latestDigest, err := imgClient.IsContainerStale(
 		ctx,
 		container,
-		params,
+		policy,
 		c.WarnOnHeadFailed,
 	)
 	if err != nil {
@@ -1308,7 +1323,7 @@ func (c *client) IsContainerStale(
 			Str("image", container.ImageName()).
 			Msg("Failed to check container staleness")
 
-		return stale, newestImage, latestDigest, fmt.Errorf("check container staleness: %w", err)
+		return stale, newestImage, latestDigest, err //nolint:wrapcheck // The image client's error already names its failure.
 	}
 
 	c.logger().Debug().
@@ -1326,7 +1341,7 @@ func (c *client) IsContainerStale(
 // Parameters:
 //   - ctx: Context for cancellation and timeout control.
 //   - container: Container to check.
-//   - params: Update parameters (NoPull, LabelPrecedence).
+//   - policy: Update policy (NoPull, LabelPrecedence).
 //
 // Returns:
 //   - bool: True if an update is available, false otherwise.
@@ -1336,14 +1351,14 @@ func (c *client) IsContainerStale(
 func (c *client) CheckContainerUpdate(
 	ctx context.Context,
 	container types.Container,
-	params types.UpdateParams,
+	policy updateConfig.Policy,
 ) (bool, types.ImageID, string, error) {
 	imgClient := containerImage.NewClient(c.api, c.logger(), c.Registry, c.RateLimiter)
 
 	available, newestImage, latestDigest, err := imgClient.CheckContainerUpdate(
 		ctx,
 		container,
-		params,
+		policy,
 	)
 	if err != nil {
 		c.logger().Debug().

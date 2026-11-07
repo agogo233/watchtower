@@ -1,15 +1,81 @@
 package update
 
 import (
+	"testing"
 	"time"
+
+	"github.com/rs/zerolog"
+	"github.com/stretchr/testify/assert"
 
 	dockerContainer "github.com/moby/moby/api/types/container"
 	dockerImage "github.com/moby/moby/api/types/image"
 	dockerNetwork "github.com/moby/moby/api/types/network"
 
+	"github.com/nicholas-fedor/watchtower/internal/update/implicitrestart"
 	mockUpdate "github.com/nicholas-fedor/watchtower/internal/update/mocks"
+	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
+	"github.com/nicholas-fedor/watchtower/internal/update/sorter"
+	"github.com/nicholas-fedor/watchtower/internal/update/state"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
+
+// sessionBatch records what an update session does with the notification
+// batch it opens.
+type sessionBatch struct {
+	sent  []*state.Report // Reports the session sent, in order.
+	ended int             // Times the session ended the batch.
+}
+
+// record keeps report as one the session sent. It serves as the send of an
+// update session's notification batch.
+//
+// Parameters:
+//   - report: The report sent.
+func (b *sessionBatch) record(report *state.Report) {
+	b.sent = append(b.sent, report)
+}
+
+// updateImplicitRestart marks the containers that depend on a restarting
+// container as linked to restarting, as an update scan does. The dependency
+// graph is built from containers, with the rest of allContainers unmonitored.
+//
+// Parameters:
+//   - log: Process logger.
+//   - allContainers: Every listed container.
+//   - containers: The monitored containers, which may be marked.
+//   - useComposeDependsOn: Whether to include Compose depends_on labels as links.
+func updateImplicitRestart(log *zerolog.Logger, allContainers, containers []types.Container, useComposeDependsOn bool) {
+	reconcileImplicitRestarts(log, allContainers, containers, updateParams.Params{UseComposeDependsOn: useComposeDependsOn})
+}
+
+// reconcileImplicitRestarts clears linked-restart marks and derives them again
+// with a dependency graph built from containers, with the rest of
+// allContainers unmonitored.
+//
+// Parameters:
+//   - log: Process logger.
+//   - allContainers: Every listed container.
+//   - containers: The monitored containers.
+//   - params: Update parameters.
+//
+// Returns:
+//   - []types.Container: Containers that should still restart.
+func reconcileImplicitRestarts(
+	log *zerolog.Logger,
+	allContainers, containers []types.Container,
+	params updateParams.Params,
+) []types.Container {
+	graph, err := sorter.NewDependencyGraph(log,
+		containers,
+		unmonitoredContainers(allContainers, containers),
+		params.UseComposeDependsOn,
+	)
+	if err != nil {
+		return nil
+	}
+
+	return implicitrestart.Reconcile(log, graph, allContainers, containers, params, nil)
+}
 
 func getCommonTestData() *mockUpdate.TestData {
 	return &mockUpdate.TestData{
@@ -450,4 +516,31 @@ func getComposeDependsOnWithNetworkModeTestData() *mockUpdate.TestData {
 		Staleness:  map[string]bool{staleContainer.Name(): true, dependentContainer.Name(): false},
 		Containers: []types.Container{staleContainer, dependentContainer},
 	}
+}
+
+// expectSessionBatch expects an update session to open its notification batch
+// once and to end it once before the test ends.
+//
+// A report sent after the batch ended fails the test, since the session ends
+// its batch after it sends.
+//
+// Returns:
+//   - *sessionBatch: The reports the session sends and its ends.
+func expectSessionBatch(t *testing.T, notifier *mockUpdate.MockNotifier) *sessionBatch {
+	t.Helper()
+
+	batch := &sessionBatch{}
+
+	t.Cleanup(func() { assert.Equal(t, 1, batch.ended, "the session ends its batch once") })
+
+	notifier.EXPECT().StartSessionNotification().Return(
+		func(report *state.Report) {
+			assert.Zero(t, batch.ended, "the session sends before it ends its batch")
+
+			batch.record(report)
+		},
+		func() { batch.ended++ },
+	).Once()
+
+	return batch
 }

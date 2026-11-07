@@ -1,8 +1,9 @@
 package cmd
 
 import (
-	"errors"
+	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -14,11 +15,18 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/golden"
 )
 
-// notifyUpgradeFilePattern matches the environment file notify-upgrade writes.
-const notifyUpgradeFilePattern = "watchtower-notif-urls-*"
+// Constants for the notify-upgrade tests.
+const (
+	// notifyUpgradeFilePattern matches the environment file notify-upgrade writes.
+	notifyUpgradeFilePattern = "watchtower-notif-urls-*"
+	// notifyUpgradeExitHelperEnv marks the test binary re-executed to run a
+	// failing notify-upgrade. Empty means the parent process.
+	notifyUpgradeExitHelperEnv = "WATCHTOWER_CMD_NOTIFY_UPGRADE_EXIT_HELPER"
+)
 
 // newNotifyUpgradeCommand returns a notify-upgrade command under a new root
 // command, configured only by args.
@@ -109,7 +117,7 @@ func runNotifyUpgradeUntilTimeout(t *testing.T, args ...string) notifyUpgradeRun
 func TestNotifyUpgrade_LegacyNotifiers(t *testing.T) {
 	run := runNotifyUpgradeUntilTimeout(t,
 		"--notifications", "email,slack,msteams,gotify",
-		"--notification-url", "discord://token@webhookid",
+		"--notification-url", "discord://token@123456789012345678",
 		"--notification-email-from", "watchtower@example.com",
 		"--notification-email-to", "admin@example.com",
 		"--notification-email-server", "smtp.example.com",
@@ -121,9 +129,9 @@ func TestNotifyUpgrade_LegacyNotifiers(t *testing.T) {
 		"--notification-slack-identifier", "watchtower-bot",
 		"--notification-slack-icon-emoji", ":whale:",
 		"--notification-slack-channel", "#ops",
-		"--notification-msteams-hook", "https://example.webhook.office.com/webhookb2/aaaa@bbbb/IncomingWebhook/cccc/dddd",
+		"--notification-msteams-hook", "https://prod-00.westus.logic.azure.com:443/workflows/abc123/triggers/manual/paths/invoke?api-version=2016-06-01",
 		"--notification-gotify-url", "https://gotify.example.com",
-		"--notification-gotify-token", "gotify-token",
+		"--notification-gotify-token", "Agotifytoken123",
 		"--notification-gotify-tls-skip-verify",
 	)
 	require.NoError(t, run.err)
@@ -147,10 +155,10 @@ func TestNotifyUpgrade_WithoutLegacyNotifiers(t *testing.T) {
 		{
 			name: "existing notification URLs only",
 			args: []string{
-				"--notification-url", "discord://token@webhookid",
+				"--notification-url", "discord://token@123456789012345678",
 				"--notification-url", "logger://",
 			},
-			want: "WATCHTOWER_NOTIFICATION_URL=discord://token@webhookid logger://\n",
+			want: "WATCHTOWER_NOTIFICATION_URL=discord://token@123456789012345678 logger://\n",
 		},
 	}
 
@@ -173,7 +181,6 @@ func TestNotifyUpgrade_Failures(t *testing.T) {
 		// readOnlyDir makes the working directory read-only so the
 		// environment file cannot be created.
 		readOnlyDir bool
-		wantErr     error
 		wantMessage string
 	}{
 		{
@@ -190,9 +197,14 @@ func TestNotifyUpgrade_Failures(t *testing.T) {
 			wantMessage: "build notification URLs",
 		},
 		{
+			name:        "legacy notifier without its required setting",
+			args:        []string{"--notifications", "slack"},
+			wantMessage: `create "slack" notification config: the notification-slack-hook-url configuration option is empty`,
+		},
+		{
 			name:        "working directory is not writable",
 			readOnlyDir: true,
-			wantErr:     errCreateTempFile,
+			wantMessage: "failed to create output file",
 		},
 	}
 
@@ -215,72 +227,45 @@ func TestNotifyUpgrade_Failures(t *testing.T) {
 			_, err := runNotifyUpgradeE(cmd, nil, new(zerolog.Nop()))
 			require.Error(t, err)
 
-			if tt.wantErr != nil {
-				require.ErrorIs(t, err, tt.wantErr)
-			}
-
 			assert.Contains(t, err.Error(), tt.wantMessage)
 			assert.Empty(t, notifyUpgradeFiles(t))
 		})
 	}
 }
 
-// TestWriteNotificationEnvFile verifies that the environment file is kept only
-// when it is fully written, because it holds credential-bearing URLs.
-func TestWriteNotificationEnvFile(t *testing.T) {
-	t.Parallel()
+// TestRunNotifyUpgrade_ExitsOnFailure verifies that a failed notify-upgrade
+// ends the process with exit code 1, so scripts and container runtimes can
+// tell that no environment file was produced. The command runs in a
+// re-executed test binary because the failure ends the process.
+func TestRunNotifyUpgrade_ExitsOnFailure(t *testing.T) {
+	if os.Getenv(notifyUpgradeExitHelperEnv) != "" {
+		t.Chdir(t.TempDir())
 
-	errSync := errors.New("sync failed")
+		cmd := newNotifyUpgradeCommand(t,
+			"--notifications", "slack",
+			"--notification-slack-hook-url", "https://hooks.slack.com/services/not-a-token",
+		)
 
-	tests := []struct {
-		name string
-		// syncFile replaces (*os.File).Sync.
-		syncFile func(*os.File) error
-		wantErr  error
-	}{
-		{
-			name:     "written",
-			syncFile: (*os.File).Sync,
-		},
-		{
-			name:     "sync fails",
-			syncFile: func(*os.File) error { return errSync },
-			wantErr:  errSyncTempFile,
-		},
-		{
-			// Closing the file during the sync makes the final close fail.
-			name:     "close fails",
-			syncFile: (*os.File).Close,
-			wantErr:  errCloseTempFile,
-		},
+		proc := &process{log: logging.New(os.Stderr, logging.InfoLevel)}
+		proc.exit(cmd, proc.runNotifyUpgrade(cmd, nil))
+
+		// The failure must end the process. Reaching here means it did not.
+		os.Exit(2)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
 
-			dir := t.TempDir()
-			line := "WATCHTOWER_NOTIFICATION_URL=discord://token@webhookid"
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestRunNotifyUpgrade_ExitsOnFailure$", "-test.v=false")
 
-			path, err := writeNotificationEnvFile(new(zerolog.Nop()), dir, line, tt.syncFile)
+	cmd.Env = append(os.Environ(), notifyUpgradeExitHelperEnv+"=1")
 
-			entries, readErr := os.ReadDir(dir)
-			require.NoError(t, readErr)
+	out, err := cmd.CombinedOutput()
 
-			if tt.wantErr != nil {
-				require.ErrorIs(t, err, tt.wantErr)
-				assert.Empty(t, path)
-				assert.Empty(t, entries, "a partly written file is removed")
+	var exitErr *exec.ExitError
 
-				return
-			}
-
-			require.NoError(t, err)
-			assert.Equal(t, dir, filepath.Dir(path))
-
-			data, err := os.ReadFile(path)
-			require.NoError(t, err)
-			assert.Equal(t, line+"\n", string(data))
-		})
-	}
+	require.ErrorAs(t, err, &exitErr, "output:\n%s", out)
+	assert.Equal(t, 1, exitErr.ExitCode(), "output:\n%s", out)
+	assert.Contains(t, string(out), "Notification upgrade failed")
+	assert.Contains(t, string(out), "build notification URLs")
 }

@@ -13,25 +13,26 @@ import (
 	"unicode"
 
 	"github.com/rs/zerolog"
-	"golang.org/x/mod/semver"
 
 	composeLabels "github.com/nicholas-fedor/watchtower/internal/compose/labels"
 	"github.com/nicholas-fedor/watchtower/internal/container/labels"
 	"github.com/nicholas-fedor/watchtower/internal/container/provenance"
+	"github.com/nicholas-fedor/watchtower/internal/git/semver"
+	gitConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/git"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
-// Options configures a Git watcher client. Credentials stay here, not on UpdateParams.
+// Options configures a Git watcher client. Credentials stay here, not on [gitConfig.Defaults].
 type Options struct {
+	Hosts           map[string]string
 	Token           string
 	Username        string
 	Password        string
 	SSHKeyPath      string
 	SSHKnownHosts   string
-	Timeout         time.Duration
 	CABundle        []byte
+	Timeout         time.Duration
 	InsecureSkipTLS bool
-	Hosts           map[string]string
 }
 
 // CheckRequest is a remote staleness query for one associated container.
@@ -46,24 +47,24 @@ type CheckRequest struct {
 
 // CheckResult is the outcome of a remote Git check.
 type CheckResult struct {
-	Stale  bool
 	Commit string
 	Tag    string
 	Kind   string
 	// Ref is the branch or tag name used to clone (empty when unknown).
-	Ref string
+	Ref   string
+	Stale bool
 }
 
 // Client inspects remotes and clones repositories for Git-sourced updates.
 type Client struct {
-	log      *zerolog.Logger
-	opts     Options
-	http     *http.Client
 	lister   RefLister
+	log      *zerolog.Logger
+	http     *http.Client
 	origins  map[string]url.URL
-	mu       sync.Mutex
 	seen     map[string]seenStamp
 	rejected map[string]rejectedApply
+	opts     Options
+	mu       sync.Mutex
 }
 
 // seenStamp is a remote tip observed without rebuilding the running container.
@@ -161,14 +162,14 @@ func (c *Client) Check(ctx context.Context, req CheckRequest) (CheckResult, erro
 	defer cancel()
 
 	req.Ref = cmpOr(req.Ref, "main")
-	req.Policy = cmpOr(req.Policy, types.GitPolicyNone)
+	req.Policy = cmpOr(req.Policy, semver.PolicyNone)
 
 	err := validateRef(req.Ref)
 	if err != nil {
 		return CheckResult{}, err
 	}
 
-	if req.Policy != types.GitPolicyNone {
+	if req.Policy != semver.PolicyNone {
 		return c.checkTagPolicy(ctx, req)
 	}
 
@@ -216,31 +217,25 @@ func (c *Client) Clone(ctx context.Context, repo string, rev CheckResult) (strin
 //   - ctx: Cancellation and timeout.
 //   - client: Git monitor client.
 //   - c: Container to inspect.
-//   - params: Update parameters with mappings and defaults.
+//   - defaults: Git settings with mappings and defaults.
 //
 // Returns:
 //   - CheckResult: Empty result when the container is not associated.
-//   - error: Non-nil on monitor failure.
+//   - error: Wraps [semver.ErrInvalidPolicy] or [provenance.ErrInvalidHost] for an invalid label. Non-nil on monitor failure.
 func CheckContainer(
 	ctx context.Context,
 	client *Client,
 	c types.Container,
-	params types.UpdateParams,
+	defaults gitConfig.Defaults,
 ) (CheckResult, error) {
-	assoc, ok := provenance.ResolveAssociation(c, params)
+	assoc, ok := provenance.ResolveAssociation(c, defaults)
 	if !ok {
 		return CheckResult{}, nil
 	}
 
-	if raw := strings.TrimSpace(policyLabelValue(c)); raw != "" && !types.ValidGitPolicy(strings.ToLower(raw)) {
-		return CheckResult{}, fmt.Errorf("%w: %s", ErrInvalidPolicy, raw)
-	}
-
-	if raw := strings.TrimSpace(assoc.Host); raw != "" {
-		_, err := provenance.ParseAPIOrigin(raw)
-		if err != nil {
-			return CheckResult{}, fmt.Errorf("%w: %w", ErrInvalidHost, err)
-		}
+	err := assoc.Validate()
+	if err != nil {
+		return CheckResult{}, err //nolint:wrapcheck // Validate's error already names the invalid label.
 	}
 
 	lastCommit, lastTag := provenance.Baseline(c)
@@ -501,7 +496,7 @@ func (c *Client) checkTagPolicy(ctx context.Context, req CheckRequest) (CheckRes
 		byName[tag.Name] = tag.Hash
 	}
 
-	lastTag := baselineTag(req.LastTag)
+	lastTag := semver.Baseline(req.LastTag)
 	inferred := false
 	// An empty or non-semver stamp still names a release when the commit
 	// matches that tag. Use the tag so patch and minor do not jump to the
@@ -514,14 +509,14 @@ func (c *Client) checkTagPolicy(ctx context.Context, req CheckRequest) (CheckRes
 	}
 
 	if lastTag == "" && req.LastCommit == "" {
-		selected, ok := selectTag("", names, req.Policy)
+		selected, ok := semver.SelectTag("", names, req.Policy)
 		if !ok {
 			// No usable semver tags. Observe the configured ref without
 			// treating the missing baseline as a reason to rebuild.
 			return c.checkExactRef(ctx, CheckRequest{
 				Repo:       req.Repo,
 				Ref:        req.Ref,
-				Policy:     types.GitPolicyNone,
+				Policy:     semver.PolicyNone,
 				Host:       req.Host,
 				LastCommit: req.LastCommit,
 			})
@@ -536,7 +531,7 @@ func (c *Client) checkTagPolicy(ctx context.Context, req CheckRequest) (CheckRes
 		}, nil
 	}
 
-	selected, ok := selectTag(lastTag, names, req.Policy)
+	selected, ok := semver.SelectTag(lastTag, names, req.Policy)
 	if !ok {
 		if inferred {
 			return CheckResult{
@@ -740,26 +735,15 @@ func (c *Client) remember(repo, ref, policy, commit, tag string) {
 // Returns:
 //   - string: Matching tag name, or empty.
 func tagForCommit(byName map[string]string, commit string) string {
-	bestName := ""
-	bestCanon := ""
+	var matches []string
 
 	for name, hash := range byName {
-		if !sameRevision(commit, hash) {
-			continue
-		}
-
-		canon := canonicalize(name)
-		if !semver.IsValid(canon) || semver.Prerelease(canon) != "" {
-			continue
-		}
-
-		if bestCanon == "" || semver.Compare(canon, bestCanon) > 0 {
-			bestCanon = canon
-			bestName = name
+		if sameRevision(commit, hash) {
+			matches = append(matches, name)
 		}
 	}
 
-	return bestName
+	return semver.HighestRelease(matches)
 }
 
 // tagName returns the resolved name when the ref is a tag.
@@ -865,24 +849,4 @@ func isHexSHA(s string) bool {
 	}
 
 	return true
-}
-
-// policyLabelValue returns the raw git-semver-policy label, or empty.
-//
-// Parameters:
-//   - c: Container to inspect.
-//
-// Returns:
-//   - string: Raw label value, or empty when unset.
-func policyLabelValue(c types.Container) string {
-	if c == nil {
-		return ""
-	}
-
-	val, ok := c.GetLabel(labels.GitSemverPolicy)
-	if !ok {
-		return ""
-	}
-
-	return val
 }

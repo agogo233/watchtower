@@ -93,7 +93,9 @@ func setPreRunState(t *testing.T, client containerClient.Client, detection selfD
 
 	setProcessFs(t, fsys)
 
-	newClient = func(*zerolog.Logger, containerClient.ClientOptions) containerClient.Client { return client }
+	newClient = func(context.Context, *zerolog.Logger, containerClient.ClientOptions) (containerClient.Client, error) {
+		return client, nil
+	}
 
 	for _, key := range []string{"HOSTNAME", "DOCKER_HOST", "DOCKER_TLS_VERIFY", "DOCKER_API_VERSION", "DOCKER_CERT_PATH"} {
 		t.Setenv(key, "")
@@ -104,7 +106,8 @@ func setPreRunState(t *testing.T, client containerClient.Client, detection selfD
 		t.Setenv("HOSTNAME", detection.hostname)
 	}
 
-	// preRun replaces the notifier with one hooked to its logger.
+	// preRun replaces the notifier with one hooked to its logger, except for a
+	// health check.
 	t.Cleanup(func() { notifier.Close() })
 }
 
@@ -243,7 +246,8 @@ func TestPreRun_SelfDetection(t *testing.T) {
 		{
 			// A health check runs no updates, so it continues without a scope.
 			// Its inspect shares the lookup's deadline instead of waiting for
-			// every retry.
+			// every retry. Because a health check probe runs often, its
+			// warning stays in the log and never reaches notifications.
 			name:      "lookup fails during a health check and the ID is kept",
 			args:      []string{"--health-check"},
 			detection: selfDetection{mountinfo: mountinfoWithSelf()},
@@ -299,7 +303,7 @@ func TestPreRun_SelfDetection(t *testing.T) {
 			readStderr := captureStderr(t)
 			args := slices.Concat(tt.args, []string{"--log-level", "warn", "--log-format", "logfmt"})
 
-			newRunProcess().preRun(newTestRootCommand(t, args...), nil)
+			require.NoError(t, newRunProcess().preRun(newTestRootCommand(t, args...), nil))
 
 			logOutput := readStderr()
 			if tt.wantWarning == "" {
@@ -315,7 +319,12 @@ func TestPreRun_SelfDetection(t *testing.T) {
 			assert.Equal(t, tt.wantName, containerName(currentWatchtowerContainer))
 			assert.Equal(t, tt.wantCalls, runCalls(mockClient))
 			assert.Same(t, mockClient, client, "preRun uses the client from newClient")
-			assert.NotSame(t, fixtureNotifier, notifier, "preRun creates its own notifier")
+
+			if slices.Contains(tt.args, "--health-check") {
+				assert.Same(t, fixtureNotifier, notifier, "preRun sets up no notifications")
+			} else {
+				assert.NotSame(t, fixtureNotifier, notifier, "preRun creates its own notifier")
+			}
 		})
 	}
 }
@@ -360,12 +369,12 @@ func containerName(c types.Container) string {
 func TestPreRun_Configuration(t *testing.T) {
 	setPreRunState(t, mockContainerClient.NewMockClient(t), selfDetection{})
 
-	newRunProcess().preRun(newTestRootCommand(t,
+	require.NoError(t, newRunProcess().preRun(newTestRootCommand(t,
 		"--scope", "prod",
 		"--host", "tcp://docker.example.com:2376",
 		"--tlsverify",
 		"--api-version", "1.47",
-	), nil)
+	), nil))
 
 	assert.Equal(t, "prod", appCfg.Filter.Scope)
 	// With TLS verification enabled, a tcp:// host is exported as https://.
@@ -427,10 +436,10 @@ func TestPreRun_RegistryTLSSettings(t *testing.T) {
 
 			var clientOptions containerClient.ClientOptions
 
-			newClient = func(_ *zerolog.Logger, opts containerClient.ClientOptions) containerClient.Client {
+			newClient = func(_ context.Context, _ *zerolog.Logger, opts containerClient.ClientOptions) (containerClient.Client, error) {
 				clientOptions = opts
 
-				return mockClient
+				return mockClient, nil
 			}
 
 			cmd := newTestRootCommand(t, tt.args...)
@@ -439,7 +448,7 @@ func TestPreRun_RegistryTLSSettings(t *testing.T) {
 				t.Setenv(key, value)
 			}
 
-			newRunProcess().preRun(cmd, nil)
+			require.NoError(t, newRunProcess().preRun(cmd, nil))
 
 			assert.Equal(t, tt.wantSkip, clientOptions.Registry.TLSSkip)
 			assert.Equal(t, tt.wantMinVersion, clientOptions.Registry.TLSMinVersion)
@@ -501,7 +510,7 @@ func TestPreRun_PorcelainKeepsExplicitSettings(t *testing.T) {
 				t.Setenv(key, value)
 			}
 
-			newRunProcess().preRun(cmd, nil)
+			require.NoError(t, newRunProcess().preRun(cmd, nil))
 
 			assert.Equal(t, tt.wantTemplate, appCfg.Notify.Template)
 			assert.Equal(t, tt.wantReport, appCfg.Notify.Report)
@@ -525,9 +534,100 @@ func TestPreRun_Exit(t *testing.T) {
 		wantExitCode int
 		// wantOutput lists lines the output must contain, in this order.
 		wantOutput []string
+		// unwantedOutput lists text the output must not contain.
+		unwantedOutput []string
+		// wantOnce lists text the output must contain exactly once.
+		wantOnce []string
 	}{
-		{helperCase: "invalid-log-format", wantExitCode: 1, wantOutput: []string{"Failed to initialize logging"}},
-		{helperCase: "invalid-configuration", wantExitCode: 1, wantOutput: []string{"Failed to load configuration"}},
+		{
+			// A startup failure happens again on every start, so the main
+			// process disables its restarts before it exits. The Docker client
+			// is created for that when startup has not created it yet.
+			helperCase:   "invalid-environment",
+			wantExitCode: 1,
+			wantOutput:   []string{"SetRestartPolicy cccccccccccc no", "Failed to apply environment configuration"},
+		},
+		{
+			helperCase:   "invalid-log-format",
+			wantExitCode: 1,
+			wantOutput:   []string{"SetRestartPolicy cccccccccccc no", "Failed to initialize logging"},
+		},
+		{
+			// Because the notification settings are part of the configuration
+			// that did not load, the failure sends no notification.
+			helperCase:     "invalid-configuration",
+			wantExitCode:   1,
+			wantOutput:     []string{"SetRestartPolicy cccccccccccc no", "Failed to load configuration"},
+			unwantedOutput: []string{"Shoutrrr:"},
+		},
+		{
+			// The client connects to the daemon that the host flag names. The
+			// process is exiting, so it waits only briefly for the daemon.
+			helperCase:   "invalid-log-format-with-host-flag",
+			wantExitCode: 1,
+			wantOutput: []string{
+				"newClient DOCKER_HOST=tcp://socket-proxy:2375 bounded=true",
+				"SetRestartPolicy cccccccccccc no",
+				"Failed to initialize logging",
+			},
+		},
+		{
+			// Without a Docker client, the restart policy cannot be changed, so
+			// Watchtower reports that before the startup failure. Startup
+			// already waited for the daemon, so the exit does not connect
+			// again. It sends no notification, because notifications are not
+			// set up yet and the failure would repeat on every restart.
+			helperCase:   "docker-client-error",
+			wantExitCode: 1,
+			wantOutput: []string{
+				logging.RestartsKept,
+				"Failed to initialize Docker client",
+			},
+			unwantedOutput: []string{"SetRestartPolicy", "Shoutrrr:"},
+			wantOnce:       []string{"newClient"},
+		},
+		{
+			// Without its own container ID, Watchtower cannot change its
+			// restart policy, so it reports that before the startup failure.
+			helperCase:   "invalid-log-format-without-container-id",
+			wantExitCode: 1,
+			wantOutput: []string{
+				logging.RestartsKept,
+				"Failed to initialize logging",
+			},
+			unwantedOutput: []string{"SetRestartPolicy"},
+		},
+		{
+			// A process other than the main one, such as a health check probe,
+			// leaves the container's restart policy alone.
+			helperCase:     "invalid-configuration-outside-main-process",
+			wantExitCode:   1,
+			wantOutput:     []string{"Failed to load configuration"},
+			unwantedOutput: []string{"newClient", "SetRestartPolicy"},
+		},
+		{
+			// A flag that does not parse fails on every start too.
+			helperCase:   "unknown-flag",
+			wantExitCode: 1,
+			wantOutput:   []string{"SetRestartPolicy cccccccccccc no", "Failed to execute root command"},
+		},
+		{
+			// The flags before the one that does not parse are read.
+			helperCase:   "host-flag-before-unknown-flag",
+			wantExitCode: 1,
+			wantOutput: []string{
+				"newClient DOCKER_HOST=tcp://socket-proxy:2375",
+				"SetRestartPolicy cccccccccccc no",
+				"Failed to execute root command",
+			},
+		},
+		{
+			// A subcommand such as notify-upgrade leaves the restart policy alone.
+			helperCase:     "subcommand-error",
+			wantExitCode:   1,
+			wantOutput:     []string{"Failed to execute root command"},
+			unwantedOutput: []string{"newClient", "SetRestartPolicy", logging.RestartsKept},
+		},
 		{
 			// RunOrchestrator always ends the process, so the restart policy
 			// fallback after it in preRun does not run.
@@ -544,6 +644,18 @@ func TestPreRun_Exit(t *testing.T) {
 			helperCase:   "invalid-restart-of-chain-parent",
 			wantExitCode: 0,
 			wantOutput:   []string{"SetRestartPolicy cccccccccccc no"},
+		},
+		{
+			// A notification URL that Shoutrrr rejects fails on every start,
+			// so the main process disables its restarts before it exits.
+			helperCase:   "rejected-notification-url",
+			wantExitCode: 1,
+			wantOutput: []string{
+				"SetRestartPolicy cccccccccccc no",
+				"Failed to initialize notifications",
+				"notification URL 1: discord:",
+			},
+			unwantedOutput: []string{"secrettoken"},
 		},
 		{
 			// Without an explicit scope, the scope label is unknown. preRun then
@@ -563,7 +675,7 @@ func TestPreRun_Exit(t *testing.T) {
 			wantExitCode: 1,
 			wantOutput: []string{
 				"SetRestartPolicy cccccccccccc no",
-				"Could not disable Watchtower's restart policy. The runtime may start it again",
+				logging.RestartsKept,
 				"Exiting rather than running without a scope",
 			},
 		},
@@ -604,6 +716,14 @@ func TestPreRun_Exit(t *testing.T) {
 				require.True(t, found, "missing %q after the earlier lines in output:\n%s", want, out)
 			}
 
+			for _, unwanted := range tt.unwantedOutput {
+				assert.NotContains(t, string(out), unwanted, "output:\n%s", out)
+			}
+
+			for _, once := range tt.wantOnce {
+				assert.Equal(t, 1, strings.Count(string(out), once), "count of %q in output:\n%s", once, out)
+			}
+
 			assert.NotContains(t, string(out), "PASS", "the helper must end the process")
 		})
 	}
@@ -617,9 +737,18 @@ func preRunExitHelper(t *testing.T, helperCase string) {
 
 	var (
 		args      []string
-		detection selfDetection
+		env       map[string]string
 		policyErr error
+		clientErr error
+		// execute runs the whole command tree, as Execute does, instead of
+		// preRun alone.
+		execute bool
 	)
+
+	// Watchtower runs as PID 1, the main process of its own container, unless
+	// a case says otherwise.
+	detection := selfDetection{mountinfo: mountinfoWithSelf(), marker: true}
+	pid := 1
 
 	mockClient := mockContainerClient.NewMockClient(t)
 	mockClient.EXPECT().SetRestartPolicy(mock.Anything, mock.Anything, mock.Anything).
@@ -630,12 +759,35 @@ func preRunExitHelper(t *testing.T, helperCase string) {
 		}).Maybe()
 
 	switch helperCase {
+	case "invalid-environment":
+		env = map[string]string{"WATCHTOWER_HTTP_API_RATE_LIMIT": "many"}
 	case "invalid-log-format":
 		args = []string{"--log-format", "bogus"}
 	case "invalid-configuration":
+		args = []string{"--rolling-restart", "--monitor-only", "--notification-url", "logger://"}
+	case "invalid-log-format-without-container-id":
+		args = []string{"--log-format", "bogus"}
+		detection = selfDetection{}
+	case "invalid-log-format-with-host-flag":
+		args = []string{"--host", "tcp://socket-proxy:2375", "--log-format", "bogus"}
+	case "invalid-configuration-outside-main-process":
 		args = []string{"--rolling-restart", "--monitor-only"}
+		pid = 42
+	case "docker-client-error":
+		args = []string{"--notification-url", "logger://"}
+		clientErr = errRunTestDocker
+	case "unknown-flag":
+		args = []string{"--not-a-watchtower-flag"}
+		execute = true
+	case "host-flag-before-unknown-flag":
+		args = []string{"--host", "tcp://socket-proxy:2375", "--not-a-watchtower-flag"}
+		execute = true
+	case "subcommand-error":
+		args = []string{"notify-upgrade", "--not-a-watchtower-flag"}
+		execute = true
 	case "orchestrator-without-settings":
 		args = []string{"--self-update-orchestrator"}
+		detection = selfDetection{}
 	case "invalid-restart-of-old-instance":
 		old := selfContainer("/watchtower-old-cccccccccccc", "")
 		detection = selfDetection{mountinfo: mountinfoWithSelf()}
@@ -651,6 +803,11 @@ func preRunExitHelper(t *testing.T, helperCase string) {
 
 		mockClient.EXPECT().GetCurrentWatchtowerContainer(mock.Anything, selfID).Return(parent, nil)
 		mockClient.EXPECT().ListContainers(mock.Anything, withFilter).Return([]types.Container{parent}, nil).Maybe()
+	case "rejected-notification-url":
+		args = []string{"--notification-url", "discord://secrettoken@notanumber"}
+		detection = selfDetection{mountinfo: mountinfoWithSelf()}
+
+		mockClient.EXPECT().GetCurrentWatchtowerContainer(mock.Anything, selfID).Return(selfContainer("/watchtower", ""), nil)
 	case "unreadable-scope-label", "unreadable-scope-label-restarts-kept":
 		detection = selfDetection{mountinfo: mountinfoWithSelf()}
 
@@ -665,10 +822,40 @@ func preRunExitHelper(t *testing.T, helperCase string) {
 
 	setPreRunState(t, mockClient, detection)
 
+	processID = func() int { return pid }
+
+	// The client factory prints the Docker host it connects to and whether its
+	// wait for the daemon has a deadline. It fails with clientErr when a case
+	// sets it.
+	newClient = func(ctx context.Context, _ *zerolog.Logger, _ containerClient.ClientOptions) (containerClient.Client, error) {
+		_, bounded := ctx.Deadline()
+		fmt.Fprintf(os.Stderr, "newClient DOCKER_HOST=%s bounded=%t\n", os.Getenv("DOCKER_HOST"), bounded)
+
+		if clientErr != nil {
+			return nil, clientErr
+		}
+
+		return mockClient, nil
+	}
+
 	for _, key := range []string{"WT_ORCHESTRATOR_OLD_ID", "WT_ORCHESTRATOR_NEW_IMAGE", "WT_ORCHESTRATOR_ORIGINAL_NAME"} {
 		t.Setenv(key, "")
 	}
 
 	proc := &process{log: logging.New(os.Stderr, logging.InfoLevel)}
-	proc.preRun(newTestRootCommand(t, args...), nil)
+
+	if execute {
+		proc.exit(newExecuteCommand(t, proc, args...).ExecuteC())
+
+		return
+	}
+
+	// The test command clears the flag environment, so env is set after it.
+	cmd := newTestRootCommand(t, args...)
+
+	for key, value := range env {
+		t.Setenv(key, value)
+	}
+
+	proc.exit(cmd, proc.preRun(cmd, nil))
 }

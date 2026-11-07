@@ -6,24 +6,25 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/nicholas-fedor/watchtower/pkg/types"
+	"github.com/nicholas-fedor/watchtower/internal/git/semver"
 )
 
 func TestParseImageMapping(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name    string
-		raw     string
-		image   string
-		mapping types.GitImage
-		wantErr error
+		name       string
+		raw        string
+		image      string
+		mapping    Image
+		wantErr    error
+		wantErrMsg string
 	}{
 		{
 			name:  "repo only uses defaults",
 			raw:   "myapp:latest=https://github.com/org/app.git",
 			image: "myapp:latest",
-			mapping: types.GitImage{
+			mapping: Image{
 				Repo:   "https://github.com/org/app.git",
 				Ref:    DefaultRef,
 				Policy: DefaultPolicy,
@@ -33,17 +34,27 @@ func TestParseImageMapping(t *testing.T) {
 			name:  "ref and policy",
 			raw:   "myapp:latest=https://github.com/org/app.git#release@minor",
 			image: "myapp:latest",
-			mapping: types.GitImage{
+			mapping: Image{
 				Repo:   "https://github.com/org/app.git",
 				Ref:    "release",
-				Policy: types.GitPolicyMinor,
+				Policy: semver.PolicyMinor,
+			},
+		},
+		{
+			name:  "policy in mixed case with spaces",
+			raw:   "myapp:latest=https://github.com/org/app.git#release@ Minor ",
+			image: "myapp:latest",
+			mapping: Image{
+				Repo:   "https://github.com/org/app.git",
+				Ref:    "release",
+				Policy: semver.PolicyMinor,
 			},
 		},
 		{
 			name:  "empty hash ref falls back to default",
 			raw:   "app:v1=https://git.example.com/org/app.git#",
 			image: "app:v1",
-			mapping: types.GitImage{
+			mapping: Image{
 				Repo:   "https://git.example.com/org/app.git",
 				Ref:    DefaultRef,
 				Policy: DefaultPolicy,
@@ -53,7 +64,7 @@ func TestParseImageMapping(t *testing.T) {
 			name:  "ssh userinfo is not a policy",
 			raw:   "app:latest=git@github.com:org/app.git",
 			image: "app:latest",
-			mapping: types.GitImage{
+			mapping: Image{
 				Repo:   "git@github.com:org/app.git",
 				Ref:    DefaultRef,
 				Policy: DefaultPolicy,
@@ -63,10 +74,10 @@ func TestParseImageMapping(t *testing.T) {
 			name:  "ssh repo with ref and policy",
 			raw:   "app:latest=git@github.com:org/app.git#main@patch",
 			image: "app:latest",
-			mapping: types.GitImage{
+			mapping: Image{
 				Repo:   "git@github.com:org/app.git",
 				Ref:    "main",
-				Policy: types.GitPolicyPatch,
+				Policy: semver.PolicyPatch,
 			},
 		},
 		{
@@ -97,7 +108,13 @@ func TestParseImageMapping(t *testing.T) {
 		{
 			name:    "unknown policy token",
 			raw:     "myapp:latest=https://github.com/org/app.git@latest",
-			wantErr: errInvalidGitPolicy,
+			wantErr: semver.ErrInvalidPolicy,
+		},
+		{
+			name:       "unknown policy token is quoted as written",
+			raw:        "myapp:latest=https://github.com/org/app.git@ Latest",
+			wantErr:    semver.ErrInvalidPolicy,
+			wantErrMsg: `invalid git semver policy: "Latest"`,
 		},
 	}
 
@@ -108,6 +125,10 @@ func TestParseImageMapping(t *testing.T) {
 			image, mapping, err := parseImageMapping(tt.raw)
 			if tt.wantErr != nil {
 				require.ErrorIs(t, err, tt.wantErr)
+
+				if tt.wantErrMsg != "" {
+					require.EqualError(t, err, tt.wantErrMsg)
+				}
 
 				return
 			}
@@ -144,15 +165,15 @@ func TestParseImageMappings(t *testing.T) {
 			"myapp:latest=https://github.com/org/app.git#dev@patch",
 		})
 		require.NoError(t, err)
-		assert.Equal(t, types.GitImage{
+		assert.Equal(t, Image{
 			Repo:   "https://github.com/org/app.git",
 			Ref:    "dev",
-			Policy: types.GitPolicyPatch,
+			Policy: semver.PolicyPatch,
 		}, got["myapp:latest"])
-		assert.Equal(t, types.GitImage{
+		assert.Equal(t, Image{
 			Repo:   "https://gitlab.com/org/other.git",
 			Ref:    DefaultRef,
-			Policy: types.GitPolicyMajor,
+			Policy: semver.PolicyMajor,
 		}, got["other:v1"])
 	})
 

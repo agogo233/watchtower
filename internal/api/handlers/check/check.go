@@ -15,6 +15,7 @@ import (
 	"github.com/nicholas-fedor/watchtower/internal/container/oci"
 	"github.com/nicholas-fedor/watchtower/internal/container/provenance"
 	"github.com/nicholas-fedor/watchtower/internal/git"
+	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
@@ -22,16 +23,15 @@ import (
 //
 // This endpoint never pulls an image, so the latest* fields are always empty.
 type ContainerCheck struct {
+	Timestamp            time.Time `json:"timestamp"`
 	Name                 string    `json:"name"`
 	Image                string    `json:"image"`
 	ImageID              string    `json:"image_id"`
 	Digest               string    `json:"digest"`
-	UpdateAvailable      bool      `json:"update_available"`
 	LatestImageID        string    `json:"latest_image_id"`
 	GitCommit            string    `json:"git_commit,omitempty"`
 	LatestDigest         string    `json:"latest_digest"`
 	Error                string    `json:"error,omitempty"`
-	Timestamp            time.Time `json:"timestamp"`
 	UpdateSource         string    `json:"update_source,omitempty"`
 	GitRepo              string    `json:"git_repo,omitempty"`
 	GitRef               string    `json:"git_ref,omitempty"`
@@ -43,16 +43,17 @@ type ContainerCheck struct {
 	CurrentImageRevision string    `json:"current_revision,omitempty"`
 	LatestImageVersion   string    `json:"latest_image_version,omitempty"`
 	LatestImageRevision  string    `json:"latest_revision,omitempty"`
+	UpdateAvailable      bool      `json:"update_available"`
 }
 
 // CheckResponse is the response returned by POST /v1/check.
 //
 // Parameters/returns are documented by the handler's Swagger annotations.
 type CheckResponse struct {
-	Containers []ContainerCheck `json:"containers"`
-	Count      int              `json:"count"`
 	Timestamp  string           `json:"timestamp"`
 	APIVersion string           `json:"api_version"`
+	Containers []ContainerCheck `json:"containers"`
+	Count      int              `json:"count"`
 }
 
 // CheckFunc performs the update availability check for all watched containers.
@@ -103,7 +104,7 @@ func CheckForUpdates(log *zerolog.Logger,
 	ctx context.Context,
 	client containerClient.Client,
 	filter types.Filter,
-	params types.UpdateParams,
+	params updateParams.Params,
 	gitClient *git.Client,
 ) ([]ContainerCheck, error) {
 	containers, err := client.ListContainers(ctx, filter)
@@ -165,12 +166,12 @@ func newContainerCheck(c types.Container, now time.Time) ContainerCheck {
 //
 // Returns:
 //   - none.
-func applyReportMetadata(c types.Container, params types.UpdateParams, result *ContainerCheck) {
+func applyReportMetadata(c types.Container, params updateParams.Params, result *ContainerCheck) {
 	if _, concrete := c.(*container.Container); !concrete {
 		return
 	}
 
-	meta := provenance.ResolveReportMeta(c, params, provenance.ChangelogVars{}, oci.Annotations{})
+	meta := provenance.ResolveReportMeta(c, params.Git, provenance.ChangelogVars{}, oci.Annotations{})
 	result.GitRepo = meta.GitRepo
 	result.GitRef = meta.GitRef
 	result.Changelog = meta.Changelog
@@ -215,7 +216,7 @@ func applyLocalDigest(c types.Container, result *ContainerCheck) {
 func isGitWatched(
 	log *zerolog.Logger,
 	c types.Container,
-	params types.UpdateParams,
+	params updateParams.Params,
 	gitClient *git.Client,
 ) bool {
 	if gitClient == nil {
@@ -226,7 +227,7 @@ func isGitWatched(
 		return false
 	}
 
-	return provenance.ShouldMonitor(log, c, params)
+	return provenance.ShouldMonitor(log, c, params.Git)
 }
 
 // checkGitSource compares the hosted Git ref for a container.
@@ -248,18 +249,18 @@ func checkGitSource(
 	ctx context.Context,
 	log *zerolog.Logger,
 	c types.Container,
-	params types.UpdateParams,
+	params updateParams.Params,
 	gitClient *git.Client,
 	result *ContainerCheck,
 ) {
 	result.UpdateSource = "git"
 
 	// no-pull skips the Git rebuild. Report the same skip here.
-	if c.IsNoPull(params) {
+	if c.IsNoPull(params.Policy) {
 		return
 	}
 
-	checkResult, err := git.CheckContainer(ctx, gitClient, c, params)
+	checkResult, err := git.CheckContainer(ctx, gitClient, c, params.Git)
 	if err != nil {
 		result.Error = err.Error()
 		logCheckFailure(log, c, err, "Failed to check container Git source")
@@ -273,7 +274,7 @@ func checkGitSource(
 	if checkResult.Tag != "" {
 		result.Changelog = provenance.ResolveReportMeta(
 			c,
-			params,
+			params.Git,
 			provenance.ChangelogVars{
 				Tag:    checkResult.Tag,
 				Commit: checkResult.Commit,
@@ -303,12 +304,12 @@ func checkRegistrySource(
 	log *zerolog.Logger,
 	client containerClient.Client,
 	c types.Container,
-	params types.UpdateParams,
+	params updateParams.Params,
 	result *ContainerCheck,
 ) {
 	result.UpdateSource = "registry"
 
-	available, latestID, latestDigest, err := client.CheckContainerUpdate(ctx, c, params)
+	available, latestID, latestDigest, err := client.CheckContainerUpdate(ctx, c, params.Policy)
 	if err != nil {
 		result.Error = err.Error()
 		logCheckFailure(log, c, err, "Failed to check container for updates")

@@ -25,6 +25,10 @@ import (
 	composeLabels "github.com/nicholas-fedor/watchtower/internal/compose/labels"
 	"github.com/nicholas-fedor/watchtower/internal/container/labels"
 	"github.com/nicholas-fedor/watchtower/internal/container/oci"
+	"github.com/nicholas-fedor/watchtower/internal/container/provenance"
+	"github.com/nicholas-fedor/watchtower/internal/git/provider"
+	"github.com/nicholas-fedor/watchtower/internal/git/semver"
+	gitConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/git"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 	mockTypes "github.com/nicholas-fedor/watchtower/pkg/types/mocks"
 )
@@ -69,22 +73,22 @@ func TestCheckContainer_RejectedComposeStampRetries(t *testing.T) {
 	client.RejectApply(ApplyStampKeyFrom(worker), current, otherPrevious, "")
 	client.RejectApply(ApplyStampKeyFrom(other), current, previous, "")
 
-	got, err := CheckContainer(t.Context(), client, api, types.UpdateParams{})
+	got, err := CheckContainer(t.Context(), client, api, gitConfig.Defaults{})
 	require.NoError(t, err)
 	assert.True(t, got.Stale)
 	assert.Equal(t, current, got.Commit)
 
 	client.AcceptApply(ApplyStampKeyFrom(api), current)
 
-	got, err = CheckContainer(t.Context(), client, api, types.UpdateParams{})
+	got, err = CheckContainer(t.Context(), client, api, gitConfig.Defaults{})
 	require.NoError(t, err)
 	assert.False(t, got.Stale)
 
-	got, err = CheckContainer(t.Context(), client, worker, types.UpdateParams{})
+	got, err = CheckContainer(t.Context(), client, worker, gitConfig.Defaults{})
 	require.NoError(t, err)
 	assert.True(t, got.Stale)
 
-	got, err = CheckContainer(t.Context(), client, other, types.UpdateParams{})
+	got, err = CheckContainer(t.Context(), client, other, gitConfig.Defaults{})
 	require.NoError(t, err)
 	assert.True(t, got.Stale)
 }
@@ -271,7 +275,7 @@ func TestCheck_TagPolicyIgnoresNonSemver(t *testing.T) {
 
 	patch, err := client.Check(t.Context(), CheckRequest{
 		Repo:    "https://example.com/org/app.git",
-		Policy:  types.GitPolicyPatch,
+		Policy:  semver.PolicyPatch,
 		LastTag: "v1.2.3",
 	})
 	require.NoError(t, err)
@@ -281,7 +285,7 @@ func TestCheck_TagPolicyIgnoresNonSemver(t *testing.T) {
 
 	none, err := client.Check(t.Context(), CheckRequest{
 		Repo:    "https://example.com/org/app.git",
-		Policy:  types.GitPolicyPatch,
+		Policy:  semver.PolicyPatch,
 		LastTag: "v1.2.4",
 	})
 	require.NoError(t, err)
@@ -332,7 +336,7 @@ func TestCheck_TagPolicyKnownCommitIsBaseline(t *testing.T) {
 
 		got, err := client.Check(t.Context(), CheckRequest{
 			Repo:       "https://example.com/org/app.git",
-			Policy:     types.GitPolicyPatch,
+			Policy:     semver.PolicyPatch,
 			LastCommit: "def2222",
 		})
 		require.NoError(t, err)
@@ -346,7 +350,7 @@ func TestCheck_TagPolicyKnownCommitIsBaseline(t *testing.T) {
 
 		got, err := client.Check(t.Context(), CheckRequest{
 			Repo:       "https://example.com/org/app.git",
-			Policy:     types.GitPolicyPatch,
+			Policy:     semver.PolicyPatch,
 			LastTag:    "nightly",
 			LastCommit: "def2222",
 		})
@@ -366,7 +370,7 @@ func TestCheck_TagPolicyKnownCommitIsBaseline(t *testing.T) {
 		})
 		got, err := wider.Check(t.Context(), CheckRequest{
 			Repo:       "https://example.com/org/app.git",
-			Policy:     types.GitPolicyPatch,
+			Policy:     semver.PolicyPatch,
 			LastCommit: "abc1111",
 		})
 		require.NoError(t, err)
@@ -380,7 +384,7 @@ func TestCheck_TagPolicyKnownCommitIsBaseline(t *testing.T) {
 
 		got, err := client.Check(t.Context(), CheckRequest{
 			Repo:       "https://example.com/org/app.git",
-			Policy:     types.GitPolicyPatch,
+			Policy:     semver.PolicyPatch,
 			LastCommit: "abc1111",
 		})
 		require.NoError(t, err)
@@ -394,7 +398,7 @@ func TestCheck_TagPolicyKnownCommitIsBaseline(t *testing.T) {
 
 		got, err := client.Check(t.Context(), CheckRequest{
 			Repo:    "https://example.com/org/app.git",
-			Policy:  types.GitPolicyMajor,
+			Policy:  semver.PolicyMajor,
 			LastTag: "nightly",
 		})
 		require.NoError(t, err)
@@ -438,11 +442,11 @@ func TestLookupAPIHostMatch(t *testing.T) {
 	t.Parallel()
 
 	client := testClient(t, nil)
-	client.opts.Hosts = map[string]string{"git.example.com": types.GitHostGitea}
+	client.opts.Hosts = map[string]string{"git.example.com": provider.Gitea}
 
 	kind, origin, ok := client.lookupAPI(t.Context(), "git.example.com", "https://git.example.com:3000/gitea")
 	require.True(t, ok)
-	assert.Equal(t, types.GitHostGitea, kind)
+	assert.Equal(t, provider.Gitea, kind)
 	assert.Equal(t, "git.example.com:3000", origin.Host)
 
 	_, _, ok = client.lookupAPI(t.Context(), "git.example.com", "https://evil.example")
@@ -459,7 +463,7 @@ func TestCheck_TagPolicyNoStampSelectsHighest(t *testing.T) {
 
 	got, err := client.Check(t.Context(), CheckRequest{
 		Repo:   "https://example.com/org/app.git",
-		Policy: types.GitPolicyMajor,
+		Policy: semver.PolicyMajor,
 	})
 	require.NoError(t, err)
 	assert.False(t, got.Stale)
@@ -479,7 +483,7 @@ func TestCheck_TagPolicyNoStampFallsBackToRef(t *testing.T) {
 	got, err := client.Check(t.Context(), CheckRequest{
 		Repo:   "https://example.com/org/app.git",
 		Ref:    "main",
-		Policy: types.GitPolicyPatch,
+		Policy: semver.PolicyPatch,
 	})
 	require.NoError(t, err)
 	assert.False(t, got.Stale)
@@ -495,7 +499,7 @@ func TestCheck_TagPolicyListError(t *testing.T) {
 
 	_, err := client.Check(t.Context(), CheckRequest{
 		Repo:   "https://example.com/org/app.git",
-		Policy: types.GitPolicyPatch,
+		Policy: semver.PolicyPatch,
 	})
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "ls-remote tags")
@@ -798,7 +802,7 @@ func TestCheckContainer(t *testing.T) {
 		c.EXPECT().GetLabel(mock.Anything).Return("", false)
 		c.EXPECT().ImageName().Return("nginx:latest")
 
-		got, err := CheckContainer(t.Context(), testClient(t, nil), c, types.UpdateParams{})
+		got, err := CheckContainer(t.Context(), testClient(t, nil), c, gitConfig.Defaults{})
 		require.NoError(t, err)
 		assert.Equal(t, CheckResult{}, got)
 	})
@@ -813,7 +817,7 @@ func TestCheckContainer(t *testing.T) {
 		})
 
 		client := testClient(t, []RemoteRef{{Name: "refs/heads/main", Hash: "newsha"}})
-		got, err := CheckContainer(t.Context(), client, c, types.UpdateParams{})
+		got, err := CheckContainer(t.Context(), client, c, gitConfig.Defaults{})
 		require.NoError(t, err)
 		assert.True(t, got.Stale)
 		assert.Equal(t, "newsha", got.Commit)
@@ -827,8 +831,24 @@ func TestCheckContainer(t *testing.T) {
 			labels.GitSemverPolicy: "nightly",
 		})
 
-		got, err := CheckContainer(t.Context(), testClient(t, nil), c, types.UpdateParams{})
-		require.ErrorIs(t, err, ErrInvalidPolicy)
+		got, err := CheckContainer(t.Context(), testClient(t, nil), c, gitConfig.Defaults{})
+		require.ErrorIs(t, err, semver.ErrInvalidPolicy)
+		require.EqualError(t, err, "invalid git semver policy: nightly")
+		assert.Equal(t, CheckResult{}, got)
+	})
+
+	t.Run("invalid policy label on a mapped image is fail-closed", func(t *testing.T) {
+		t.Parallel()
+
+		c := labeledContainer(t, map[string]string{labels.GitSemverPolicy: "nightly"})
+		defaults := gitConfig.Defaults{
+			Images: map[string]gitConfig.Image{
+				"app:latest": {Repo: "https://example.com/org/app.git", Policy: semver.PolicyPatch},
+			},
+		}
+
+		got, err := CheckContainer(t.Context(), testClient(t, nil), c, defaults)
+		require.ErrorIs(t, err, semver.ErrInvalidPolicy)
 		assert.Equal(t, CheckResult{}, got)
 	})
 
@@ -841,8 +861,9 @@ func TestCheckContainer(t *testing.T) {
 			labels.GitHost: rawHost,
 		})
 
-		got, err := CheckContainer(t.Context(), testClient(t, nil), c, types.UpdateParams{})
-		require.ErrorIs(t, err, ErrInvalidHost)
+		got, err := CheckContainer(t.Context(), testClient(t, nil), c, gitConfig.Defaults{})
+		require.ErrorIs(t, err, provenance.ErrInvalidHost)
+		require.EqualError(t, err, "invalid git-host: host=type mappings are not supported")
 		assert.NotContains(t, err.Error(), "secret")
 		assert.NotContains(t, err.Error(), rawHost)
 		assert.Equal(t, CheckResult{}, got)
@@ -860,17 +881,17 @@ func TestCheckContainer(t *testing.T) {
 		client := testClient(t, nil)
 		client.lister = lister
 
-		first, err := CheckContainer(t.Context(), client, c, types.UpdateParams{})
+		first, err := CheckContainer(t.Context(), client, c, gitConfig.Defaults{})
 		require.NoError(t, err)
 		assert.False(t, first.Stale)
 		assert.Equal(t, "aaa111", first.Commit)
 
-		second, err := CheckContainer(t.Context(), client, c, types.UpdateParams{})
+		second, err := CheckContainer(t.Context(), client, c, gitConfig.Defaults{})
 		require.NoError(t, err)
 		assert.False(t, second.Stale)
 
 		lister.refs = []RemoteRef{{Name: "refs/heads/main", Hash: "bbb222"}}
-		third, err := CheckContainer(t.Context(), client, c, types.UpdateParams{})
+		third, err := CheckContainer(t.Context(), client, c, gitConfig.Defaults{})
 		require.NoError(t, err)
 		assert.True(t, third.Stale)
 		assert.Equal(t, "bbb222", third.Commit)
@@ -885,12 +906,12 @@ func TestCheckContainer(t *testing.T) {
 		}, "app:latest", ociImage("aaa111", ""))
 
 		client := testClient(t, []RemoteRef{{Name: "refs/heads/main", Hash: "aaa111"}})
-		got, err := CheckContainer(t.Context(), client, c, types.UpdateParams{})
+		got, err := CheckContainer(t.Context(), client, c, gitConfig.Defaults{})
 		require.NoError(t, err)
 		assert.False(t, got.Stale)
 
 		staleClient := testClient(t, []RemoteRef{{Name: "refs/heads/main", Hash: "bbb222"}})
-		stale, err := CheckContainer(t.Context(), staleClient, c, types.UpdateParams{})
+		stale, err := CheckContainer(t.Context(), staleClient, c, gitConfig.Defaults{})
 		require.NoError(t, err)
 		assert.True(t, stale.Stale)
 		assert.Equal(t, "bbb222", stale.Commit)
@@ -905,7 +926,7 @@ func TestCheckContainer(t *testing.T) {
 		}, "app:git-aaa111bbbbcc", nil)
 
 		client := testClient(t, []RemoteRef{{Name: "refs/heads/main", Hash: "aaa111bbbbccdddd"}})
-		got, err := CheckContainer(t.Context(), client, c, types.UpdateParams{})
+		got, err := CheckContainer(t.Context(), client, c, gitConfig.Defaults{})
 		require.NoError(t, err)
 		assert.False(t, got.Stale)
 	})
@@ -1061,15 +1082,15 @@ func githubTagsAt(ctx context.Context, client *Client, base, owner, repo string)
 func TestProviderKindUnknownUsesGoGit(t *testing.T) {
 	t.Parallel()
 
-	assert.Empty(t, types.ResolveGitHostKind("git.unknown.example", nil))
-	assert.Equal(t, types.GitHostGitea, types.ResolveGitHostKind("git.example.com", map[string]string{
-		"git.example.com": types.GitHostForgejo,
+	assert.Empty(t, provider.ResolveHostKind("git.unknown.example", nil))
+	assert.Equal(t, provider.Gitea, provider.ResolveHostKind("git.example.com", map[string]string{
+		"git.example.com": provider.Forgejo,
 	}))
-	assert.Equal(t, types.GitHostGitHub, types.ResolveGitHostKind("github.com", nil))
-	assert.Equal(t, types.GitHostGitLab, types.ResolveGitHostKind("gitlab.com", nil))
-	assert.Equal(t, types.GitHostGitea, types.ResolveGitHostKind("codeberg.org", nil))
-	assert.Equal(t, types.GitHostGitHub, types.ResolveGitHostKind("github.company.com", map[string]string{
-		"github.company.com": types.GitHostGitHub,
+	assert.Equal(t, provider.GitHub, provider.ResolveHostKind("github.com", nil))
+	assert.Equal(t, provider.GitLab, provider.ResolveHostKind("gitlab.com", nil))
+	assert.Equal(t, provider.Gitea, provider.ResolveHostKind("codeberg.org", nil))
+	assert.Equal(t, provider.GitHub, provider.ResolveHostKind("github.company.com", map[string]string{
+		"github.company.com": provider.GitHub,
 	}))
 }
 
@@ -1092,7 +1113,7 @@ func TestClassifyHostsDetectsProviders(t *testing.T) {
 		client.http = rewriteHostClient(srv)
 
 		got := client.ClassifyHosts(t.Context(), []url.URL{httpsOrigin("git.example.com")})
-		assert.Equal(t, types.GitHostGitea, got["git.example.com"])
+		assert.Equal(t, provider.Gitea, got["git.example.com"])
 	})
 
 	t.Run("gitlab", func(t *testing.T) {
@@ -1115,7 +1136,7 @@ func TestClassifyHostsDetectsProviders(t *testing.T) {
 		client.http = rewriteHostClient(srv)
 
 		got := client.ClassifyHosts(t.Context(), []url.URL{httpsOrigin("gitlab.internal")})
-		assert.Equal(t, types.GitHostGitLab, got["gitlab.internal"])
+		assert.Equal(t, provider.GitLab, got["gitlab.internal"])
 	})
 
 	t.Run("github enterprise", func(t *testing.T) {
@@ -1135,7 +1156,7 @@ func TestClassifyHostsDetectsProviders(t *testing.T) {
 		client.http = rewriteHostClient(srv)
 
 		got := client.ClassifyHosts(t.Context(), []url.URL{httpsOrigin("github.company.com")})
-		assert.Equal(t, types.GitHostGitHub, got["github.company.com"])
+		assert.Equal(t, provider.GitHub, got["github.company.com"])
 	})
 
 	t.Run("path prefix", func(t *testing.T) {
@@ -1158,7 +1179,7 @@ func TestClassifyHostsDetectsProviders(t *testing.T) {
 
 		origin := url.URL{Scheme: "https", Host: "git.example.com", Path: "/gitlab"}
 		got := client.ClassifyHosts(t.Context(), []url.URL{origin})
-		assert.Equal(t, types.GitHostGitLab, got["git.example.com"])
+		assert.Equal(t, provider.GitLab, got["git.example.com"])
 		assert.Equal(t, "https://git.example.com/gitlab/api/v4/projects/group%2Fapp/repository/commits/main",
 			joinEscaped(client.gitlabAPIAt(url.URL{}, "git.example.com"), "projects", "group/app", "repository", "commits", "main").String())
 	})

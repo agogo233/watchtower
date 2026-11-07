@@ -3,6 +3,8 @@ package update
 import (
 	"context"
 	"errors"
+	"fmt"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -11,46 +13,96 @@ import (
 	containerClient "github.com/nicholas-fedor/watchtower/internal/container/client"
 	"github.com/nicholas-fedor/watchtower/internal/git"
 	"github.com/nicholas-fedor/watchtower/internal/observability/events"
+	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
 	"github.com/nicholas-fedor/watchtower/internal/observability/metrics"
 	"github.com/nicholas-fedor/watchtower/internal/registry/ratelimit"
+	"github.com/nicholas-fedor/watchtower/internal/update/cleanup"
+	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/internal/update/state"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
+// Notifier sends the notifications of an update session.
+type Notifier interface {
+	// StartSessionNotification starts collecting log entries for the session's
+	// notifications. Entries an earlier owner left collected, such as a check
+	// request's, are sent first. The returned send sends a report with the
+	// session's collected entries. A split report's notification carries only
+	// its container's entries. Any other report ends the session's batch. Send
+	// does nothing once the batch has ended. Unless the batch has already
+	// ended, the returned end sends the entries no notification took, without a
+	// report.
+	StartSessionNotification() (send func(*state.Report), end func())
+	// ShouldSendNotification reports whether report is worth a notification at
+	// the configured notifications level.
+	ShouldSendNotification(report *state.Report) bool
+}
+
 // RunUpdatesWithNotificationsParams holds runtime dependencies and update policy.
 //
-// Update carries the full types.UpdateParams snapshot from config.UpdateParams
-// (or an equivalent complete construction).
+// Update carries a complete [updateParams.Params] snapshot built from the
+// process configuration.
 type RunUpdatesWithNotificationsParams struct {
-	// Logger is the process logger for this update session. Required and must be non-nil.
-	Logger *zerolog.Logger
 	// Client is the Docker client for container operations.
 	Client containerClient.Client
+	// Notifier sends update status messages to configured channels.
+	Notifier Notifier
+	// Logger is the process logger for this update session. Required and must be non-nil.
+	Logger *zerolog.Logger
 	// GitClient inspects remotes and clones repositories when the Git watcher is used.
 	GitClient *git.Client
 	// RateLimiter paces the session's registry requests. It must be the limiter
 	// Client uses, so release tag lookups share the client's registry budget.
 	RateLimiter *ratelimit.Limiter
-	// Notifier sends update status messages to configured channels.
-	Notifier types.Notifier
-	// NotificationSplitByContainer enables a separate notification per updated container.
-	NotificationSplitByContainer bool
-	// NotificationReport enables report-based notification templates.
-	NotificationReport bool
 	// EventBroadcaster publishes SSE events during the update session.
 	EventBroadcaster *events.Broadcaster
-	// Update is the complete update policy for this invocation (filter, cleanup, timeouts, etc.).
-	Update types.UpdateParams
 	// OnOldSelfDetected is called when Watchtower finds that it runs in an old
 	// instance's container, after that container's restart policy is disabled.
 	// The caller should stop the process. Nil means the session simply ends.
 	OnOldSelfDetected func()
+	// Update is the complete update policy for this invocation (filter, cleanup, timeouts, etc.).
+	Update updateParams.Params
+	// NotificationSplitByContainer enables a separate notification for each container.
+	NotificationSplitByContainer bool
+	// NotificationReport enables report-based notification templates.
+	NotificationReport bool
+}
+
+// reportedError marks an update error whose cause a phase has already logged
+// as a notification.
+//
+// The session then logs "Update execution failed" without notifying, so one
+// failure reaches notifications once. The marker does not change the error's
+// text, and errors.Is and errors.As see through it.
+type reportedError struct {
+	// err is the error whose cause was already notified.
+	err error
+}
+
+// Error returns the text of the wrapped error.
+//
+// Returns:
+//   - string: The wrapped error's text.
+func (e reportedError) Error() string {
+	return e.err.Error()
+}
+
+// Unwrap returns the wrapped error.
+//
+// Returns:
+//   - error: The error whose cause was already notified.
+func (e reportedError) Unwrap() error {
+	return e.err
 }
 
 // RunUpdatesWithNotifications performs container updates and sends notifications about the results.
 //
 // It executes the update action with configured parameters, batches notifications, and returns a metric
 // summarizing the session for monitoring purposes, ensuring users are informed of update outcomes.
+//
+// A panic during the session ends it as an update error does. The panic is
+// logged and sent with the session's notification batch. Subscribers get
+// scan_failed, and the returned metric marks a failed scan.
 //
 // Parameters:
 //   - ctx: Context for cancellation and timeouts.
@@ -59,25 +111,43 @@ type RunUpdatesWithNotificationsParams struct {
 //
 // Returns:
 //   - *metrics.Metric: A pointer to a metric object summarizing the update session (scanned, updated, failed counts).
+//
+//nolint:nonamedreturns // The deferred recover sets the result.
 func RunUpdatesWithNotifications(
 	ctx context.Context,
 	params RunUpdatesWithNotificationsParams,
-) *metrics.Metric {
+) (metric *metrics.Metric) {
 	log := params.Logger
 
 	log.Debug().Msg("Starting RunUpdatesWithNotifications")
 
-	// Initiate notification batching.
-	startNotifications(log, params.Notifier, params.NotificationSplitByContainer)
+	// The session owns its batch and sends its reports through it. It ends the
+	// batch on every return. The end sends what no notification took, without
+	// a report. Deferred before the recover, it also runs after a panicked
+	// session.
+	var send func(*state.Report)
+
+	if params.Notifier != nil {
+		var end func()
+
+		send, end = params.Notifier.StartSessionNotification()
+		defer end()
+	}
+
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			metric = endPanickedSession(log, params.EventBroadcaster, recovered)
+		}
+	}()
 
 	updateConfig := params.Update
 
-	// Publish redacted policy flags only to avoid UpdateParams leaking internal IDs.
+	// Publish redacted policy flags only to avoid updateParams.Params leaking internal IDs.
 	if params.EventBroadcaster != nil {
 		params.EventBroadcaster.Publish(events.Event{
 			Type:      "scan_started",
 			Timestamp: time.Now().UTC(),
-			Data:      events.NewScanStartedData(updateConfig),
+			Data:      updateConfig.ScanStartedData(),
 		})
 	}
 
@@ -120,7 +190,7 @@ func RunUpdatesWithNotifications(
 		params.Client,
 		updateConfig.Cleanup,
 		cleanupImageInfosPtr,
-		updateConfig.Timeout,
+		updateConfig.DetachedTimeout(),
 	)
 
 	// Publish image cleanup event
@@ -145,7 +215,7 @@ func RunUpdatesWithNotifications(
 	}
 
 	// Process update result, return metric on failure
-	metric := handleUpdateResult(log, result, err, params.Notifier)
+	metric = handleUpdateResult(log, result, err, send)
 	if metric != nil {
 		if params.EventBroadcaster != nil {
 			errMsg := "unknown error"
@@ -177,86 +247,67 @@ func RunUpdatesWithNotifications(
 	// Send notifications about update results
 	sendNotifications(log,
 		params.Notifier,
+		send,
 		params.NotificationSplitByContainer,
 		params.NotificationReport,
 		result,
-		cleanedImages,
 	)
 
-	// Publish scan completed event
-	if params.EventBroadcaster != nil {
-		scanned, updated, failed, skipped := 0, 0, 0, 0
-		if result != nil {
-			scanned = len(result.Scanned())
-			updated = len(result.Updated())
-			failed = len(result.Failed())
-			skipped = len(result.Skipped())
-		}
+	metric = generateAndLogMetric(log, result)
 
+	if params.EventBroadcaster != nil {
 		params.EventBroadcaster.Publish(events.Event{
 			Type:      "scan_completed",
 			Timestamp: time.Now().UTC(),
 			Data: events.ScanCompletedData{
-				Scanned: scanned,
-				Updated: updated,
-				Failed:  failed,
-				Skipped: skipped,
+				Scanned: metric.Scanned,
+				Updated: metric.Updated,
+				Failed:  metric.Failed,
+				Skipped: metric.Skipped,
 			},
 		})
 	}
 
-	// Generate and return metric summarizing the session
-	return generateAndLogMetric(log, result)
+	return metric
 }
-
-// emptyReport is a non-nil empty report used when sending notifications about errors.
-// It prevents panics in notifier implementations that may dereference the report.
-type emptyReport struct{}
-
-func (emptyReport) Scanned() []types.ContainerReport   { return nil }
-func (emptyReport) Updated() []types.ContainerReport   { return nil }
-func (emptyReport) Failed() []types.ContainerReport    { return nil }
-func (emptyReport) Skipped() []types.ContainerReport   { return nil }
-func (emptyReport) Stale() []types.ContainerReport     { return nil }
-func (emptyReport) Fresh() []types.ContainerReport     { return nil }
-func (emptyReport) Restarted() []types.ContainerReport { return nil }
-func (emptyReport) All() []types.ContainerReport       { return nil }
 
 // handleUpdateResult processes the result of an update operation and returns an appropriate metric.
 //
-// It checks for errors or nil results, logging accordingly. If an error occurred, it sends a
-// notification via the provided notifier (if not nil) to alert about the failure. An update that
-// fails partway still returns the report of the work done before the error, so that report is
-// notified and counted. On error or nil result, it returns a non-nil metric to indicate the
-// failure state. On success, it returns nil to indicate continuation of the update process.
+// It logs an update error at error level. When a phase has already notified the error's cause,
+// that line is logged with notify=no, which keeps the failure to one notification. An update that
+// fails partway still returns the report of the work done before the error. That report is sent
+// through the session's batch and counted. Without a report, nothing is sent here. The session's
+// end then sends the batch without a report, which lets report templates list the queued error
+// entry. On error or nil result, it returns a metric that marks a failed scan. On success, it
+// returns nil.
 //
 // Parameters:
 //   - result: The report from the update operation. It may be partial when err is non-nil.
 //   - err: Any error encountered during the update.
-//   - notifier: The notification system for sending error alerts. It may be nil.
+//   - send: Sends a report through the session's notification batch. Nil without a notifier.
 //
 // Returns:
 //   - *metrics.Metric: A metric marked as a failed scan, with the counts of the partial report
 //     on error, or zero counts when there is no report. Nil on success.
-func handleUpdateResult(log *zerolog.Logger, result types.Report, err error, notifier types.Notifier) *metrics.Metric {
+func handleUpdateResult(log *zerolog.Logger, result *state.Report, err error, send func(*state.Report)) *metrics.Metric {
 	// Check for errors during update execution
 	if err != nil {
-		log.Error().
-			Err(err).
-			Msg("Update execution failed")
-
-		// Without a partial report, the notification still carries the error.
-		report := result
-		if report == nil {
-			report = emptyReport{}
+		event := log.Error().Err(err)
+		if _, reported := errors.AsType[reportedError](err); reported {
+			event = event.Str("notify", "no")
 		}
 
-		// Send notification about the error
-		if notifier != nil {
-			notifier.SendNotification(report)
+		event.Msg(logging.UpdateFailed)
+
+		if result == nil {
+			return &metrics.Metric{ScanFailed: true}
 		}
 
-		metric := metrics.NewMetric(report)
+		if send != nil {
+			send(result)
+		}
+
+		metric := newScanMetric(result)
 		metric.ScanFailed = true
 
 		return metric
@@ -272,71 +323,45 @@ func handleUpdateResult(log *zerolog.Logger, result types.Report, err error, not
 	return nil
 }
 
-// buildSingleContainerReport creates a SingleContainerReport for a specific updated container.
+// endPanickedSession ends an update session that panicked, as an update error
+// ends one.
 //
-// It populates the report with the updated container as the primary item and includes
-// all other session results (scanned, failed, skipped, stale, fresh) for comprehensive context.
+// The panic value is logged at error, so it reaches notifications. The stack
+// is logged at debug without notifying. The session's end then sends its
+// notification batch, which holds the panic entry, without a report.
+// Subscribers get scan_failed.
 //
 // Parameters:
-//   - updatedContainer: The container that was updated.
-//   - result: The full session report containing all container statuses.
+//   - log: Process logger for the session.
+//   - broadcaster: Event broadcaster that receives scan_failed. It may be nil.
+//   - recovered: The value the session panicked with.
 //
 // Returns:
-//   - *state.SingleContainerReport: A report focused on the updated container with full session context.
-func buildSingleContainerReport(
-	updatedContainer types.ContainerReport,
-	result types.Report,
-) *state.SingleContainerReport {
-	return &state.SingleContainerReport{
-		UpdatedReports: []types.ContainerReport{updatedContainer},
-		ScannedReports: result.Scanned(),
-		FailedReports:  result.Failed(),
-		SkippedReports: result.Skipped(),
-		StaleReports:   result.Stale(),
-		FreshReports:   result.Fresh(),
-	}
-}
+//   - *metrics.Metric: A metric marking a failed scan with zero counts.
+func endPanickedSession(
+	log *zerolog.Logger,
+	broadcaster *events.Broadcaster,
+	recovered any,
+) *metrics.Metric {
+	panicValue := fmt.Sprint(recovered)
 
-// buildSingleRestartedContainerReport creates a SingleContainerReport for a specific restarted container.
-//
-// It populates the report with the restarted container as the primary item and includes
-// all other session results (scanned, failed, skipped, stale, fresh) for comprehensive context.
-//
-// Parameters:
-//   - restartedContainer: The container that was restarted.
-//   - result: The full session report containing all container statuses.
-//
-// Returns:
-//   - *state.SingleContainerReport: A report focused on the restarted container with full session context.
-func buildSingleRestartedContainerReport(
-	restartedContainer types.ContainerReport,
-	result types.Report,
-) *state.SingleContainerReport {
-	return &state.SingleContainerReport{
-		RestartedReports: []types.ContainerReport{restartedContainer},
-		ScannedReports:   result.Scanned(),
-		FailedReports:    result.Failed(),
-		SkippedReports:   result.Skipped(),
-		StaleReports:     result.Stale(),
-		FreshReports:     result.Fresh(),
-	}
-}
+	log.Error().Str("error", panicValue).Msg(logging.UpdatePanicked)
+	log.Debug().
+		Str("notify", "no").
+		Str("stack", string(debug.Stack())).
+		Msg("Stack of the update panic")
 
-// startNotifications initiates notification batching if a notifier is provided.
-//
-// It starts the notification process to group update messages, or logs a debug message
-// if no notifier is available. When notifications are split by container, it suppresses
-// the summary notification to prevent unwanted duplicates.
-//
-// Parameters:
-//   - notifier: The notification system instance for sending update status messages.
-//   - notificationSplitByContainer: Boolean flag indicating whether notifications are split by container.
-func startNotifications(log *zerolog.Logger, notifier types.Notifier, notificationSplitByContainer bool) {
-	if notifier != nil {
-		notifier.StartNotification(notificationSplitByContainer)
-	} else {
-		log.Debug().Msg("Notifier is nil, skipping notification batching")
+	if broadcaster != nil {
+		broadcaster.Publish(events.Event{
+			Type:      "scan_failed",
+			Timestamp: time.Now().UTC(),
+			Data: events.ScanFailedData{
+				Error: "update panicked: " + panicValue,
+			},
+		})
 	}
+
+	return &metrics.Metric{ScanFailed: true}
 }
 
 // executeUpdate performs the container update operation and handles errors.
@@ -353,17 +378,17 @@ func startNotifications(log *zerolog.Logger, notifier types.Notifier, notificati
 //   - gitClient: Git monitor client. Nil when Git monitoring is unused.
 //
 // Returns:
-//   - types.Report: Results of the update operation.
-//   - []types.RemovedImageInfo: Images eligible for cleanup.
+//   - *state.Report: Results of the update operation.
+//   - []cleanup.RemovedImageInfo: Images eligible for cleanup.
 //   - error: Non-nil when Update fails.
 func executeUpdate(
 	log *zerolog.Logger,
 	ctx context.Context,
 	client containerClient.Client,
-	config types.UpdateParams,
+	config updateParams.Params,
 	rateLimiter *ratelimit.Limiter,
 	gitClient *git.Client,
-) (types.Report, []types.RemovedImageInfo, error) {
+) (*state.Report, []cleanup.RemovedImageInfo, error) {
 	// Log before calling the Update function
 	log.Debug().Msg("About to call Update function")
 
@@ -377,96 +402,48 @@ func executeUpdate(
 
 // performImageCleanup executes image cleanup if enabled.
 //
-// It removes old images after updates if the cleanup flag is set.
-// When multiple containers share the same old image, the image is only removed once
-// (preventing duplicate "Removing image" log entries), but the returned slice includes
-// all container associations so that split-by-container notifications report correctly.
+// It removes old images after updates if the cleanup flag is set. An image
+// that several containers shared is removed once. The returned slice has an
+// entry for each of those containers. The image_cleanup event then lists each
+// container that used a removed image.
 // Docker calls use a detached timeout so SIGTERM after a Watchtower self-update
 // cannot abort leftover image removal.
 //
 // Parameters:
 //   - ctx: Parent session context. Cancellation is detached for Docker calls.
 //   - client: The Docker client instance used for container operations.
-//   - cleanup: Boolean indicating whether to perform image cleanup.
+//   - enabled: Whether image cleanup is enabled.
 //   - cleanupImageInfos: Slice of cleaned image info to be removed.
-//   - timeout: Bound for detached cleanup Docker calls. Non-positive uses the restart-policy fallback.
+//   - timeout: Bound for the detached cleanup Docker calls.
 //
 // Returns:
-//   - []types.RemovedImageInfo: Slice of successfully cleaned image info.
+//   - []cleanup.RemovedImageInfo: Slice of successfully cleaned image info.
 func performImageCleanup(log *zerolog.Logger, ctx context.Context,
 	client containerClient.Client,
-	cleanup bool,
-	cleanupImageInfos []types.RemovedImageInfo,
+	enabled bool,
+	cleanupImageInfos []cleanup.RemovedImageInfo,
 	timeout time.Duration,
-) []types.RemovedImageInfo {
-	if !cleanup || len(cleanupImageInfos) == 0 {
-		return []types.RemovedImageInfo{}
+) []cleanup.RemovedImageInfo {
+	if !enabled || len(cleanupImageInfos) == 0 {
+		return []cleanup.RemovedImageInfo{}
 	}
-
-	// Deduplicate by ImageID so each image is only removed once.
-	// This prevents duplicate "Removing image" log entries in non-split notifications
-	// when multiple containers share the same old image.
-	uniqueByImageID := deduplicateByImageID(cleanupImageInfos)
 
 	// Detach from the session context so SIGTERM after self-update cannot
 	// abort leftover image removal.
 	cleanupCtx, cancel := context.WithTimeout(
 		context.WithoutCancel(ctx),
-		restartPolicyTimeout(timeout),
+		timeout,
 	)
 	defer cancel()
 
-	cleaned, err := removeImages(log, cleanupCtx, client, uniqueByImageID)
+	cleaned, err := cleanup.RemoveImages(log, cleanupCtx, client, cleanupImageInfos)
 	if err != nil {
 		log.Warn().
 			Err(err).
 			Msg("Failed to clean up some images after update")
 	}
 
-	if len(cleaned) == 0 {
-		return []types.RemovedImageInfo{}
-	}
-
-	// Build a set of successfully removed image IDs.
-	removedIDs := make(map[types.ImageID]bool, len(cleaned))
-	for _, c := range cleaned {
-		removedIDs[c.ImageID] = true
-	}
-
-	// Expand to include all container associations for each removed image.
-	// This ensures split-by-container notifications report cleanup for every
-	// container that used the old image, not just the one that triggered removal.
-	result := make([]types.RemovedImageInfo, 0, len(cleanupImageInfos))
-	for _, info := range cleanupImageInfos {
-		if removedIDs[info.ImageID] {
-			result = append(result, info)
-		}
-	}
-
-	return result
-}
-
-// deduplicateByImageID returns a new slice containing only the first occurrence
-// of each ImageID. This is used to ensure each image is removed exactly once
-// even when multiple containers share the same old image.
-//
-// Parameters:
-//   - images: Slice of RemovedImageInfo that may contain duplicate ImageIDs.
-//
-// Returns:
-//   - []types.RemovedImageInfo: Slice with one entry per unique ImageID.
-func deduplicateByImageID(images []types.RemovedImageInfo) []types.RemovedImageInfo {
-	seen := make(map[types.ImageID]bool, len(images))
-	result := make([]types.RemovedImageInfo, 0, len(images))
-
-	for _, img := range images {
-		if !seen[img.ImageID] {
-			seen[img.ImageID] = true
-			result = append(result, img)
-		}
-	}
-
-	return result
+	return cleaned
 }
 
 // logUpdateReport logs the update report details for debugging purposes.
@@ -475,7 +452,7 @@ func deduplicateByImageID(images []types.RemovedImageInfo) []types.RemovedImageI
 //
 // Parameters:
 //   - result: The report containing the results of the update operation.
-func logUpdateReport(log *zerolog.Logger, result types.Report) {
+func logUpdateReport(log *zerolog.Logger, result *state.Report) {
 	// Initialize slice for updated container names
 	updatedNames := make([]string, 0, len(result.Updated()))
 	// Collect names of all updated containers
@@ -493,61 +470,61 @@ func logUpdateReport(log *zerolog.Logger, result types.Report) {
 
 // sendNotifications handles sending notifications about update results.
 //
-// It supports both grouped and per-container notifications based on configuration flags,
-// including complex logic for splitting notifications by container. The non-split path
-// sends notifications asynchronously using a goroutine with proper synchronization
-// to ensure the notification completes before the notifier is closed.
+// It supports both grouped and per-container notifications based on configuration flags.
+// A grouped report below the notifications level is not sent. The session's
+// end then sends the lines it queued, without the report.
 //
 // Parameters:
-//   - notifier: The notification system instance for sending update status messages.
-//   - notificationSplitByContainer: Boolean flag enabling separate notifications for each updated container.
+//   - notifier: Decides which reports are worth a notification. It may be nil.
+//   - send: Sends a report through the session's notification batch. Nil when notifier is nil.
+//   - notificationSplitByContainer: Boolean flag enabling a separate notification for each container.
 //   - notificationReport: Boolean flag enabling report-based notifications.
 //   - result: The report containing the results of the update operation.
-//   - cleanedImages: Slice of successfully cleaned image info.
-func sendNotifications(log *zerolog.Logger, notifier types.Notifier,
+func sendNotifications(log *zerolog.Logger, notifier Notifier, send func(*state.Report),
 	notificationSplitByContainer, notificationReport bool,
-	result types.Report,
-	cleanedImages []types.RemovedImageInfo,
+	result *state.Report,
 ) {
-	// Check if notifier is available
-	if notifier != nil {
-		// Check if notifications should be split by container
-		if notificationSplitByContainer {
-			sendSplitNotifications(log, notifier, notificationReport, result, cleanedImages)
-		} else if notifier.ShouldSendNotification(result) {
-			notifier.SendNotification(result)
+	if notifier == nil {
+		return
+	}
+
+	// notify sends a report through the session's batch when it is worth a
+	// notification at the configured notifications level.
+	notify := func(report *state.Report) {
+		if notifier.ShouldSendNotification(report) {
+			send(report)
 		}
 	}
+
+	if notificationSplitByContainer {
+		sendSplitNotifications(log, notify, notificationReport, result)
+
+		return
+	}
+
+	notify(result)
 }
 
 // sendSplitNotifications handles sending notifications when split by container is enabled.
 //
-// It processes updated containers and sends either report-based or filtered entry notifications
-// based on the notificationReport flag, skipping invalid containers.
-// When notificationReport is true, it also sends notifications for monitor-only
-// containers from the stale list.
-// To prevent duplicate notifications for the same container, a map is used to track
-// which container IDs have already been notified during this notification session.
-// This tracking mechanism ensures that even if a container appears in multiple lists
-// (e.g., due to edge cases in report generation), it receives only one notification,
-// maintaining clean and non-redundant communication with users.
+// It sends one notification for each of these containers:
+//   - an updated or restarted container
+//   - a container whose update failed
+//   - a monitor-only container with a newer image
+//   - a container skipped during its update cooldown
+//
+// The notificationReport flag picks report-based or filtered entry
+// notifications. A container without a name is skipped. The session report
+// lists each container in one category. No container is notified twice.
 //
 // Parameters:
-//   - notifier: The notification system instance for sending update status messages.
+//   - notify: Sends a report that is worth a notification through the session's notification batch.
 //   - notificationReport: Boolean flag enabling report-based notifications.
 //   - result: The report containing the results of the update operation.
-//   - cleanedImages: Slice of successfully cleaned image info.
-func sendSplitNotifications(log *zerolog.Logger, notifier types.Notifier,
+func sendSplitNotifications(log *zerolog.Logger, notify func(*state.Report),
 	notificationReport bool,
-	result types.Report,
-	cleanedImages []types.RemovedImageInfo,
+	result *state.Report,
 ) {
-	// Map to track notified container IDs to prevent duplicate notifications.
-	// Key is the full container ID string for uniqueness, value is boolean indicating
-	// whether a notification has been sent for this container.
-	// This map is scoped to the function to ensure tracking is per-notification-session.
-	notified := make(map[string]bool)
-
 	log.Debug().
 		Int("updated_count", len(result.Updated())).
 		Int("restarted_count", len(result.Restarted())).
@@ -558,115 +535,35 @@ func sendSplitNotifications(log *zerolog.Logger, notifier types.Notifier,
 		Int("scanned_count", len(result.Scanned())).
 		Msg("Split notifications: container counts by category")
 
-	if notificationReport {
-		// Log updated containers for debugging
-		updatedNames := make([]string, 0, len(result.Updated()))
-		for _, report := range result.Updated() {
-			updatedNames = append(updatedNames, report.Name())
-		}
+	// inCooldown reports whether a skipped container waits out its update cooldown.
+	inCooldown := func(r types.ContainerReport) bool {
+		status, ok := r.(*state.ContainerStatus)
 
-		log.Debug().
-			Strs("updated_containers", updatedNames).
-			Msg("Split notifications: sending report notifications for updated containers")
+		return ok && status.CooldownDelay() != ""
+	}
 
+	passes := []struct {
+		include  func(types.ContainerReport) bool
+		category string
+		reports  []types.ContainerReport
+	}{
+		{include: nil, category: "updated", reports: result.Updated()},
+		{include: nil, category: "restarted", reports: result.Restarted()},
+		{include: nil, category: "failed", reports: result.Failed()},
+		{include: types.ContainerReport.IsMonitorOnly, category: "monitor-only stale", reports: result.Stale()},
+		{include: inCooldown, category: "cooldown-skipped", reports: result.Skipped()},
+	}
+
+	for _, pass := range passes {
 		notifyContainers(notifyContainersParams{
 			log:           log,
-			notifier:      notifier,
-			notified:      notified,
-			reports:       result.Updated(),
+			notify:        notify,
+			reports:       pass.reports,
 			result:        result,
-			category:      "updated",
-			logBeforeSend: false,
-			include:       func(r types.ContainerReport) bool { return true },
-			buildReport:   buildSingleContainerReport,
+			category:      pass.category,
+			logBeforeSend: !notificationReport,
+			include:       pass.include,
 		})
-		notifyContainers(notifyContainersParams{
-			log:           log,
-			notifier:      notifier,
-			notified:      notified,
-			reports:       result.Restarted(),
-			result:        result,
-			category:      "restarted",
-			logBeforeSend: false,
-			include:       func(r types.ContainerReport) bool { return true },
-			buildReport:   buildSingleRestartedContainerReport,
-		})
-		// Monitor-only containers appear in Stale when notificationReport is true.
-		notifyContainers(notifyContainersParams{
-			log:           log,
-			notifier:      notifier,
-			notified:      notified,
-			reports:       result.Stale(),
-			result:        result,
-			category:      "stale",
-			logBeforeSend: false,
-			include:       func(r types.ContainerReport) bool { return r.IsMonitorOnly() },
-			buildReport:   buildSingleContainerReport,
-		})
-
-		// Cooldown-skipped containers use a different report shape and stay inline.
-		notifySkippedCooldownContainers(log, notifier, notified, result)
-	} else {
-		// Log-mode split: hook-captured entries are filtered by container inside
-		// SendNotification when the report is a SingleContainerReport.
-		//
-		// Image removal logs once per ImageID without container scope. Expanded
-		// cleanedImages retains every container association for shared images, so
-		// emit a hooked container-scoped cleanup event for each entry so both
-		// containers that shared an old image receive cleanup in split mode.
-		for _, img := range cleanedImages {
-			log.Info().
-				Str("notify", "yes").
-				Str("container_name", img.ContainerName).
-				Str("image_name", img.ImageName).
-				Str("image_id", img.ImageID.ShortID()).
-				Msg("Removing image")
-		}
-
-		updatedNames := make([]string, 0, len(result.Updated()))
-		for _, report := range result.Updated() {
-			updatedNames = append(updatedNames, report.Name())
-		}
-
-		log.Debug().
-			Strs("updated_containers", updatedNames).
-			Msg("Split notifications: sending per-container notifications (log mode)")
-
-		notifyContainers(notifyContainersParams{
-			log:           log,
-			notifier:      notifier,
-			notified:      notified,
-			reports:       result.Updated(),
-			result:        result,
-			category:      "updated",
-			logBeforeSend: true,
-			include:       func(r types.ContainerReport) bool { return true },
-			buildReport:   buildSingleContainerReport,
-		})
-		notifyContainers(notifyContainersParams{
-			log:           log,
-			notifier:      notifier,
-			notified:      notified,
-			reports:       result.Restarted(),
-			result:        result,
-			category:      "restarted",
-			logBeforeSend: true,
-			include:       func(r types.ContainerReport) bool { return true },
-			buildReport:   buildSingleRestartedContainerReport,
-		})
-		notifyContainers(notifyContainersParams{
-			log:           log,
-			notifier:      notifier,
-			notified:      notified,
-			reports:       result.Stale(),
-			result:        result,
-			category:      "monitor-only stale",
-			logBeforeSend: true,
-			include:       func(r types.ContainerReport) bool { return r.IsMonitorOnly() },
-			buildReport:   buildSingleContainerReport,
-		})
-
-		notifySkippedCooldownContainers(log, notifier, notified, result)
 	}
 
 	log.Debug().Msg("Finished sending notifications")
@@ -674,32 +571,24 @@ func sendSplitNotifications(log *zerolog.Logger, notifier types.Notifier,
 
 // notifyContainersParams groups inputs for notifyContainers.
 type notifyContainersParams struct {
+	result        *state.Report
+	notify        func(*state.Report)
 	log           *zerolog.Logger
-	notifier      types.Notifier
-	notified      map[string]bool
-	reports       []types.ContainerReport
-	result        types.Report
-	category      string
-	logBeforeSend bool
 	include       func(types.ContainerReport) bool
-	buildReport   func(types.ContainerReport, types.Report) *state.SingleContainerReport
+	category      string
+	reports       []types.ContainerReport
+	logBeforeSend bool
 }
 
 // notifyContainers sends per-container notifications for a report collection.
 //
-// It applies nil and empty-name filtering, container-ID de-duplication via notified,
-// optional category eligibility (include), and ShouldSendNotification before send.
+// It skips a container without a name. It also skips one that include
+// rejects. A nil include notifies every named container.
 //
 // Parameters:
 //   - params: Named inputs for the category-specific notification pass.
 func notifyContainers(params notifyContainersParams) {
 	for _, report := range params.reports {
-		if report == nil {
-			params.log.Debug().Msg("Encountered nil " + params.category + " container report, skipping")
-
-			continue
-		}
-
 		if strings.TrimSpace(report.Name()) == "" {
 			params.log.Debug().
 				Str("container_id", report.ID().ShortID()).
@@ -708,12 +597,7 @@ func notifyContainers(params notifyContainersParams) {
 			continue
 		}
 
-		if !params.include(report) {
-			continue
-		}
-
-		containerID := string(report.ID())
-		if params.notified[containerID] {
+		if params.include != nil && !params.include(report) {
 			continue
 		}
 
@@ -724,57 +608,7 @@ func notifyContainers(params notifyContainersParams) {
 				Msg("Sending individual notification for " + params.category + " container")
 		}
 
-		singleContainerReport := params.buildReport(report, params.result)
-		if params.notifier.ShouldSendNotification(singleContainerReport) {
-			params.notifier.SendNotification(singleContainerReport)
-		}
-
-		params.notified[containerID] = true
-	}
-}
-
-// notifySkippedCooldownContainers sends notifications for cooldown-skipped containers.
-//
-// Parameters:
-//   - log: Logger (unused currently, reserved for consistency with sibling helpers).
-//   - notifier: Notification client.
-//   - notified: Map of container IDs already notified in this session.
-//   - result: Full session report.
-func notifySkippedCooldownContainers(
-	_ *zerolog.Logger,
-	notifier types.Notifier,
-	notified map[string]bool,
-	result types.Report,
-) {
-	for _, report := range result.Skipped() {
-		if report == nil {
-			continue
-		}
-
-		containerStatus, ok := report.(*state.ContainerStatus)
-		if !ok || containerStatus.CooldownDelay() == "" {
-			continue
-		}
-
-		containerID := string(report.ID())
-		if notified[containerID] {
-			continue
-		}
-
-		singleSkippedReport := &state.SingleContainerReport{
-			SkippedReports:   []types.ContainerReport{report},
-			ScannedReports:   result.Scanned(),
-			UpdatedReports:   result.Updated(),
-			RestartedReports: result.Restarted(),
-			FailedReports:    result.Failed(),
-			StaleReports:     result.Stale(),
-			FreshReports:     result.Fresh(),
-		}
-		if notifier.ShouldSendNotification(singleSkippedReport) {
-			notifier.SendNotification(singleSkippedReport)
-		}
-
-		notified[containerID] = true
+		params.notify(state.NewSingleContainerReport(report, params.result))
 	}
 }
 
@@ -782,8 +616,8 @@ func notifySkippedCooldownContainers(
 //
 // It builds a session summary metric and writes an Info completion line on the
 // process logger. The line carries notify=no so the Shoutrrr hook does not send
-// a second notification after SendNotification has already flushed the session
-// batch. Without that field, legacy templates would emit a standalone
+// a second notification after the session's report has already been sent.
+// Without that field, legacy templates would emit a standalone
 // "Update session completed" message with only the scanned, updated, failed,
 // and skipped counts.
 //
@@ -793,8 +627,8 @@ func notifySkippedCooldownContainers(
 //
 // Returns:
 //   - *metrics.Metric: A pointer to a metric object summarizing the update session.
-func generateAndLogMetric(log *zerolog.Logger, result types.Report) *metrics.Metric {
-	metricResults := metrics.NewMetric(result)
+func generateAndLogMetric(log *zerolog.Logger, result *state.Report) *metrics.Metric {
+	metricResults := newScanMetric(result)
 
 	// Process log only. Session content was already notified via sendNotifications.
 	log.Info().
@@ -806,4 +640,21 @@ func generateAndLogMetric(log *zerolog.Logger, result types.Report) *metrics.Met
 		Msg("Update session completed")
 
 	return metricResults
+}
+
+// newScanMetric counts the containers in each category of a session report.
+//
+// Parameters:
+//   - report: The session report. It must not be nil.
+//
+// Returns:
+//   - *metrics.Metric: The session's counts, with ScanFailed unset.
+func newScanMetric(report *state.Report) *metrics.Metric {
+	return &metrics.Metric{
+		Scanned:   len(report.Scanned()),
+		Updated:   len(report.Updated()),
+		Failed:    len(report.Failed()),
+		Restarted: len(report.Restarted()),
+		Skipped:   len(report.Skipped()),
+	}
 }

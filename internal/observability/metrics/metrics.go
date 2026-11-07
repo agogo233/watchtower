@@ -9,8 +9,6 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 var metrics *Metrics
@@ -31,7 +29,6 @@ type Metric struct {
 
 // Metrics handles processing and exposing scan metrics.
 type Metrics struct {
-	channel            chan *Metric       // Channel for queuing metrics.
 	scanned            prometheus.Gauge   // Gauge for scanned containers.
 	updated            prometheus.Gauge   // Gauge for updated containers.
 	failed             prometheus.Gauge   // Gauge for failed containers.
@@ -46,16 +43,15 @@ type Metrics struct {
 	imageReclaimable   prometheus.Gauge   // Gauge for reclaimable Docker image bytes.
 	diskSpaceMaxBytes  prometheus.Gauge   // Gauge for the configured image-usage maximum.
 	diskSpaceWarnBytes prometheus.Gauge   // Gauge for the configured image-usage warning threshold.
-	stopCh             chan struct{}      // Channel for shutdown signaling.
-	shutdownOnce       sync.Once          // Ensures shutdown is called only once.
-	lastMetric         *Metric            // Last scan metric for status endpoint.
-	lastMetricMu       sync.RWMutex       // Protects lastMetric.
-	history            []HistoryEntry     // Ring buffer of scan history.
-	historyIdx         int                // Current write position in the ring buffer.
-	historyMu          sync.RWMutex       // Protects history and historyIdx.
 	//nolint:containedctx
-	ctx    context.Context    // Context for cancellation.
-	cancel context.CancelFunc // Cancel function for the context.
+	ctx          context.Context    // Context for cancellation.
+	channel      chan *Metric       // Channel for queuing metrics.
+	stopCh       chan struct{}      // Channel for shutdown signaling.
+	cancel       context.CancelFunc // Cancel function for the context.
+	history      []HistoryEntry     // Ring buffer of scan history.
+	historyIdx   int                // Current write position in the ring buffer.
+	historyMu    sync.RWMutex       // Protects history and historyIdx.
+	shutdownOnce sync.Once          // Ensures shutdown is called only once.
 }
 
 // NewWithRegistry creates a new Metrics handler with a custom Prometheus registry.
@@ -218,33 +214,17 @@ func registerCollector[Collector prometheus.Collector](
 	return collector, fmt.Errorf("failed to register metric: %w", err)
 }
 
-// NewMetric creates a Metric from a scan report.
-//
-// Parameters:
-//   - report: Scan report from types.Report.
-//
-// Returns:
-//   - *Metric: New metric instance.
-func NewMetric(report types.Report) *Metric {
-	if report == nil {
-		panic("NewMetric: report is nil")
-	}
-
-	return &Metric{
-		Scanned:   len(report.Scanned()),
-		Updated:   len(report.Updated()), // Only count actually updated containers.
-		Failed:    len(report.Failed()),
-		Restarted: len(report.Restarted()),
-		Skipped:   len(report.Skipped()),
-	}
-}
-
 // Register attempts to enqueue a metric for processing.
 // If the channel is full, the metric is dropped and the dropped counter is incremented.
+// A nil metric is ignored.
 //
 // Parameters:
 //   - metric: Metric to register.
 func (m *Metrics) Register(metric *Metric) {
+	if metric == nil {
+		return
+	}
+
 	select {
 	case m.channel <- metric:
 		// Metric sent successfully
@@ -278,6 +258,17 @@ func Default() *Metrics {
 //   - metric: Metric to register.
 func (m *Metrics) RegisterScan(metric *Metric) {
 	m.Register(metric)
+}
+
+// RegisterSkippedScan counts a scan that the scheduler skipped because another
+// update was still running.
+//
+// An HTTP API update request turned away for the same reason never started a
+// scan, so it is not counted. A skipped scan scanned nothing, so it leaves the
+// last-scan gauges, the scan history, and the scan total unchanged. It is safe
+// to call concurrently.
+func (m *Metrics) RegisterSkippedScan() {
+	m.skippedScans.Inc()
 }
 
 // RecordImageDiskUsage updates Docker image-usage gauges on the default handler.
@@ -325,23 +316,26 @@ func (m *Metrics) Shutdown() {
 	})
 }
 
-// GetLastScan returns a copy of the most recent scan metric, or nil if no scan
-// has completed yet. The returned copy is safe to modify by the caller without
-// affecting the internal metrics state.
+// GetLastScan returns a copy of the most recent scan's history entry, with its
+// counts and the time the scan was recorded, or nil if no scan has completed
+// yet. The returned copy is safe to modify by the caller without affecting the
+// internal metrics state.
 //
 // Returns:
-//   - *Metric: Copy of the last scan metric, or nil.
-func (m *Metrics) GetLastScan() *Metric {
-	m.lastMetricMu.RLock()
-	defer m.lastMetricMu.RUnlock()
+//   - *HistoryEntry: Copy of the last scan's entry, or nil.
+func (m *Metrics) GetLastScan() *HistoryEntry {
+	m.historyMu.RLock()
+	defer m.historyMu.RUnlock()
 
-	if m.lastMetric == nil {
+	if len(m.history) == 0 {
 		return nil
 	}
 
-	metricCopy := *m.lastMetric
+	// The newest entry sits just before the next write position, which stays
+	// at 0 until the buffer is full.
+	last := m.history[(m.historyIdx+len(m.history)-1)%len(m.history)]
 
-	return &metricCopy
+	return &last
 }
 
 // historyBufferSize defines the maximum number of scan history entries
@@ -426,18 +420,6 @@ func (m *Metrics) HandleUpdate() {
 				return
 			}
 
-			if change == nil {
-				// Update was skipped and rescheduled
-				m.total.Inc()
-				m.skippedScans.Inc()
-				m.scanned.Set(0)
-				m.updated.Set(0)
-				m.failed.Set(0)
-				m.restarted.Set(0)
-				m.skipped.Set(0)
-
-				continue
-			}
 			// Update metrics with scan results. A failed scan still counts as a
 			// scan, with the counts it reached.
 			m.total.Inc()
@@ -452,10 +434,6 @@ func (m *Metrics) HandleUpdate() {
 			m.restarted.Set(float64(change.Restarted))
 			m.skipped.Set(float64(change.Skipped))
 			m.restartedTotal.Add(float64(change.Restarted))
-
-			m.lastMetricMu.Lock()
-			m.lastMetric = change
-			m.lastMetricMu.Unlock()
 
 			m.RecordHistory(change)
 		case <-m.stopCh:

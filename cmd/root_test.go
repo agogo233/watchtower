@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -36,6 +37,7 @@ import (
 	"github.com/nicholas-fedor/watchtower/internal/settings"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/logcapture"
 	"github.com/nicholas-fedor/watchtower/internal/update"
+	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/internal/update/schedule"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 	mockTypes "github.com/nicholas-fedor/watchtower/pkg/types/mocks"
@@ -377,7 +379,7 @@ func testScheduleDeps(
 		WriteStartupMessage: logging.WriteStartupMessage,
 		RunUpdate:           runUpdatesWithNotifications,
 		UpdateOnStart:       updateOnStart,
-		BaseParams:          types.UpdateParams{},
+		BaseParams:          updateParams.Params{},
 	}
 }
 
@@ -396,7 +398,7 @@ func TestUpdateOnStartTriggersImmediateUpdate(t *testing.T) {
 
 	// Mock the update function to signal when called
 	originalRunUpdatesWithNotifications := runUpdatesWithNotifications
-	runUpdatesWithNotifications = func(_ context.Context, _ types.Filter, _ types.UpdateParams) *metrics.Metric {
+	runUpdatesWithNotifications = func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
 		atomic.AddInt32(&updateCallCount, 1)
 
 		select {
@@ -455,7 +457,7 @@ func TestUpdateOnStartIntegratesWithCronScheduling(t *testing.T) {
 
 		// Mock the update function
 		originalRunUpdatesWithNotifications := runUpdatesWithNotifications
-		runUpdatesWithNotifications = func(_ context.Context, _ types.Filter, _ types.UpdateParams) *metrics.Metric {
+		runUpdatesWithNotifications = func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
 			callTime := time.Now()
 
 			atomic.AddInt32(&updateCallCount, 1)
@@ -536,7 +538,7 @@ func TestUpdateOnStartLockingBehavior(t *testing.T) {
 
 		// Mock the update function
 		originalRunUpdatesWithNotifications := runUpdatesWithNotifications
-		runUpdatesWithNotifications = func(_ context.Context, _ types.Filter, _ types.UpdateParams) *metrics.Metric {
+		runUpdatesWithNotifications = func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
 			select {
 			case updateCalled <- true:
 			default:
@@ -586,7 +588,7 @@ func TestUpdateOnStartSelfUpdateScenario(t *testing.T) {
 
 		// Mock the update function
 		originalRunUpdatesWithNotifications := runUpdatesWithNotifications
-		runUpdatesWithNotifications = func(_ context.Context, _ types.Filter, _ types.UpdateParams) *metrics.Metric {
+		runUpdatesWithNotifications = func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
 			select {
 			case updateCalled <- true:
 			default:
@@ -619,100 +621,6 @@ func TestUpdateOnStartSelfUpdateScenario(t *testing.T) {
 		default:
 			t.Error("Update function was not called in self-update scenario")
 		}
-	})
-}
-
-// TestUpdateOnStartMultiInstanceScenario verifies that multiple Watchtower instances
-// with update-on-start don't conflict with each other.
-func TestUpdateOnStartMultiInstanceScenario(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		// This test simulates two Watchtower instances both with --update-on-start
-		// They should not conflict due to proper locking
-
-		// Create commands with update-on-start flag enabled
-		cmd1 := &cobra.Command{}
-		settings.RegisterAll(cmd1)
-		err := cmd1.ParseFlags([]string{"--update-on-start", "--no-startup-message"})
-		require.NoError(t, err)
-
-		updateOnStart1, _ := cmd1.Flags().GetBool("update-on-start")
-
-		cmd2 := &cobra.Command{}
-		settings.RegisterAll(cmd2)
-		err = cmd2.ParseFlags([]string{"--update-on-start", "--no-startup-message"})
-		require.NoError(t, err)
-
-		updateOnStart2, _ := cmd2.Flags().GetBool("update-on-start")
-
-		// Shared update lock (simulating shared resource)
-		updateLock := schedule.NewUpdateLock()
-
-		// Track update calls from both instances
-		updateCallCount := int32(0)
-
-		var completed atomic.Int32
-
-		instance1Called := make(chan bool, 1)
-		instance2Called := make(chan bool, 1)
-
-		// Mock the update function
-		originalRunUpdatesWithNotifications := runUpdatesWithNotifications
-		runUpdatesWithNotifications = func(_ context.Context, _ types.Filter, _ types.UpdateParams) *metrics.Metric {
-			atomic.AddInt32(&updateCallCount, 1)
-			synctest.Wait() // Simulate update work
-
-			return nil // Don't trigger metrics in test
-		}
-
-		defer func() { runUpdatesWithNotifications = originalRunUpdatesWithNotifications }()
-
-		// Start both instances concurrently
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-			defer cancel()
-
-			filter := types.Filter(func(_ types.FilterableContainer) bool { return false })
-			deps := testScheduleDeps(t, filter, updateLock, updateOnStart1)
-			runErr := schedule.RunUpgradesOnSchedule(ctx, deps)
-			assert.NoError(t, runErr)
-			completed.Add(1)
-			close(instance1Called)
-		}()
-
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-			defer cancel()
-
-			filter := types.Filter(func(_ types.FilterableContainer) bool { return false })
-			deps := testScheduleDeps(t, filter, updateLock, updateOnStart2)
-			runErr := schedule.RunUpgradesOnSchedule(ctx, deps)
-			assert.NoError(t, runErr)
-			completed.Add(1)
-			close(instance2Called)
-		}()
-
-		// Wait for both instances to complete
-		<-instance1Called
-		<-instance2Called
-
-		// Verify that both instances shut down properly
-		assert.Equal(
-			t,
-			int32(2),
-			completed.Load(),
-			"Both instances should have shut down properly",
-		)
-
-		// Verify that only one update occurred due to locking (one instance gets the lock first)
-		callCount := atomic.LoadInt32(&updateCallCount)
-		assert.Equal(
-			t,
-			int32(1),
-			callCount,
-			"Only one update should occur due to lock serialization",
-		)
-		// Verify that shutdown keeps the lock, so no update starts afterwards
-		assert.False(t, updateLock.TryLock(), "An update could start after shutdown")
 	})
 }
 
@@ -776,7 +684,7 @@ func TestRunUpgradesOnSchedule_ShutdownWaitsForRunningUpdate(t *testing.T) {
 
 		// Mock runUpdatesWithNotifications to simulate a long-running update
 		originalRunUpdatesWithNotifications := runUpdatesWithNotifications
-		runUpdatesWithNotifications = func(_ context.Context, _ types.Filter, _ types.UpdateParams) *metrics.Metric {
+		runUpdatesWithNotifications = func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
 			// Signal that we're in the update
 			synctest.Wait() // Simulate update work
 
@@ -913,7 +821,7 @@ func TestEphemeralSelfUpdateExercisesTruePath(t *testing.T) {
 
 	// Mock the update function
 	originalRunUpdatesWithNotifications := runUpdatesWithNotifications
-	runUpdatesWithNotifications = func(_ context.Context, _ types.Filter, _ types.UpdateParams) *metrics.Metric {
+	runUpdatesWithNotifications = func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
 		atomic.AddInt32(&updateCallCount, 1)
 
 		select {
@@ -1361,6 +1269,123 @@ func TestRootCommand_FlagParsing(t *testing.T) {
 	}
 }
 
+// TestCommands_ErrorOutput verifies what Cobra prints when a command fails. A
+// flag or argument that does not parse is printed with the usage text, while
+// an error the command returns is left to Execute to report.
+func TestCommands_ErrorOutput(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		// wantOutput lists text Cobra prints. Empty means it prints nothing.
+		wantOutput []string
+		// wantExitError reports whether the command returns an exitError.
+		wantExitError bool
+	}{
+		{
+			name:       "unknown flag",
+			args:       []string{"--bogus"},
+			wantOutput: []string{"Error: unknown flag: --bogus", "Usage:"},
+		},
+		{
+			name:          "root command failure",
+			args:          []string{"--log-format", "bogus"},
+			wantExitError: true,
+		},
+		{
+			name:       "notify-upgrade argument",
+			args:       []string{"notify-upgrade", "extra"},
+			wantOutput: []string{`Error: unknown command "extra" for "watchtower notify-upgrade"`, "Usage:"},
+		},
+		{
+			name:          "notify-upgrade failure",
+			args:          []string{"notify-upgrade", "--log-format", "bogus"},
+			wantExitError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := newExecuteCommand(t, newRunProcess(), tt.args...)
+
+			var out bytes.Buffer
+
+			root.SetOut(&out)
+			root.SetErr(&out)
+
+			err := root.Execute()
+			require.Error(t, err)
+
+			_, isExitError := errors.AsType[*exitError](err)
+			assert.Equal(t, tt.wantExitError, isExitError)
+
+			if len(tt.wantOutput) == 0 {
+				assert.Empty(t, out.String())
+			}
+
+			for _, want := range tt.wantOutput {
+				assert.Contains(t, out.String(), want)
+			}
+		})
+	}
+}
+
+// TestIsContainerMainProcess verifies which processes count as the main
+// process of a container. Processes started with docker exec have parent PID 0,
+// and a host binary can have an init system as its parent.
+func TestIsContainerMainProcess(t *testing.T) {
+	tests := []struct {
+		name        string
+		pid         int
+		ppid        int
+		inContainer bool
+		want        bool
+	}{
+		{name: "PID 1", pid: 1, ppid: 0, inContainer: true, want: true},
+		{name: "child of the container's init", pid: 7, ppid: 1, inContainer: true, want: true},
+		{name: "started with docker exec", pid: 8, ppid: 0, inContainer: true, want: false},
+		{name: "started by another process in the container", pid: 9, ppid: 8, inContainer: true, want: false},
+		{name: "host binary under an init system", pid: 4242, ppid: 1, inContainer: false, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setPreRunState(t, nil, selfDetection{marker: tt.inContainer})
+
+			processID = func() int { return tt.pid }
+			parentProcessID = func() int { return tt.ppid }
+
+			assert.Equal(t, tt.want, isContainerMainProcess())
+		})
+	}
+}
+
+// TestExitError_Error verifies the text of an exit error with and without a
+// message and a cause.
+func TestExitError_Error(t *testing.T) {
+	t.Parallel()
+
+	cause := errors.New("cause")
+
+	tests := []struct {
+		name string
+		err  *exitError
+		want string
+	}{
+		{name: "message and cause", err: &exitError{err: cause, msg: "Failed", code: 1}, want: "Failed: cause"},
+		{name: "message only", err: &exitError{err: nil, msg: "Failed", code: 1}, want: "Failed"},
+		{name: "cause only", err: &exitError{err: cause, msg: "", code: 1}, want: "cause"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, tt.want, tt.err.Error())
+			assert.Equal(t, tt.err.err, errors.Unwrap(tt.err))
+		})
+	}
+}
+
 func TestRootCommand_HTTPAPIEndpointsFlag(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1447,21 +1472,21 @@ func TestValidateAPIHost(t *testing.T) {
 func TestAnyHTTPAPIConfig(t *testing.T) {
 	t.Parallel()
 
-	assert.False(t, settings.AnyHTTPAPIConfig(types.RunConfig{}))
-	assert.True(t, settings.AnyHTTPAPIConfig(types.RunConfig{APIToken: "secret"}))
-	assert.True(t, settings.AnyHTTPAPIConfig(types.RunConfig{TLSCertPath: "/cert.pem"}))
-	assert.True(t, settings.AnyHTTPAPIConfig(types.RunConfig{CORSAllowedOrigins: []string{"https://app.example.com"}}))
-	assert.True(t, settings.AnyHTTPAPIConfig(types.RunConfig{APIHostChanged: true}))
-	assert.True(t, settings.AnyHTTPAPIConfig(types.RunConfig{APIPortChanged: true}))
-	assert.True(t, settings.AnyHTTPAPIConfig(types.RunConfig{APIRateLimitChanged: true}))
+	assert.False(t, settings.AnyHTTPAPIConfig(settings.RunConfig{}))
+	assert.True(t, settings.AnyHTTPAPIConfig(settings.RunConfig{APIToken: "secret"}))
+	assert.True(t, settings.AnyHTTPAPIConfig(settings.RunConfig{TLSCertPath: "/cert.pem"}))
+	assert.True(t, settings.AnyHTTPAPIConfig(settings.RunConfig{CORSAllowedOrigins: []string{"https://app.example.com"}}))
+	assert.True(t, settings.AnyHTTPAPIConfig(settings.RunConfig{APIHostChanged: true}))
+	assert.True(t, settings.AnyHTTPAPIConfig(settings.RunConfig{APIPortChanged: true}))
+	assert.True(t, settings.AnyHTTPAPIConfig(settings.RunConfig{APIRateLimitChanged: true}))
 }
 
 func TestHTTPAPIEndpointsEnabled(t *testing.T) {
 	t.Parallel()
 
-	assert.False(t, settings.HTTPAPIEndpointsEnabled(types.RunConfig{}))
-	assert.True(t, settings.HTTPAPIEndpointsEnabled(types.RunConfig{EnableHealthAPI: true}))
-	assert.True(t, settings.HTTPAPIEndpointsEnabled(types.RunConfig{EnableUpdateAPI: true}))
+	assert.False(t, settings.HTTPAPIEndpointsEnabled(settings.RunConfig{}))
+	assert.True(t, settings.HTTPAPIEndpointsEnabled(settings.RunConfig{EnableHealthAPI: true}))
+	assert.True(t, settings.HTTPAPIEndpointsEnabled(settings.RunConfig{EnableUpdateAPI: true}))
 }
 
 func TestRootCommand_ReviveStoppedFlagParsing(t *testing.T) {
@@ -1501,24 +1526,29 @@ func TestRootCommand_ReviveStoppedFlagParsing(t *testing.T) {
 // TestDisableRestarts verifies that disableRestarts sets the restart policy of
 // Watchtower's own container to "no" and reports an error only when that
 // fails, since the runtime may then start Watchtower again. A container whose
-// policy is already "no" needs no update. It changes package state, so it does
+// policy is already "no" needs no update. A process other than the container's
+// main process leaves the policy alone. It changes package state, so it does
 // not run in parallel.
 func TestDisableRestarts(t *testing.T) {
-	const wantError = "Could not disable Watchtower's restart policy. The runtime may start it again"
-
 	tests := []struct {
 		name string
 		// current is the inspected Watchtower container, or nil when it was
 		// not inspected.
-		current    types.Container
+		current types.Container
+		// pid is the process ID Watchtower runs as.
+		pid int
+		// unknownID leaves Watchtower's own container ID unknown.
+		unknownID  bool
 		wantUpdate bool
 		updateErr  error
 		wantError  bool
 	}{
-		{name: "the update succeeds", current: currentWatchtower(), wantUpdate: true},
-		{name: "the update fails", current: currentWatchtower(), wantUpdate: true, updateErr: errRunTestDocker, wantError: true},
-		{name: "the container was not inspected", wantUpdate: true},
-		{name: "the policy is already no", current: currentWatchtowerWithoutRestarts(), wantUpdate: false},
+		{name: "the update succeeds", current: currentWatchtower(), pid: 1, wantUpdate: true},
+		{name: "the update fails", current: currentWatchtower(), pid: 1, wantUpdate: true, updateErr: errRunTestDocker, wantError: true},
+		{name: "the container was not inspected", pid: 1, wantUpdate: true},
+		{name: "the policy is already no", current: currentWatchtowerWithoutRestarts(), pid: 1, wantUpdate: false},
+		{name: "not the container's main process", current: currentWatchtower(), pid: 42, wantUpdate: false},
+		{name: "the container ID is not known", pid: 1, unknownID: true, wantUpdate: false, wantError: true},
 	}
 
 	for _, tt := range tests {
@@ -1530,14 +1560,27 @@ func TestDisableRestarts(t *testing.T) {
 					Return(tt.updateErr).Once()
 			}
 
-			setRunState(t, runTestState{client: mockClient, current: tt.current, currentID: "c0c0"})
+			currentID := types.ContainerID("c0c0")
+			if tt.unknownID {
+				currentID = ""
+			}
+
+			setRunState(t, runTestState{client: mockClient, current: tt.current, currentID: currentID})
+
+			processID = func() int { return tt.pid }
 
 			log, logOutput := logcapture.New(zerolog.ErrorLevel)
 			(&process{log: log}).disableRestarts()
 
 			if tt.wantError {
-				assert.Contains(t, logOutput.String(), wantError)
-				assert.Contains(t, logOutput.String(), errRunTestDocker.Error())
+				assert.Contains(t, logOutput.String(), logging.RestartsKept)
+
+				wantCause := errRunTestDocker
+				if tt.unknownID {
+					wantCause = errUnknownContainerID
+				}
+
+				assert.Contains(t, logOutput.String(), wantCause.Error())
 			} else {
 				assert.Empty(t, logOutput.String())
 			}

@@ -8,20 +8,13 @@ import (
 	"github.com/rs/zerolog"
 
 	containerClient "github.com/nicholas-fedor/watchtower/internal/container/client"
+	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
 	"github.com/nicholas-fedor/watchtower/internal/observability/metrics"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
+	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 )
 
-const (
-	// msgImageDiskSpaceExceeded is logged and sampled when image usage reaches the maximum.
-	msgImageDiskSpaceExceeded = "Docker image usage exceeds configured maximum"
-
-	// msgImageDiskSpaceWarn is logged and sampled when image usage reaches the warning threshold.
-	msgImageDiskSpaceWarn = "Docker image usage exceeds configured warning threshold"
-
-	// msgImageDiskSpaceOK is logged when image usage is below all configured thresholds.
-	msgImageDiskSpaceOK = "Docker image usage within configured budget"
-)
+// msgImageDiskSpaceOK is logged when image usage is below all configured thresholds.
+const msgImageDiskSpaceOK = "Docker image usage within configured budget"
 
 // Errors for Docker image-usage budget checks.
 var (
@@ -36,7 +29,9 @@ var (
 // When both thresholds are unset the check is skipped. Otherwise it queries
 // image usage once, updates Prometheus gauges, warns when usage reaches the
 // warning threshold, and returns errImageDiskSpaceExceeded when usage reaches
-// the maximum. A daemon query failure is fail-closed.
+// the maximum. A daemon query failure is fail-closed. Both failures are logged
+// at error here, so the session's own failure line for the returned error is
+// kept out of notifications.
 //
 // Parameters:
 //   - log: Session logger.
@@ -50,7 +45,7 @@ func checkImageDiskSpace(
 	log *zerolog.Logger,
 	ctx context.Context,
 	client containerClient.Client,
-	config types.UpdateParams,
+	config updateParams.Params,
 ) error {
 	if config.DiskSpaceMax == 0 && config.DiskSpaceWarn == 0 {
 		return nil
@@ -58,9 +53,9 @@ func checkImageDiskSpace(
 
 	usage, err := client.GetImageDiskUsage(ctx)
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to query Docker image disk usage")
+		log.Error().Err(err).Msg(logging.ImageDiskUsageQueryFailed)
 
-		return fmt.Errorf("%w: %w", errImageDiskUsageFailed, err)
+		return reportedError{err: fmt.Errorf("%w: %w", errImageDiskUsageFailed, err)}
 	}
 
 	metrics.RecordImageDiskUsage(
@@ -80,18 +75,18 @@ func checkImageDiskSpace(
 	clog := &clogVal
 
 	if config.DiskSpaceMax > 0 && usage.TotalSize >= config.DiskSpaceMax {
-		clog.Error().Msg(msgImageDiskSpaceExceeded)
+		clog.Error().Msg(logging.ImageUsageExceedsMaximum)
 
-		return fmt.Errorf(
+		return reportedError{err: fmt.Errorf(
 			"%w: usage %d bytes, max %d bytes",
 			errImageDiskSpaceExceeded,
 			usage.TotalSize,
 			config.DiskSpaceMax,
-		)
+		)}
 	}
 
 	if config.DiskSpaceWarn > 0 && usage.TotalSize >= config.DiskSpaceWarn {
-		clog.Warn().Msg(msgImageDiskSpaceWarn)
+		clog.Warn().Msg(logging.ImageUsageExceedsWarning)
 
 		return nil
 	}

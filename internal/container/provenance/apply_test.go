@@ -7,9 +7,10 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/nicholas-fedor/watchtower/internal/container/labels"
+	"github.com/nicholas-fedor/watchtower/internal/git/semver"
+	gitConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/git"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/containerfixture"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/modelfixture"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // TestGitWrappers verifies the container's Git helpers: resolving the Git
@@ -24,7 +25,7 @@ func TestGitWrappers(t *testing.T) {
 		t.Run("returns false for a nil container", func(t *testing.T) {
 			t.Parallel()
 
-			assoc, ok := ResolveAssociation(nil, types.UpdateParams{})
+			assoc, ok := ResolveAssociation(nil, gitConfig.Defaults{})
 			assert.False(t, ok)
 			assert.Equal(t, Association{}, assoc)
 		})
@@ -40,8 +41,8 @@ func TestGitWrappers(t *testing.T) {
 				}),
 			)
 
-			assoc, ok := ResolveAssociation(c, types.UpdateParams{
-				GitImages: map[string]types.GitImage{
+			assoc, ok := ResolveAssociation(c, gitConfig.Defaults{
+				Images: map[string]gitConfig.Image{
 					"myapp:latest": {Repo: "https://github.com/org/from-map.git", Ref: "mapped"},
 				},
 			})
@@ -55,8 +56,8 @@ func TestGitWrappers(t *testing.T) {
 
 			c := modelfixture.Container(containerfixture.WithImageName("myapp:latest"))
 
-			assoc, ok := ResolveAssociation(c, types.UpdateParams{
-				GitImages: map[string]types.GitImage{
+			assoc, ok := ResolveAssociation(c, gitConfig.Defaults{
+				Images: map[string]gitConfig.Image{
 					"myapp:latest": {Repo: "https://github.com/org/mapped.git", Ref: "v1"},
 				},
 			})
@@ -69,7 +70,7 @@ func TestGitWrappers(t *testing.T) {
 			t.Parallel()
 
 			c := modelfixture.Container(containerfixture.WithImageName("nginx:latest"))
-			assoc, ok := ResolveAssociation(c, types.UpdateParams{})
+			assoc, ok := ResolveAssociation(c, gitConfig.Defaults{})
 			assert.False(t, ok)
 			assert.Equal(t, Association{}, assoc)
 		})
@@ -81,7 +82,7 @@ func TestGitWrappers(t *testing.T) {
 		t.Run("returns false for a nil container", func(t *testing.T) {
 			t.Parallel()
 
-			assert.False(t, ShouldMonitor(nil, nil, types.UpdateParams{EnableGitMonitoring: true}))
+			assert.False(t, ShouldMonitor(nil, nil, gitConfig.Defaults{Enable: true}))
 		})
 
 		t.Run("returns false for Watchtower even when associated", func(t *testing.T) {
@@ -92,7 +93,7 @@ func TestGitWrappers(t *testing.T) {
 				labels.GitRepo:    "https://github.com/nicholas-fedor/watchtower.git",
 			}))
 
-			assert.False(t, ShouldMonitor(nil, c, types.UpdateParams{EnableGitMonitoring: true}))
+			assert.False(t, ShouldMonitor(nil, c, gitConfig.Defaults{Enable: true}))
 		})
 
 		t.Run("returns true when associated and monitoring is enabled", func(t *testing.T) {
@@ -102,7 +103,7 @@ func TestGitWrappers(t *testing.T) {
 				labels.GitRepo: "https://github.com/org/app.git",
 			}))
 
-			assert.True(t, ShouldMonitor(nil, c, types.UpdateParams{EnableGitMonitoring: true}))
+			assert.True(t, ShouldMonitor(nil, c, gitConfig.Defaults{Enable: true}))
 		})
 
 		t.Run("returns false when the container turns watch off", func(t *testing.T) {
@@ -113,7 +114,7 @@ func TestGitWrappers(t *testing.T) {
 				labels.GitWatch: "false",
 			}))
 
-			assert.False(t, ShouldMonitor(nil, c, types.UpdateParams{EnableGitMonitoring: true}))
+			assert.False(t, ShouldMonitor(nil, c, gitConfig.Defaults{Enable: true}))
 		})
 
 		t.Run("returns false when watch is on but the container is not associated", func(t *testing.T) {
@@ -125,7 +126,7 @@ func TestGitWrappers(t *testing.T) {
 			)
 			nop := zerolog.Nop()
 
-			assert.False(t, ShouldMonitor(&nop, c, types.UpdateParams{}))
+			assert.False(t, ShouldMonitor(&nop, c, gitConfig.Defaults{}))
 		})
 	})
 
@@ -210,7 +211,7 @@ func TestGitWrappers(t *testing.T) {
 			ApplyGitAssociation(c, Association{
 				Repo:       "https://github.com/org/app.git",
 				Ref:        "main",
-				Policy:     types.GitPolicyPatch,
+				Policy:     semver.PolicyPatch,
 				Host:       "https://git.example.com:3000",
 				Dockerfile: "build/docker/Dockerfile",
 				Context:    ".",
@@ -219,7 +220,7 @@ func TestGitWrappers(t *testing.T) {
 			assert.Equal(t, map[string]string{
 				labels.GitRepo:         "https://github.com/org/app.git",
 				labels.GitRef:          "main",
-				labels.GitSemverPolicy: types.GitPolicyPatch,
+				labels.GitSemverPolicy: semver.PolicyPatch,
 				labels.GitHost:         "https://git.example.com:3000",
 				labels.GitDockerfile:   "build/docker/Dockerfile",
 				labels.GitContext:      ".",
@@ -294,7 +295,7 @@ func TestGitWrappers(t *testing.T) {
 			ApplyGitAssociation(c, Association{
 				Repo:                  "https://github.com/org/app.git",
 				Ref:                   "main",
-				Policy:                types.GitPolicyNone,
+				Policy:                semver.PolicyNone,
 				Dockerfile:            "Dockerfile",
 				Context:               ".",
 				RefFromDefault:        true,

@@ -9,10 +9,12 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/nicholas-fedor/watchtower/internal/container"
+	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
 	"github.com/nicholas-fedor/watchtower/internal/registry"
 	"github.com/nicholas-fedor/watchtower/internal/registry/digest"
 	"github.com/nicholas-fedor/watchtower/internal/registry/ratelimit"
 	registryConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/registry"
+	updateConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/update"
 	"github.com/nicholas-fedor/watchtower/internal/settings/units"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
@@ -26,11 +28,11 @@ var ErrImageCooldown = errors.New("image is within cooldown period")
 // while still extracting the fields needed for progress reports and
 // rich notifications.
 type CooldownError struct {
+	EligibleAt time.Time
+	err        error
 	Age        string
 	Delay      string
 	Remaining  string
-	EligibleAt time.Time
-	err        error
 }
 
 func (e *CooldownError) Error() string {
@@ -57,7 +59,7 @@ func (e *CooldownError) Is(target error) bool {
 // Parameters:
 //   - ctx: Context for cancellation and timeouts.
 //   - sourceContainer: Container whose image age to evaluate.
-//   - params: Update parameters (global cooldown + LabelPrecedence).
+//   - policy: Update policy with the global cooldown, no-pull and monitor-only settings.
 //
 // Returns:
 //   - bool: true if safe to pull/update, false if deferred.
@@ -65,18 +67,14 @@ func (e *CooldownError) Is(target error) bool {
 func (c Client) isOutsideCooldown(
 	ctx context.Context,
 	sourceContainer types.Container,
-	params types.UpdateParams,
+	policy updateConfig.Policy,
 ) (bool, error) {
-	delay, skip := shouldCheckCooldown(sourceContainer, params)
+	delay, skip := shouldCheckCooldown(sourceContainer, policy)
 	if skip {
 		return true, nil
 	}
 
-	clogVal := c.logger().With().
-		Str("container", sourceContainer.Name()).
-		Str("image", sourceContainer.ImageName()).
-		Logger()
-	clog := &clogVal
+	clog := cooldownLogger(c.logger(), sourceContainer)
 
 	creationTime, cdErr := fetchImageCreationTime(
 		ctx,
@@ -98,14 +96,14 @@ func (c Client) isOutsideCooldown(
 //
 // Parameters:
 //   - sourceContainer: Container to evaluate.
-//   - params: Update parameters (global cooldown + LabelPrecedence).
+//   - policy: Update policy with the global cooldown, no-pull and monitor-only settings.
 //
 // Returns:
 //   - time.Duration: The effective cooldown delay (0 if skipped).
 //   - bool: True if the cooldown check should be skipped entirely.
-func shouldCheckCooldown(sourceContainer types.Container, params types.UpdateParams) (time.Duration, bool) {
-	delay := sourceContainer.CooldownDelay(params)
-	if delay <= 0 || sourceContainer.IsNoPull(params) || sourceContainer.IsMonitorOnly(params) {
+func shouldCheckCooldown(sourceContainer types.Container, policy updateConfig.Policy) (time.Duration, bool) {
+	delay := sourceContainer.CooldownDelay(policy)
+	if delay <= 0 || sourceContainer.IsNoPull(policy) || sourceContainer.IsMonitorOnly(policy) {
 		return 0, true
 	}
 
@@ -161,7 +159,7 @@ func fetchImageCreationTime(
 	if err != nil {
 		clog.Info().
 			Err(err).
-			Msg("Image creation time unavailable - update check unavailable")
+			Msg(logging.CooldownUnavailable)
 
 		return time.Time{}, &CooldownError{
 			Delay: units.FormatDuration(delay),
@@ -210,7 +208,7 @@ func evalImageAge(creationTime time.Time, delay time.Duration, clog *zerolog.Log
 			Str("cooldown", cooldownStr).
 			Str("eligible_in", remainingStr).
 			Str("eligible_at", eligibleAt.Format(time.RFC3339)).
-			Msg("Image is within cooldown period - not eligible for update")
+			Msg(logging.WithinCooldown)
 
 		return false, buildCooldownError(imageAge, delay, eligibleAt)
 	}
@@ -258,12 +256,12 @@ func logClockSkew(imageAge, delay time.Duration, clog *zerolog.Logger) {
 //
 // Parameters:
 //   - c: Container whose local image age is evaluated.
-//   - params: Update parameters (global cooldown and label override).
+//   - policy: Update policy (global cooldown and label override).
 //
 // Returns:
 //   - error: Non-nil CooldownError when the image is inside the cooldown window.
-func CheckLocalImageCooldown(c types.Container, params types.UpdateParams) error {
-	delay, skip := shouldCheckCooldown(c, params)
+func CheckLocalImageCooldown(c types.Container, policy updateConfig.Policy) error {
+	delay, skip := shouldCheckCooldown(c, policy)
 	if skip {
 		return nil
 	}
@@ -273,12 +271,12 @@ func CheckLocalImageCooldown(c types.Container, params types.UpdateParams) error
 		return nil
 	}
 
-	clog := nopLog()
+	base := nopLog()
 	if concrete, isConcrete := c.(*container.Container); isConcrete {
-		clog = concrete.Logger()
+		base = concrete.Logger()
 	}
 
-	_, err := evalImageAge(created, delay, clog)
+	_, err := evalImageAge(created, delay, cooldownLogger(base, c))
 
 	return err
 }
@@ -304,11 +302,29 @@ func localImageCreated(c types.Container) (time.Time, bool) {
 	return created, true
 }
 
+// cooldownLogger returns base with the container's name and image added, so
+// every cooldown line names the container it is about.
+//
+// Parameters:
+//   - base: The logger to extend.
+//   - c: The container whose image the cooldown check evaluates.
+//
+// Returns:
+//   - *zerolog.Logger: The logger with the container and image fields.
+func cooldownLogger(base *zerolog.Logger, c types.Container) *zerolog.Logger {
+	log := base.With().
+		Str("container", c.Name()).
+		Str("image", c.ImageName()).
+		Logger()
+
+	return &log
+}
+
 // logCooldownExceeded logs an info message when the image age exceeds the
 // cooldown window and the pull can proceed.
 func logCooldownExceeded(imageAge, delay time.Duration, clog *zerolog.Logger) {
 	clog.Info().
 		Str("image_age", units.FormatDuration(imageAge)).
 		Str("cooldown", units.FormatDuration(delay)).
-		Msg("Image age exceeds cooldown - eligible for update")
+		Msg(logging.CooldownElapsed)
 }

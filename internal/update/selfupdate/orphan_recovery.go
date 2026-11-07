@@ -5,64 +5,22 @@ import (
 
 	"github.com/rs/zerolog"
 
+	dockerContainer "github.com/moby/moby/api/types/container"
+
 	"github.com/nicholas-fedor/watchtower/internal/container"
 	containerClient "github.com/nicholas-fedor/watchtower/internal/container/client"
 	"github.com/nicholas-fedor/watchtower/internal/container/filters"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
-// isRecoverableOrphan determines whether a container is a recoverable orphaned
-// Watchtower instance. It excludes the current container, old-container names,
-// non-Watchtower containers, containers that are not in the created state, and
-// containers from a different scope.
-//
-// Parameters:
-//   - c: Candidate container to evaluate.
-//   - currentContainer: The current running container to exclude.
-//   - currentScope: Normalized scope of the current container ("none" when unset).
-//
-// Returns:
-//   - bool: True if the candidate is a recoverable orphan, false otherwise.
-func isRecoverableOrphan(
-	c types.Container,
-	currentContainer types.Container,
-	currentScope string,
-) bool {
-	if !c.IsWatchtower() {
-		return false
-	}
-
-	if c.ID() == currentContainer.ID() {
-		return false
-	}
-
-	if container.IsOldContainer(c.Name()) {
-		return false
-	}
-
-	if !c.IsCreated() {
-		return false
-	}
-
-	candidateScope, candidateHasScope := c.Scope()
-	if !candidateHasScope || candidateScope == "" {
-		candidateScope = "none"
-	}
-
-	if candidateScope != currentScope {
-		return false
-	}
-
-	return true
-}
-
 // TryRecoverOrphanedContainer attempts to start an orphaned Watchtower container
 // that is stuck in the Docker "created" state. This can happen when a self-update
 // creates a replacement container but fails to start it, leaving the old container
 // running and the new container never started.
 //
-// It lists all containers, filters for Watchtower containers in the created state
-// that are not the current container, and attempts to start the first match.
+// It lists all containers and starts the first one that
+// [container.IsOrphanedReplacement] reports as an orphaned replacement of the
+// current container.
 //
 // Parameters:
 //   - log: Process logger. Required and must be non-nil. A nil logger panics on the first log call.
@@ -92,13 +50,8 @@ func TryRecoverOrphanedContainer(
 		return nil, false
 	}
 
-	currentScope, currentHasScope := currentContainer.Scope()
-	if !currentHasScope || currentScope == "" {
-		currentScope = "none"
-	}
-
 	for _, c := range allContainers {
-		if !isRecoverableOrphan(c, currentContainer, currentScope) {
+		if !container.IsOrphanedReplacement(c, currentContainer) {
 			continue
 		}
 
@@ -127,4 +80,35 @@ func TryRecoverOrphanedContainer(
 	}
 
 	return nil, false
+}
+
+// DisableOldRestarts sets the restart policy of an old Watchtower container to
+// "no", so the runtime does not start it again.
+//
+// A failure is logged at debug only. An old Watchtower container that starts
+// again detects that it is old and exits, and the instance that replaced it
+// removes it.
+//
+// Parameters:
+//   - log: Logger for the failure.
+//   - ctx: Context for the restart policy update.
+//   - oldContainer: The old Watchtower container.
+//   - client: Container client for Docker operations.
+func DisableOldRestarts(
+	log *zerolog.Logger,
+	ctx context.Context,
+	oldContainer types.Container,
+	client containerClient.Client,
+) {
+	err := client.SetRestartPolicy(
+		ctx,
+		oldContainer.ID(),
+		dockerContainer.RestartPolicy{Name: dockerContainer.RestartPolicyDisabled},
+	)
+	if err != nil {
+		log.Debug().
+			Err(err).
+			Str("container", oldContainer.Name()).
+			Msg("Failed to disable the restart policy of the old Watchtower container")
+	}
 }

@@ -6,6 +6,9 @@ import (
 	"github.com/nicholas-fedor/watchtower/internal/container"
 	"github.com/nicholas-fedor/watchtower/internal/container/oci"
 	"github.com/nicholas-fedor/watchtower/internal/container/redact"
+	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
+	gitConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/git"
+	updateConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/update"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
@@ -34,7 +37,7 @@ type ReportMeta struct {
 //
 // Parameters:
 //   - c: Container to inspect.
-//   - params: Update parameters with image mappings and host classifications.
+//   - defaults: Git settings with image mappings and defaults.
 //   - vars: Optional new-version values for changelog placeholders.
 //   - latest: OCI annotations from a newly pulled image, or empty for none.
 //
@@ -42,7 +45,7 @@ type ReportMeta struct {
 //   - ReportMeta: Resolved metadata. Empty strings when unknown.
 func ResolveReportMeta(
 	c types.Container,
-	params types.UpdateParams,
+	defaults gitConfig.Defaults,
 	vars ChangelogVars,
 	latest oci.Annotations,
 ) ReportMeta {
@@ -52,13 +55,13 @@ func ResolveReportMeta(
 
 	cur := oci.Read(c)
 	anns := preferAnnotations(latest, cur)
-	mapping := types.GitImage{}
+	mapping := gitConfig.Image{}
 
-	if params.GitImages != nil {
-		mapping = params.GitImages[c.ImageName()]
+	if defaults.Images != nil {
+		mapping = defaults.Images[c.ImageName()]
 	}
 
-	assoc, associated := ResolveAssociation(c, params)
+	assoc, associated := ResolveAssociation(c, defaults)
 
 	// Report repo may fall back to OCI source. That does not enable the watcher.
 	repo := redact.GitURL(assoc.Repo)
@@ -111,7 +114,7 @@ func ResolveReportMeta(
 // Parameters:
 //   - log: Process logger.
 //   - c: Container the entry describes.
-//   - params: Update parameters carrying the changelog enable gate.
+//   - policy: Update policy carrying the changelog enable gate.
 //   - meta: Resolved report metadata.
 //
 // Returns:
@@ -119,7 +122,7 @@ func ResolveReportMeta(
 func LogChangelog(
 	log *zerolog.Logger,
 	c types.Container,
-	params types.UpdateParams,
+	policy updateConfig.Policy,
 	meta ReportMeta,
 ) {
 	if c == nil || meta.Changelog == "" {
@@ -127,14 +130,14 @@ func LogChangelog(
 	}
 
 	concrete, ok := c.(*container.Container)
-	if !ok || !concrete.IsChangelogEnabled(params) {
+	if !ok || !concrete.IsChangelogEnabled(policy) {
 		return
 	}
 
 	log.Info().
 		Str("container", c.Name()).
 		Str("changelog", meta.Changelog).
-		Msg("Changelog")
+		Msg(logging.Changelog)
 }
 
 // preferAnnotations returns the latest image annotations, falling back to the

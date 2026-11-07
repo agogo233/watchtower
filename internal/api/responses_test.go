@@ -33,7 +33,9 @@ import (
 	mockContainerClient "github.com/nicholas-fedor/watchtower/internal/container/client/mocks"
 	"github.com/nicholas-fedor/watchtower/internal/observability/events"
 	"github.com/nicholas-fedor/watchtower/internal/observability/metrics"
+	updateConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/update"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/golden"
+	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/internal/update/schedule"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
@@ -155,7 +157,7 @@ func newFixtureClient(t *testing.T) *mockContainerClient.MockClient {
 	client.EXPECT().ListContainers(mock.Anything, mock.Anything).Return(list, nil).Maybe()
 	client.EXPECT().ListContainers(mock.Anything).Return(list, nil).Maybe()
 	client.EXPECT().CheckContainerUpdate(mock.Anything, mock.Anything, mock.Anything).
-		RunAndReturn(func(_ context.Context, c types.Container, _ types.UpdateParams) (bool, types.ImageID, string, error) {
+		RunAndReturn(func(_ context.Context, c types.Container, _ updateConfig.Policy) (bool, types.ImageID, string, error) {
 			switch c.Name() {
 			case "web", "web-2":
 				return true, types.ImageID("sha256:" + fixtureID("7")), "sha256:" + fixtureID("8"), nil
@@ -218,11 +220,11 @@ func fixtureOptions(t *testing.T, client containerClient.Client, store *metrics.
 		FilterDesc:          "Checking all containers (except explicitly disabled with label)",
 		IncludeStopped:      true,
 		UpdateLock:          schedule.NewUpdateLock(),
-		BaseParams: types.UpdateParams{
+		BaseParams: updateParams.Params{
 			Cleanup:        true,
 			LifecycleHooks: true,
 		},
-		RunUpdatesWithNotifications: func(context.Context, types.Filter, types.UpdateParams) *metrics.Metric {
+		RunUpdatesWithNotifications: func(context.Context, types.Filter, updateParams.Params) *metrics.Metric {
 			return &metrics.Metric{Scanned: 5, Updated: 2, Failed: 1, Restarted: 0, Skipped: 1}
 		},
 		FilterByImage:    func(_ []string, filter types.Filter) types.Filter { return filter },
@@ -458,7 +460,7 @@ func TestHTTPAPIResponses(t *testing.T) {
 	// reached, by the update, the status, and the history.
 	failedStore := newFixtureMetrics(t)
 	failedOpts := fixtureOptions(t, newFixtureClient(t), failedStore)
-	failedOpts.RunUpdatesWithNotifications = func(context.Context, types.Filter, types.UpdateParams) *metrics.Metric {
+	failedOpts.RunUpdatesWithNotifications = func(context.Context, types.Filter, updateParams.Params) *metrics.Metric {
 		return &metrics.Metric{Scanned: 5, Updated: 1, Failed: 0, Restarted: 0, Skipped: 0, ScanFailed: true}
 	}
 
@@ -506,7 +508,7 @@ func TestHTTPAPIErrorResponses(t *testing.T) {
 	recorder.record(t, responseRequest{method: http.MethodPost, target: "/v1/update", token: fixtureAPIToken})
 
 	failingOpts := fixtureOptions(t, newFailingClient(t), newFixtureMetrics(t))
-	failingOpts.RunUpdatesWithNotifications = func(context.Context, types.Filter, types.UpdateParams) *metrics.Metric {
+	failingOpts.RunUpdatesWithNotifications = func(context.Context, types.Filter, updateParams.Params) *metrics.Metric {
 		return nil
 	}
 
@@ -637,12 +639,12 @@ func TestHTTPAPIEventStream(t *testing.T) {
 	checkEvents := readSSEEvents(t, stream, 2)
 
 	session := []events.Event{
-		{Type: "scan_started", Data: events.NewScanStartedData(types.UpdateParams{
+		{Type: "scan_started", Data: updateParams.Params{
 			Cleanup:             true,
 			LifecycleHooks:      true,
 			RunOnce:             true,
 			UseComposeDependsOn: true,
-		})},
+		}.ScanStartedData()},
 		{Type: "scan_failed", Data: events.ScanFailedData{Error: "failed to list containers"}},
 		{Type: "image_cleanup", Data: events.ImageCleanupData{Images: []events.ImageCleanupEntry{{
 			ImageID:       "sha256:" + fixtureID("a"),

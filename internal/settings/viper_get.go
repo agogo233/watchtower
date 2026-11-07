@@ -14,6 +14,37 @@ import (
 	"github.com/nicholas-fedor/watchtower/internal/settings/flags/utils"
 )
 
+// checkRanges returns an error for the first integer or duration setting whose
+// value is outside the range its spec allows.
+//
+// Parameters:
+//   - vCfg: Bound Viper instance.
+//   - flagSet: Parsed flag set.
+//   - specs: Specs of every setting.
+//
+// Returns:
+//   - error: The spec's range error, naming the setting and its value.
+func checkRanges(vCfg *viper.Viper, flagSet *pflag.FlagSet, specs []spec.FlagSpec) error {
+	for _, flagSpec := range specs {
+		var err error
+
+		switch flagSpec.Kind {
+		case spec.KindInt:
+			err = flagSpec.CheckInt(vCfg.GetInt(flagSpec.Name))
+		case spec.KindDuration:
+			err = flagSpec.CheckDuration(durationValue(vCfg, flagSet, flagSpec.Name))
+		case spec.KindBool, spec.KindString, spec.KindStringSlice, spec.KindStringArray:
+		default:
+		}
+
+		if err != nil {
+			return err //nolint:wrapcheck // The spec's error already names the setting and its value.
+		}
+	}
+
+	return nil
+}
+
 // durationValue reads a duration from Viper with bare-second env support.
 //
 // When the flag was not changed on the CLI and the bound env value is a pure
@@ -22,17 +53,11 @@ import (
 // Parameters:
 //   - vCfg: Bound Viper instance.
 //   - flagSet: Parsed flag set (for Changed checks).
-//   - name: Flag name.
-//   - envKeys: Environment keys bound to this flag.
+//   - name: Flag name. Its spec lists the environment keys to read.
 //
 // Returns:
 //   - time.Duration: Resolved duration.
-func durationValue(
-	vCfg *viper.Viper,
-	flagSet *pflag.FlagSet,
-	name string,
-	envKeys []string,
-) time.Duration {
+func durationValue(vCfg *viper.Viper, flagSet *pflag.FlagSet, name string) time.Duration {
 	if flagSet.Changed(name) {
 		d, err := flagSet.GetDuration(name)
 		if err == nil {
@@ -42,7 +67,9 @@ func durationValue(
 
 	envSeen := false
 
-	for _, envKey := range envKeys {
+	flagSpec, _ := specNamed(name)
+
+	for _, envKey := range flagSpec.EnvKeys {
 		raw := strings.TrimSpace(os.Getenv(envKey))
 		if raw == "" {
 			continue
@@ -56,8 +83,9 @@ func durationValue(
 				return d
 			}
 
-			// Unparseable bare number (for example out-of-range float): same as
-			// other invalid env values — fall back to the pflag default below.
+			// A bare number that does not parse, such as one beyond the float
+			// range, ends the search. Like any other invalid environment value,
+			// it falls back to the flag default below.
 			break
 		}
 

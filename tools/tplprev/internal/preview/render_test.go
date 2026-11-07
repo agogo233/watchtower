@@ -108,6 +108,21 @@ func TestRenderJSONIncludesReport(t *testing.T) {
 	assert.Equal(t, "Host", decoded["host"])
 }
 
+// TestRenderReportFocus verifies that a template written for split
+// notifications can read the report's focus in the preview. The preview
+// renders a whole session's report, which has no focus.
+func TestRenderReportFocus(t *testing.T) {
+	t.Parallel()
+
+	result, err := Render(
+		`{{ with .Report.Focus }}{{ .Name }}{{ else }}whole session{{ end }}`,
+		[]State{UpdatedState},
+		nil,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "whole session", result)
+}
+
 func TestRenderLegacyModeOmitsReportRoot(t *testing.T) {
 	t.Parallel()
 

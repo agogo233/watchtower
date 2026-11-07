@@ -16,11 +16,13 @@ import (
 	dockerClient "github.com/moby/moby/client"
 
 	"github.com/nicholas-fedor/watchtower/internal/container/oci"
+	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
 	"github.com/nicholas-fedor/watchtower/internal/registry"
 	"github.com/nicholas-fedor/watchtower/internal/registry/auth"
 	"github.com/nicholas-fedor/watchtower/internal/registry/digest"
 	"github.com/nicholas-fedor/watchtower/internal/registry/ratelimit"
 	registryConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/registry"
+	updateConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/update"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
@@ -57,10 +59,12 @@ var (
 	errPullImageFailed = errors.New("failed to pull image")
 	// errFailedToLoadPullOptions indicates pull options could not be resolved.
 	errFailedToLoadPullOptions = errors.New("failed to load pull options")
-	// errPullImageUnauthorized indicates an authentication failure during image pull.
-	errPullImageUnauthorized = errors.New("failed to pull image: authentication required")
-	// errPullImageNotFound indicates the image was not found in the registry.
-	errPullImageNotFound = errors.New("failed to pull image: image not found")
+	// errPullImageUnauthorized indicates that a pull failed because the registry
+	// required authentication.
+	errPullImageUnauthorized = errors.New("authentication required")
+	// errPullImageNotFound indicates that a pull failed because the registry
+	// does not have the image.
+	errPullImageNotFound = errors.New("image not found")
 	// errReadPullResponseFailed indicates a failure to read the pull response stream.
 	errReadPullResponseFailed = errors.New("failed to read pull response")
 	// errRemoveImageFailed indicates a failure to remove an image from the Docker host.
@@ -127,10 +131,10 @@ type Client struct {
 	log *zerolog.Logger
 	// daemonInfo shares Docker Info and mirrors across check and pull paths.
 	daemonInfo *daemonInfoCache
-	// registrySettings holds the settings for registry requests.
-	registrySettings registryConfig.Registry
 	// rateLimiter paces pulls, digest checks, and image age requests per registry host.
 	rateLimiter *ratelimit.Limiter
+	// registrySettings holds the settings for registry requests.
+	registrySettings registryConfig.Registry
 }
 
 // NewClient creates a new Client instance.
@@ -169,7 +173,7 @@ func NewClient(
 // Parameters:
 //   - ctx: Context for operation control.
 //   - sourceContainer: Container to check.
-//   - params: Update parameters (e.g., NoPull flag, cooldown delay).
+//   - policy: Update policy for the no-pull and cooldown checks.
 //   - warnOnHeadFailed: Strategy for logging warnings on HEAD request failures.
 //
 // Returns:
@@ -180,7 +184,7 @@ func NewClient(
 func (c Client) IsContainerStale(
 	ctx context.Context,
 	sourceContainer types.Container,
-	params types.UpdateParams,
+	policy updateConfig.Policy,
 	warnOnHeadFailed WarningStrategy,
 ) (bool, types.ImageID, string, error) {
 	clogVal := c.logger().With().
@@ -190,11 +194,11 @@ func (c Client) IsContainerStale(
 	clog := &clogVal
 
 	// Skip pull if NoPull is enabled.
-	if sourceContainer.IsNoPull(params) {
+	if sourceContainer.IsNoPull(policy) {
 		return c.checkLocalImageStaleness(ctx, sourceContainer, clog)
 	}
 
-	err := c.PullImage(ctx, sourceContainer, warnOnHeadFailed, params)
+	err := c.PullImage(ctx, sourceContainer, warnOnHeadFailed, policy)
 	if err != nil {
 		if errors.Is(err, ErrImageCooldown) {
 			clog.Debug().
@@ -232,7 +236,7 @@ func (c Client) IsContainerStale(
 // Parameters:
 //   - ctx: Context for operation control.
 //   - sourceContainer: Container to check.
-//   - params: Update parameters (NoPull, LabelPrecedence).
+//   - policy: Update policy (NoPull, LabelPrecedence).
 //
 // Returns:
 //   - bool: True if an update is available, false otherwise.
@@ -242,7 +246,7 @@ func (c Client) IsContainerStale(
 func (c Client) CheckContainerUpdate(
 	ctx context.Context,
 	sourceContainer types.Container,
-	params types.UpdateParams,
+	policy updateConfig.Policy,
 ) (bool, types.ImageID, string, error) {
 	clogVal := c.logger().With().
 		Str("container", sourceContainer.Name()).
@@ -251,7 +255,7 @@ func (c Client) CheckContainerUpdate(
 	clog := &clogVal
 
 	// Respect no-pull: monitor local image cache only.
-	if sourceContainer.IsNoPull(params) {
+	if sourceContainer.IsNoPull(policy) {
 		return c.checkLocalImageStaleness(ctx, sourceContainer, clog)
 	}
 
@@ -308,7 +312,7 @@ func (c Client) CheckContainerUpdate(
 	clog.Info().
 		Str("new_id", types.ImageID(remoteDigest).ShortID()).
 		Str("latest_digest", remoteDigest).
-		Msg("Found new image")
+		Msg(logging.FoundNewImage)
 
 	return true, "", remoteDigest, nil
 }
@@ -373,7 +377,7 @@ func (c Client) HasNewImage(
 
 	clog.Info().
 		Str("new_id", newImageID.ShortID()).
-		Msg("Found new image")
+		Msg(logging.FoundNewImage)
 
 	return true,
 		newImageID,
@@ -449,7 +453,7 @@ func ExtractImageDigest(repoDigests []string, imageName string) string {
 //   - ctx: Context for operation control.
 //   - sourceContainer: Container whose image to pull.
 //   - warnOnHeadFailed: Strategy for logging warnings on HEAD request failures.
-//   - params: Update parameters (for per-container cooldown via label or global).
+//   - policy: Update policy (for per-container cooldown via label or global).
 //
 // Returns:
 //   - Non-nil error if pull fails or cooldown defers the pull.
@@ -458,7 +462,7 @@ func (c Client) PullImage(
 	ctx context.Context,
 	sourceContainer types.Container,
 	warnOnHeadFailed WarningStrategy,
-	params types.UpdateParams,
+	policy updateConfig.Policy,
 ) error {
 	clogVal := c.logger().With().
 		Str("container", sourceContainer.Name()).
@@ -502,7 +506,7 @@ func (c Client) PullImage(
 
 	// Perform cooldown check to prevent downloading images that are still
 	// inside the cooldown window.
-	_, cooldownErr := c.isOutsideCooldown(ctx, sourceContainer, params)
+	_, cooldownErr := c.isOutsideCooldown(ctx, sourceContainer, policy)
 	if cooldownErr != nil {
 		return cooldownErr
 	}
@@ -544,7 +548,7 @@ func (c Client) RemoveImageByID(ctx context.Context, imageID types.ImageID, imag
 
 		clog.Warn().
 			Err(err).
-			Msg("Failed to list containers for image usage check, skipping removal")
+			Msg(logging.ImageUsageCheckFailed)
 
 		return fmt.Errorf("cannot verify image usage: %w", err)
 	}
@@ -560,9 +564,11 @@ func (c Client) RemoveImageByID(ctx context.Context, imageID types.ImageID, imag
 		}
 	}
 
-	clog.Info().
-		Str("notify", "yes").
-		Msg("Removing image")
+	// Callers log a successful removal for notifications, where they can name
+	// the containers that used the image.
+	clog.Debug().
+		Str("notify", "no").
+		Msg(logging.RemovingImage)
 
 	// Perform image removal with force and pruning.
 	items, err := c.api.ImageRemove(
@@ -831,7 +837,7 @@ func (c Client) performImagePull(
 		// another quota token.
 		cooldownErr := c.rateLimiter.WaitCooldown(ctx, pullHost)
 		if cooldownErr != nil {
-			return fmt.Errorf("image pull cooldown wait: %w", cooldownErr)
+			return fmt.Errorf("rate-limit cooldown wait: %w", cooldownErr)
 		}
 
 		response, err := c.api.ImagePull(ctx, imageName, opts)
@@ -846,25 +852,27 @@ func (c Client) performImagePull(
 			// Differentiate error types for appropriate logging and handling.
 			// Auth failures and missing images return distinct sentinel errors
 			// so callers can programmatically distinguish error categories.
+			// These lines stay at debug because the update check that called
+			// the pull warns about its failure once.
 			switch {
 			case cerrdefs.IsUnauthorized(err):
-				clog.Warn().
+				clog.Debug().
 					Err(err).
 					Msg("Image pull failed: authentication required")
 
-				return fmt.Errorf("%w: %s: %w", errPullImageUnauthorized, imageName, err)
+				return fmt.Errorf("%w: %w", errPullImageUnauthorized, err)
 			case cerrdefs.IsNotFound(err):
 				clog.Debug().
 					Err(err).
 					Msg("Image pull failed: image not found in registry")
 
-				return fmt.Errorf("%w: %s: %w", errPullImageNotFound, imageName, err)
+				return fmt.Errorf("%w: %w", errPullImageNotFound, err)
 			default:
 				clog.Debug().
 					Err(err).
 					Msg("Failed to initiate image pull")
 
-				return fmt.Errorf("%w: %s: %w", errPullImageFailed, imageName, err)
+				return err //nolint:wrapcheck // Wrapped once with the image name after the retries.
 			}
 		}
 		defer response.Close()
@@ -885,7 +893,7 @@ func (c Client) performImagePull(
 				Err(waitErr).
 				Msg("Failed to read image pull response")
 
-			return fmt.Errorf("%w: %s: %w", errReadPullResponseFailed, imageName, waitErr)
+			return fmt.Errorf("%w: %w", errReadPullResponseFailed, waitErr)
 		}
 
 		clog.Debug().Msg("Image pull completed")
@@ -893,7 +901,8 @@ func (c Client) performImagePull(
 		return nil
 	})
 	if pullErr != nil {
-		return fmt.Errorf("image pull: %w", pullErr)
+		// Each attempt's error gives only the cause. The image is named here once.
+		return fmt.Errorf("%w: %s: %w", errPullImageFailed, imageName, pullErr)
 	}
 
 	return nil
@@ -930,14 +939,14 @@ func pullSlotFor(host string) chan struct{} {
 func acquirePullSlot(ctx context.Context, host string) error {
 	ctxErr := ctx.Err()
 	if ctxErr != nil {
-		return fmt.Errorf("image pull slot wait canceled: %w", ctxErr)
+		return fmt.Errorf("pull slot wait canceled: %w", ctxErr)
 	}
 
 	select {
 	case pullSlotFor(host) <- struct{}{}:
 		return nil
 	case <-ctx.Done():
-		return fmt.Errorf("image pull slot wait canceled: %w", ctx.Err())
+		return fmt.Errorf("pull slot wait canceled: %w", ctx.Err())
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/image"
+	"github.com/nicholas-fedor/watchtower/internal/settings/config/update"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 	mock "github.com/stretchr/testify/mock"
 )
@@ -96,16 +97,16 @@ func (_c *MockContainer_ContainerInfo_Call) RunAndReturn(run func() *container.I
 }
 
 // CooldownDelay provides a mock function for the type MockContainer
-func (_mock *MockContainer) CooldownDelay(params types.UpdateParams) time.Duration {
-	ret := _mock.Called(params)
+func (_mock *MockContainer) CooldownDelay(policy update.Policy) time.Duration {
+	ret := _mock.Called(policy)
 
 	if len(ret) == 0 {
 		panic("no return value specified for CooldownDelay")
 	}
 
 	var r0 time.Duration
-	if returnFunc, ok := ret.Get(0).(func(types.UpdateParams) time.Duration); ok {
-		r0 = returnFunc(params)
+	if returnFunc, ok := ret.Get(0).(func(update.Policy) time.Duration); ok {
+		r0 = returnFunc(policy)
 	} else {
 		r0 = ret.Get(0).(time.Duration)
 	}
@@ -118,16 +119,16 @@ type MockContainer_CooldownDelay_Call struct {
 }
 
 // CooldownDelay is a helper method to define mock.On call
-//   - params types.UpdateParams
-func (_e *MockContainer_Expecter) CooldownDelay(params any) *MockContainer_CooldownDelay_Call {
-	return &MockContainer_CooldownDelay_Call{Call: _e.mock.On("CooldownDelay", params)}
+//   - policy update.Policy
+func (_e *MockContainer_Expecter) CooldownDelay(policy any) *MockContainer_CooldownDelay_Call {
+	return &MockContainer_CooldownDelay_Call{Call: _e.mock.On("CooldownDelay", policy)}
 }
 
-func (_c *MockContainer_CooldownDelay_Call) Run(run func(params types.UpdateParams)) *MockContainer_CooldownDelay_Call {
+func (_c *MockContainer_CooldownDelay_Call) Run(run func(policy update.Policy)) *MockContainer_CooldownDelay_Call {
 	_c.Call.Run(func(args mock.Arguments) {
-		var arg0 types.UpdateParams
+		var arg0 update.Policy
 		if args[0] != nil {
-			arg0 = args[0].(types.UpdateParams)
+			arg0 = args[0].(update.Policy)
 		}
 		run(
 			arg0,
@@ -141,7 +142,7 @@ func (_c *MockContainer_CooldownDelay_Call) Return(duration time.Duration) *Mock
 	return _c
 }
 
-func (_c *MockContainer_CooldownDelay_Call) RunAndReturn(run func(params types.UpdateParams) time.Duration) *MockContainer_CooldownDelay_Call {
+func (_c *MockContainer_CooldownDelay_Call) RunAndReturn(run func(policy update.Policy) time.Duration) *MockContainer_CooldownDelay_Call {
 	_c.Call.Return(run)
 	return _c
 }
@@ -404,59 +405,6 @@ func (_c *MockContainer_GetLabel_Call) RunAndReturn(run func(key string) (string
 	return _c
 }
 
-// GetLifecycleGID provides a mock function for the type MockContainer
-func (_mock *MockContainer) GetLifecycleGID() (int, bool) {
-	ret := _mock.Called()
-
-	if len(ret) == 0 {
-		panic("no return value specified for GetLifecycleGID")
-	}
-
-	var r0 int
-	var r1 bool
-	if returnFunc, ok := ret.Get(0).(func() (int, bool)); ok {
-		return returnFunc()
-	}
-	if returnFunc, ok := ret.Get(0).(func() int); ok {
-		r0 = returnFunc()
-	} else {
-		r0 = ret.Get(0).(int)
-	}
-	if returnFunc, ok := ret.Get(1).(func() bool); ok {
-		r1 = returnFunc()
-	} else {
-		r1 = ret.Get(1).(bool)
-	}
-	return r0, r1
-}
-
-// MockContainer_GetLifecycleGID_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'GetLifecycleGID'
-type MockContainer_GetLifecycleGID_Call struct {
-	*mock.Call
-}
-
-// GetLifecycleGID is a helper method to define mock.On call
-func (_e *MockContainer_Expecter) GetLifecycleGID() *MockContainer_GetLifecycleGID_Call {
-	return &MockContainer_GetLifecycleGID_Call{Call: _e.mock.On("GetLifecycleGID")}
-}
-
-func (_c *MockContainer_GetLifecycleGID_Call) Run(run func()) *MockContainer_GetLifecycleGID_Call {
-	_c.Call.Run(func(args mock.Arguments) {
-		run()
-	})
-	return _c
-}
-
-func (_c *MockContainer_GetLifecycleGID_Call) Return(n int, b bool) *MockContainer_GetLifecycleGID_Call {
-	_c.Call.Return(n, b)
-	return _c
-}
-
-func (_c *MockContainer_GetLifecycleGID_Call) RunAndReturn(run func() (int, bool)) *MockContainer_GetLifecycleGID_Call {
-	_c.Call.Return(run)
-	return _c
-}
-
 // GetLifecyclePostCheckCommand provides a mock function for the type MockContainer
 func (_mock *MockContainer) GetLifecyclePostCheckCommand() string {
 	ret := _mock.Called()
@@ -629,59 +577,6 @@ func (_c *MockContainer_GetLifecyclePreUpdateCommand_Call) Return(s string) *Moc
 }
 
 func (_c *MockContainer_GetLifecyclePreUpdateCommand_Call) RunAndReturn(run func() string) *MockContainer_GetLifecyclePreUpdateCommand_Call {
-	_c.Call.Return(run)
-	return _c
-}
-
-// GetLifecycleUID provides a mock function for the type MockContainer
-func (_mock *MockContainer) GetLifecycleUID() (int, bool) {
-	ret := _mock.Called()
-
-	if len(ret) == 0 {
-		panic("no return value specified for GetLifecycleUID")
-	}
-
-	var r0 int
-	var r1 bool
-	if returnFunc, ok := ret.Get(0).(func() (int, bool)); ok {
-		return returnFunc()
-	}
-	if returnFunc, ok := ret.Get(0).(func() int); ok {
-		r0 = returnFunc()
-	} else {
-		r0 = ret.Get(0).(int)
-	}
-	if returnFunc, ok := ret.Get(1).(func() bool); ok {
-		r1 = returnFunc()
-	} else {
-		r1 = ret.Get(1).(bool)
-	}
-	return r0, r1
-}
-
-// MockContainer_GetLifecycleUID_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'GetLifecycleUID'
-type MockContainer_GetLifecycleUID_Call struct {
-	*mock.Call
-}
-
-// GetLifecycleUID is a helper method to define mock.On call
-func (_e *MockContainer_Expecter) GetLifecycleUID() *MockContainer_GetLifecycleUID_Call {
-	return &MockContainer_GetLifecycleUID_Call{Call: _e.mock.On("GetLifecycleUID")}
-}
-
-func (_c *MockContainer_GetLifecycleUID_Call) Run(run func()) *MockContainer_GetLifecycleUID_Call {
-	_c.Call.Run(func(args mock.Arguments) {
-		run()
-	})
-	return _c
-}
-
-func (_c *MockContainer_GetLifecycleUID_Call) Return(n int, b bool) *MockContainer_GetLifecycleUID_Call {
-	_c.Call.Return(n, b)
-	return _c
-}
-
-func (_c *MockContainer_GetLifecycleUID_Call) RunAndReturn(run func() (int, bool)) *MockContainer_GetLifecycleUID_Call {
 	_c.Call.Return(run)
 	return _c
 }
@@ -1041,16 +936,16 @@ func (_c *MockContainer_IsLinkedToRestarting_Call) RunAndReturn(run func() bool)
 }
 
 // IsMonitorOnly provides a mock function for the type MockContainer
-func (_mock *MockContainer) IsMonitorOnly(params types.UpdateParams) bool {
-	ret := _mock.Called(params)
+func (_mock *MockContainer) IsMonitorOnly(policy update.Policy) bool {
+	ret := _mock.Called(policy)
 
 	if len(ret) == 0 {
 		panic("no return value specified for IsMonitorOnly")
 	}
 
 	var r0 bool
-	if returnFunc, ok := ret.Get(0).(func(types.UpdateParams) bool); ok {
-		r0 = returnFunc(params)
+	if returnFunc, ok := ret.Get(0).(func(update.Policy) bool); ok {
+		r0 = returnFunc(policy)
 	} else {
 		r0 = ret.Get(0).(bool)
 	}
@@ -1063,16 +958,16 @@ type MockContainer_IsMonitorOnly_Call struct {
 }
 
 // IsMonitorOnly is a helper method to define mock.On call
-//   - params types.UpdateParams
-func (_e *MockContainer_Expecter) IsMonitorOnly(params any) *MockContainer_IsMonitorOnly_Call {
-	return &MockContainer_IsMonitorOnly_Call{Call: _e.mock.On("IsMonitorOnly", params)}
+//   - policy update.Policy
+func (_e *MockContainer_Expecter) IsMonitorOnly(policy any) *MockContainer_IsMonitorOnly_Call {
+	return &MockContainer_IsMonitorOnly_Call{Call: _e.mock.On("IsMonitorOnly", policy)}
 }
 
-func (_c *MockContainer_IsMonitorOnly_Call) Run(run func(params types.UpdateParams)) *MockContainer_IsMonitorOnly_Call {
+func (_c *MockContainer_IsMonitorOnly_Call) Run(run func(policy update.Policy)) *MockContainer_IsMonitorOnly_Call {
 	_c.Call.Run(func(args mock.Arguments) {
-		var arg0 types.UpdateParams
+		var arg0 update.Policy
 		if args[0] != nil {
-			arg0 = args[0].(types.UpdateParams)
+			arg0 = args[0].(update.Policy)
 		}
 		run(
 			arg0,
@@ -1086,22 +981,22 @@ func (_c *MockContainer_IsMonitorOnly_Call) Return(b bool) *MockContainer_IsMoni
 	return _c
 }
 
-func (_c *MockContainer_IsMonitorOnly_Call) RunAndReturn(run func(params types.UpdateParams) bool) *MockContainer_IsMonitorOnly_Call {
+func (_c *MockContainer_IsMonitorOnly_Call) RunAndReturn(run func(policy update.Policy) bool) *MockContainer_IsMonitorOnly_Call {
 	_c.Call.Return(run)
 	return _c
 }
 
 // IsNoPull provides a mock function for the type MockContainer
-func (_mock *MockContainer) IsNoPull(params types.UpdateParams) bool {
-	ret := _mock.Called(params)
+func (_mock *MockContainer) IsNoPull(policy update.Policy) bool {
+	ret := _mock.Called(policy)
 
 	if len(ret) == 0 {
 		panic("no return value specified for IsNoPull")
 	}
 
 	var r0 bool
-	if returnFunc, ok := ret.Get(0).(func(types.UpdateParams) bool); ok {
-		r0 = returnFunc(params)
+	if returnFunc, ok := ret.Get(0).(func(update.Policy) bool); ok {
+		r0 = returnFunc(policy)
 	} else {
 		r0 = ret.Get(0).(bool)
 	}
@@ -1114,16 +1009,16 @@ type MockContainer_IsNoPull_Call struct {
 }
 
 // IsNoPull is a helper method to define mock.On call
-//   - params types.UpdateParams
-func (_e *MockContainer_Expecter) IsNoPull(params any) *MockContainer_IsNoPull_Call {
-	return &MockContainer_IsNoPull_Call{Call: _e.mock.On("IsNoPull", params)}
+//   - policy update.Policy
+func (_e *MockContainer_Expecter) IsNoPull(policy any) *MockContainer_IsNoPull_Call {
+	return &MockContainer_IsNoPull_Call{Call: _e.mock.On("IsNoPull", policy)}
 }
 
-func (_c *MockContainer_IsNoPull_Call) Run(run func(params types.UpdateParams)) *MockContainer_IsNoPull_Call {
+func (_c *MockContainer_IsNoPull_Call) Run(run func(policy update.Policy)) *MockContainer_IsNoPull_Call {
 	_c.Call.Run(func(args mock.Arguments) {
-		var arg0 types.UpdateParams
+		var arg0 update.Policy
 		if args[0] != nil {
-			arg0 = args[0].(types.UpdateParams)
+			arg0 = args[0].(update.Policy)
 		}
 		run(
 			arg0,
@@ -1137,7 +1032,7 @@ func (_c *MockContainer_IsNoPull_Call) Return(b bool) *MockContainer_IsNoPull_Ca
 	return _c
 }
 
-func (_c *MockContainer_IsNoPull_Call) RunAndReturn(run func(params types.UpdateParams) bool) *MockContainer_IsNoPull_Call {
+func (_c *MockContainer_IsNoPull_Call) RunAndReturn(run func(policy update.Policy) bool) *MockContainer_IsNoPull_Call {
 	_c.Call.Return(run)
 	return _c
 }
@@ -1318,6 +1213,72 @@ func (_c *MockContainer_IsWatchtower_Call) RunAndReturn(run func() bool) *MockCo
 	return _c
 }
 
+// LifecycleUser provides a mock function for the type MockContainer
+func (_mock *MockContainer) LifecycleUser(uid int, gid int) (int, int) {
+	ret := _mock.Called(uid, gid)
+
+	if len(ret) == 0 {
+		panic("no return value specified for LifecycleUser")
+	}
+
+	var r0 int
+	var r1 int
+	if returnFunc, ok := ret.Get(0).(func(int, int) (int, int)); ok {
+		return returnFunc(uid, gid)
+	}
+	if returnFunc, ok := ret.Get(0).(func(int, int) int); ok {
+		r0 = returnFunc(uid, gid)
+	} else {
+		r0 = ret.Get(0).(int)
+	}
+	if returnFunc, ok := ret.Get(1).(func(int, int) int); ok {
+		r1 = returnFunc(uid, gid)
+	} else {
+		r1 = ret.Get(1).(int)
+	}
+	return r0, r1
+}
+
+// MockContainer_LifecycleUser_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'LifecycleUser'
+type MockContainer_LifecycleUser_Call struct {
+	*mock.Call
+}
+
+// LifecycleUser is a helper method to define mock.On call
+//   - uid int
+//   - gid int
+func (_e *MockContainer_Expecter) LifecycleUser(uid any, gid any) *MockContainer_LifecycleUser_Call {
+	return &MockContainer_LifecycleUser_Call{Call: _e.mock.On("LifecycleUser", uid, gid)}
+}
+
+func (_c *MockContainer_LifecycleUser_Call) Run(run func(uid int, gid int)) *MockContainer_LifecycleUser_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		var arg0 int
+		if args[0] != nil {
+			arg0 = args[0].(int)
+		}
+		var arg1 int
+		if args[1] != nil {
+			arg1 = args[1].(int)
+		}
+		run(
+			arg0,
+			arg1,
+		)
+	})
+	return _c
+}
+
+func (_c *MockContainer_LifecycleUser_Call) Return(n int, n1 int) *MockContainer_LifecycleUser_Call {
+	_c.Call.Return(n, n1)
+	return _c
+}
+
+func (_c *MockContainer_LifecycleUser_Call) RunAndReturn(run func(uid int, gid int) (int, int)) *MockContainer_LifecycleUser_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // Links provides a mock function for the type MockContainer
 func (_mock *MockContainer) Links(useComposeDependsOn bool) []string {
 	ret := _mock.Called(useComposeDependsOn)
@@ -1415,6 +1376,94 @@ func (_c *MockContainer_Name_Call) RunAndReturn(run func() string) *MockContaine
 	return _c
 }
 
+// NormalizedScope provides a mock function for the type MockContainer
+func (_mock *MockContainer) NormalizedScope() string {
+	ret := _mock.Called()
+
+	if len(ret) == 0 {
+		panic("no return value specified for NormalizedScope")
+	}
+
+	var r0 string
+	if returnFunc, ok := ret.Get(0).(func() string); ok {
+		r0 = returnFunc()
+	} else {
+		r0 = ret.Get(0).(string)
+	}
+	return r0
+}
+
+// MockContainer_NormalizedScope_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'NormalizedScope'
+type MockContainer_NormalizedScope_Call struct {
+	*mock.Call
+}
+
+// NormalizedScope is a helper method to define mock.On call
+func (_e *MockContainer_Expecter) NormalizedScope() *MockContainer_NormalizedScope_Call {
+	return &MockContainer_NormalizedScope_Call{Call: _e.mock.On("NormalizedScope")}
+}
+
+func (_c *MockContainer_NormalizedScope_Call) Run(run func()) *MockContainer_NormalizedScope_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run()
+	})
+	return _c
+}
+
+func (_c *MockContainer_NormalizedScope_Call) Return(s string) *MockContainer_NormalizedScope_Call {
+	_c.Call.Return(s)
+	return _c
+}
+
+func (_c *MockContainer_NormalizedScope_Call) RunAndReturn(run func() string) *MockContainer_NormalizedScope_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// PostCheckTimeout provides a mock function for the type MockContainer
+func (_mock *MockContainer) PostCheckTimeout() int {
+	ret := _mock.Called()
+
+	if len(ret) == 0 {
+		panic("no return value specified for PostCheckTimeout")
+	}
+
+	var r0 int
+	if returnFunc, ok := ret.Get(0).(func() int); ok {
+		r0 = returnFunc()
+	} else {
+		r0 = ret.Get(0).(int)
+	}
+	return r0
+}
+
+// MockContainer_PostCheckTimeout_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'PostCheckTimeout'
+type MockContainer_PostCheckTimeout_Call struct {
+	*mock.Call
+}
+
+// PostCheckTimeout is a helper method to define mock.On call
+func (_e *MockContainer_Expecter) PostCheckTimeout() *MockContainer_PostCheckTimeout_Call {
+	return &MockContainer_PostCheckTimeout_Call{Call: _e.mock.On("PostCheckTimeout")}
+}
+
+func (_c *MockContainer_PostCheckTimeout_Call) Run(run func()) *MockContainer_PostCheckTimeout_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run()
+	})
+	return _c
+}
+
+func (_c *MockContainer_PostCheckTimeout_Call) Return(n int) *MockContainer_PostCheckTimeout_Call {
+	_c.Call.Return(n)
+	return _c
+}
+
+func (_c *MockContainer_PostCheckTimeout_Call) RunAndReturn(run func() int) *MockContainer_PostCheckTimeout_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // PostUpdateTimeout provides a mock function for the type MockContainer
 func (_mock *MockContainer) PostUpdateTimeout() int {
 	ret := _mock.Called()
@@ -1455,6 +1504,50 @@ func (_c *MockContainer_PostUpdateTimeout_Call) Return(n int) *MockContainer_Pos
 }
 
 func (_c *MockContainer_PostUpdateTimeout_Call) RunAndReturn(run func() int) *MockContainer_PostUpdateTimeout_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// PreCheckTimeout provides a mock function for the type MockContainer
+func (_mock *MockContainer) PreCheckTimeout() int {
+	ret := _mock.Called()
+
+	if len(ret) == 0 {
+		panic("no return value specified for PreCheckTimeout")
+	}
+
+	var r0 int
+	if returnFunc, ok := ret.Get(0).(func() int); ok {
+		r0 = returnFunc()
+	} else {
+		r0 = ret.Get(0).(int)
+	}
+	return r0
+}
+
+// MockContainer_PreCheckTimeout_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'PreCheckTimeout'
+type MockContainer_PreCheckTimeout_Call struct {
+	*mock.Call
+}
+
+// PreCheckTimeout is a helper method to define mock.On call
+func (_e *MockContainer_Expecter) PreCheckTimeout() *MockContainer_PreCheckTimeout_Call {
+	return &MockContainer_PreCheckTimeout_Call{Call: _e.mock.On("PreCheckTimeout")}
+}
+
+func (_c *MockContainer_PreCheckTimeout_Call) Run(run func()) *MockContainer_PreCheckTimeout_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run()
+	})
+	return _c
+}
+
+func (_c *MockContainer_PreCheckTimeout_Call) Return(n int) *MockContainer_PreCheckTimeout_Call {
+	_c.Call.Return(n)
+	return _c
+}
+
+func (_c *MockContainer_PreCheckTimeout_Call) RunAndReturn(run func() int) *MockContainer_PreCheckTimeout_Call {
 	_c.Call.Return(run)
 	return _c
 }
@@ -1725,20 +1818,18 @@ func (_c *MockContainer_StopSignal_Call) RunAndReturn(run func() string) *MockCo
 }
 
 // StopTimeout provides a mock function for the type MockContainer
-func (_mock *MockContainer) StopTimeout() *int {
-	ret := _mock.Called()
+func (_mock *MockContainer) StopTimeout(fallback time.Duration) time.Duration {
+	ret := _mock.Called(fallback)
 
 	if len(ret) == 0 {
 		panic("no return value specified for StopTimeout")
 	}
 
-	var r0 *int
-	if returnFunc, ok := ret.Get(0).(func() *int); ok {
-		r0 = returnFunc()
+	var r0 time.Duration
+	if returnFunc, ok := ret.Get(0).(func(time.Duration) time.Duration); ok {
+		r0 = returnFunc(fallback)
 	} else {
-		if ret.Get(0) != nil {
-			r0 = ret.Get(0).(*int)
-		}
+		r0 = ret.Get(0).(time.Duration)
 	}
 	return r0
 }
@@ -1749,23 +1840,30 @@ type MockContainer_StopTimeout_Call struct {
 }
 
 // StopTimeout is a helper method to define mock.On call
-func (_e *MockContainer_Expecter) StopTimeout() *MockContainer_StopTimeout_Call {
-	return &MockContainer_StopTimeout_Call{Call: _e.mock.On("StopTimeout")}
+//   - fallback time.Duration
+func (_e *MockContainer_Expecter) StopTimeout(fallback any) *MockContainer_StopTimeout_Call {
+	return &MockContainer_StopTimeout_Call{Call: _e.mock.On("StopTimeout", fallback)}
 }
 
-func (_c *MockContainer_StopTimeout_Call) Run(run func()) *MockContainer_StopTimeout_Call {
+func (_c *MockContainer_StopTimeout_Call) Run(run func(fallback time.Duration)) *MockContainer_StopTimeout_Call {
 	_c.Call.Run(func(args mock.Arguments) {
-		run()
+		var arg0 time.Duration
+		if args[0] != nil {
+			arg0 = args[0].(time.Duration)
+		}
+		run(
+			arg0,
+		)
 	})
 	return _c
 }
 
-func (_c *MockContainer_StopTimeout_Call) Return(n *int) *MockContainer_StopTimeout_Call {
-	_c.Call.Return(n)
+func (_c *MockContainer_StopTimeout_Call) Return(duration time.Duration) *MockContainer_StopTimeout_Call {
+	_c.Call.Return(duration)
 	return _c
 }
 
-func (_c *MockContainer_StopTimeout_Call) RunAndReturn(run func() *int) *MockContainer_StopTimeout_Call {
+func (_c *MockContainer_StopTimeout_Call) RunAndReturn(run func(fallback time.Duration) time.Duration) *MockContainer_StopTimeout_Call {
 	_c.Call.Return(run)
 	return _c
 }

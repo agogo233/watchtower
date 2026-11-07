@@ -3,9 +3,7 @@ package selfupdate
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
-	"strings"
 	"testing"
 	"time"
 
@@ -17,7 +15,9 @@ import (
 	dockerContainer "github.com/moby/moby/api/types/container"
 
 	mockContainerClient "github.com/nicholas-fedor/watchtower/internal/container/client/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/testutil/logcapture"
 	mockUpdate "github.com/nicholas-fedor/watchtower/internal/update/mocks"
+	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
@@ -104,7 +104,7 @@ func TestStartOrchestrator(t *testing.T) {
 			source := createDefaultMockContainer("source-123", watchtowerLabels)
 			client := expectOrchestrator(t, source, "source-123", false, nil)
 
-			newID, renamed, err := StartOrchestrator(newTestLogger(t), t.Context(), client, source, types.UpdateParams{})
+			newID, renamed, err := StartOrchestrator(newTestLogger(t), t.Context(), client, source, updateParams.Params{})
 			require.NoError(t, err)
 			assert.Empty(t, newID)
 			assert.True(t, renamed)
@@ -120,7 +120,7 @@ func TestStartOrchestrator(t *testing.T) {
 			source := createDefaultMockContainer("source-456", watchtowerLabels)
 			client := expectOrchestrator(t, source, "source-456", false, nil)
 
-			newID, renamed, err := StartOrchestrator(newTestLogger(t), t.Context(), client, source, types.UpdateParams{})
+			newID, renamed, err := StartOrchestrator(newTestLogger(t), t.Context(), client, source, updateParams.Params{})
 			require.NoError(t, err)
 			assert.Empty(t, newID)
 			assert.True(t, renamed)
@@ -146,7 +146,7 @@ func TestStartOrchestrator(t *testing.T) {
 
 			client := expectOrchestrator(t, source, "old-id-1,old-id-2,source-789", false, nil)
 
-			newID, renamed, err := StartOrchestrator(newTestLogger(t), t.Context(), client, source, types.UpdateParams{})
+			newID, renamed, err := StartOrchestrator(newTestLogger(t), t.Context(), client, source, updateParams.Params{})
 			require.NoError(t, err)
 			assert.Empty(t, newID)
 			assert.True(t, renamed)
@@ -162,7 +162,7 @@ func TestStartOrchestrator(t *testing.T) {
 			source := createDefaultMockContainer("source-err", watchtowerLabels)
 			client := expectOrchestrator(t, source, "source-err", false, errors.New("create failed"))
 
-			_, _, err := StartOrchestrator(newTestLogger(t), t.Context(), client, source, types.UpdateParams{})
+			_, _, err := StartOrchestrator(newTestLogger(t), t.Context(), client, source, updateParams.Params{})
 			require.ErrorContains(t, err, "ephemeral orchestrator failed")
 		})
 	})
@@ -176,7 +176,7 @@ func TestStartOrchestrator(t *testing.T) {
 			source := createDefaultMockContainer("source-cleanup", watchtowerLabels)
 			client := expectOrchestrator(t, source, "source-cleanup", true, nil)
 
-			_, renamed, err := StartOrchestrator(newTestLogger(t), t.Context(), client, source, types.UpdateParams{Cleanup: true})
+			_, renamed, err := StartOrchestrator(newTestLogger(t), t.Context(), client, source, updateParams.Params{Cleanup: true})
 			require.NoError(t, err)
 			assert.True(t, renamed)
 		})
@@ -194,7 +194,7 @@ func TestStartOrchestrator(t *testing.T) {
 			source := createDefaultMockContainer("source-async", watchtowerLabels)
 			client := expectOrchestrator(t, source, "source-async", false, nil)
 
-			newID, renamed, err := StartOrchestrator(newTestLogger(t), t.Context(), client, source, types.UpdateParams{})
+			newID, renamed, err := StartOrchestrator(newTestLogger(t), t.Context(), client, source, updateParams.Params{})
 			require.NoError(t, err)
 			assert.Empty(t, newID)
 			assert.True(t, renamed)
@@ -236,7 +236,7 @@ func TestEphemeralSelfUpdate_StoppingContainerLog(t *testing.T) {
 
 			log := zerolog.New(&out).Level(zerolog.DebugLevel)
 
-			_, _, err := StartOrchestrator(&log, t.Context(), client, source, types.UpdateParams{})
+			_, _, err := StartOrchestrator(&log, t.Context(), client, source, updateParams.Params{})
 			if tt.createErr != nil {
 				require.Error(t, err)
 			} else {
@@ -245,11 +245,7 @@ func TestEphemeralSelfUpdate_StoppingContainerLog(t *testing.T) {
 
 			var levels []string
 
-			for line := range strings.Lines(out.String()) {
-				var record map[string]any
-
-				require.NoError(t, json.Unmarshal([]byte(line), &record))
-
+			for _, record := range logcapture.Entries[logcapture.Entry](t, out.String()) {
 				if record["message"] == "Stopping container" {
 					assert.Equal(t, "watchtower", record["container"])
 					assert.Equal(t, source.ID().ShortID(), record["id"])
@@ -296,7 +292,7 @@ func TestEphemeralSelfUpdate_OutlivesCanceledUpdate(t *testing.T) {
 		).
 		Return(types.ContainerID("orchestrator-id"), nil).Once()
 
-	_, renamed, err := StartOrchestrator(newTestLogger(t), ctx, client, source, types.UpdateParams{})
+	_, renamed, err := StartOrchestrator(newTestLogger(t), ctx, client, source, updateParams.Params{})
 	require.NoError(t, err)
 	assert.True(t, renamed)
 }

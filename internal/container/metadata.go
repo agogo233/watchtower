@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -11,9 +12,27 @@ import (
 	dockerContainer "github.com/moby/moby/api/types/container"
 
 	"github.com/nicholas-fedor/watchtower/internal/container/labels"
+	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
+	updateConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/update"
 	"github.com/nicholas-fedor/watchtower/internal/settings/units"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
+
+// hookTimeoutMessages holds the log messages for reading one lifecycle hook's
+// timeout label.
+type hookTimeoutMessages struct {
+	// notSet is logged at debug when the label is unset.
+	notSet string
+	// invalid is logged as a warning when the value is not a whole number of
+	// 0 or more.
+	invalid string
+	// retrieved is logged at debug when the value is used.
+	retrieved string
+}
+
+// defaultHookTimeout is the lifecycle hook timeout in minutes when a hook's
+// timeout label is unset or invalid.
+const defaultHookTimeout = 1
 
 // Errors for label and scope operations.
 var (
@@ -21,7 +40,45 @@ var (
 	errCurrentContainerNotCached = errors.New("current container not cached for scope derivation")
 	// errLabelNotFound indicates a requested label is not present in the container's metadata.
 	errLabelNotFound = errors.New("label not found")
+	// errInvalidHookTimeout indicates a lifecycle hook timeout label is not a
+	// whole number of minutes of 0 or more.
+	errInvalidHookTimeout = errors.New("lifecycle hook timeout must be a whole number of minutes of 0 or more")
 )
+
+// Log messages for reading each lifecycle hook's timeout label.
+var (
+	// preCheckTimeoutMessages are the log messages for the pre-check timeout label.
+	preCheckTimeoutMessages = hookTimeoutMessages{
+		notSet:    "Pre-check timeout not set, using default",
+		invalid:   logging.InvalidPreCheckTimeout,
+		retrieved: "Retrieved pre-check timeout",
+	}
+	// postCheckTimeoutMessages are the log messages for the post-check timeout label.
+	postCheckTimeoutMessages = hookTimeoutMessages{
+		notSet:    "Post-check timeout not set, using default",
+		invalid:   logging.InvalidPostCheckTimeout,
+		retrieved: "Retrieved post-check timeout",
+	}
+	// preUpdateTimeoutMessages are the log messages for the pre-update timeout label.
+	preUpdateTimeoutMessages = hookTimeoutMessages{
+		notSet:    "Pre-update timeout not set, using default",
+		invalid:   logging.InvalidPreUpdateTimeout,
+		retrieved: "Retrieved pre-update timeout",
+	}
+	// postUpdateTimeoutMessages are the log messages for the post-update timeout label.
+	postUpdateTimeoutMessages = hookTimeoutMessages{
+		notSet:    "Post-update timeout not set, using default",
+		invalid:   logging.InvalidPostUpdateTimeout,
+		retrieved: "Retrieved post-update timeout",
+	}
+)
+
+// invalidLabels holds the invalid label values reported during this process,
+// by container ID and label. Labels are read on every scan, hook run or API
+// request, so each invalid value is warned about once and then logged at
+// debug. A container whose labels change is recreated with a new ID, so its
+// labels are reported again.
+var invalidLabels logging.ReportedProblems
 
 // GetLifecyclePreCheckCommand returns the pre-check command from labels.
 //
@@ -55,88 +112,93 @@ func (c *Container) GetLifecyclePostUpdateCommand() string {
 	return c.getLabelValueOrEmpty(labels.LifecyclePostUpdate)
 }
 
+// PreCheckTimeout returns the pre-check command timeout in minutes.
+//
+// It defaults to 1 minute if unset or invalid, including a negative value.
+// 0 allows indefinite execution.
+//
+// Returns:
+//   - int: Timeout in minutes.
+func (c *Container) PreCheckTimeout() int {
+	return c.hookTimeout(labels.LifecyclePreCheckTimeout, preCheckTimeoutMessages)
+}
+
+// PostCheckTimeout returns the post-check command timeout in minutes.
+//
+// It defaults to 1 minute if unset or invalid, including a negative value.
+// 0 allows indefinite execution.
+//
+// Returns:
+//   - int: Timeout in minutes.
+func (c *Container) PostCheckTimeout() int {
+	return c.hookTimeout(labels.LifecyclePostCheckTimeout, postCheckTimeoutMessages)
+}
+
 // PreUpdateTimeout returns the pre-update command timeout in minutes.
 //
-// It defaults to 1 minute if unset or invalid.
+// It defaults to 1 minute if unset or invalid, including a negative value.
 // 0 allows indefinite execution.
 //
 // Returns:
 //   - int: Timeout in minutes.
 func (c *Container) PreUpdateTimeout() int {
-	clogVal := c.Logger().With().
-		Str("container", c.Name()).
-		Logger()
-	clog := &clogVal
-	val := c.getLabelValueOrEmpty(labels.LifecyclePreUpdateTimeout)
-
-	// Use default if label is unset.
-	if val == "" {
-		clog.Debug().
-			Str("label", labels.LifecyclePreUpdateTimeout).
-			Msg("Pre-update timeout not set, using default")
-
-		return 1
-	}
-
-	// Parse timeout value.
-	minutes, err := strconv.Atoi(val)
-	if err != nil {
-		clog.Warn().
-			Err(err).
-			Str("label", labels.LifecyclePreUpdateTimeout).
-			Str("value", val).
-			Msg("Invalid pre-update timeout value, using default")
-
-		return 1
-	}
-
-	clog.Debug().
-		Str("label", labels.LifecyclePreUpdateTimeout).
-		Int("minutes", minutes).
-		Msg("Retrieved pre-update timeout")
-
-	return minutes
+	return c.hookTimeout(labels.LifecyclePreUpdateTimeout, preUpdateTimeoutMessages)
 }
 
 // PostUpdateTimeout returns the post-update command timeout in minutes.
 //
-// It defaults to 1 minute if unset or invalid.
+// It defaults to 1 minute if unset or invalid, including a negative value.
 // 0 allows indefinite execution.
 //
 // Returns:
 //   - int: Timeout in minutes.
 func (c *Container) PostUpdateTimeout() int {
+	return c.hookTimeout(labels.LifecyclePostUpdateTimeout, postUpdateTimeoutMessages)
+}
+
+// hookTimeout reads a lifecycle hook timeout label in minutes.
+//
+// It returns 1 minute when the label is unset. A value that is not a whole
+// number of 0 or more, including an empty one, logs a warning and also returns
+// 1 minute.
+//
+// Parameters:
+//   - label: The hook's timeout label.
+//   - messages: The hook's log messages.
+//
+// Returns:
+//   - int: Timeout in minutes, where 0 means no timeout.
+func (c *Container) hookTimeout(label string, messages hookTimeoutMessages) int {
 	clogVal := c.Logger().With().
 		Str("container", c.Name()).
 		Logger()
 	clog := &clogVal
-	val := c.getLabelValueOrEmpty(labels.LifecyclePostUpdateTimeout)
+	val, ok := c.getLabelValue(label)
 
 	// Use default if label is unset.
-	if val == "" {
+	if !ok {
 		clog.Debug().
-			Str("label", labels.LifecyclePostUpdateTimeout).
-			Msg("Post-update timeout not set, using default")
+			Str("label", label).
+			Msg(messages.notSet)
 
-		return 1
+		return defaultHookTimeout
 	}
 
-	// Parse timeout value.
-	minutes, err := strconv.Atoi(val)
+	minutes, err := parseHookTimeout(val)
 	if err != nil {
-		clog.Warn().
+		clog.WithLevel(invalidLabels.Level(string(c.ID()), label)).
 			Err(err).
-			Str("label", labels.LifecyclePostUpdateTimeout).
+			Str("label", label).
 			Str("value", val).
-			Msg("Invalid post-update timeout value, using default")
+			Msg(messages.invalid)
 
-		return 1
+		return defaultHookTimeout
 	}
 
 	clog.Debug().
-		Str("label", labels.LifecyclePostUpdateTimeout).
+		Str("label", label).
 		Int("minutes", minutes).
-		Msg("Retrieved post-update timeout")
+		Msg(messages.retrieved)
 
 	return minutes
 }
@@ -168,7 +230,7 @@ func (c *Container) getLifecycleID(label, idType string) (int, bool) {
 	// Parse ID value.
 	parsedID, err := strconv.Atoi(rawString)
 	if err != nil {
-		clog.Warn().
+		clog.WithLevel(invalidLabels.Level(string(c.ID()), label)).
 			Err(err).
 			Str("label", label).
 			Str("value", rawString).
@@ -179,7 +241,7 @@ func (c *Container) getLifecycleID(label, idType string) (int, bool) {
 
 	// Validate ID range (must be non-negative and within reasonable bounds).
 	if parsedID < 0 {
-		clog.Warn().
+		clog.WithLevel(invalidLabels.Level(string(c.ID()), label)).
 			Str("label", label).
 			Str("value", rawString).
 			Str("id_type", idType).
@@ -189,15 +251,13 @@ func (c *Container) getLifecycleID(label, idType string) (int, bool) {
 		return 0, false
 	}
 
-	// Check for unreasonably large ID values (greater than 2^31-1).
-	const maxReasonableID = 2147483647 // 2^31-1
-	if parsedID > maxReasonableID {
-		clog.Warn().
+	if parsedID > labels.MaxLifecycleID {
+		clog.WithLevel(invalidLabels.Level(string(c.ID()), label)).
 			Str("label", label).
 			Str("value", rawString).
 			Str("id_type", idType).
 			Int("id", parsedID).
-			Int("max", maxReasonableID).
+			Int("max", labels.MaxLifecycleID).
 			Msg(fmt.Sprintf("Invalid lifecycle %s value: exceeds maximum reasonable value", idType))
 
 		return 0, false
@@ -212,22 +272,33 @@ func (c *Container) getLifecycleID(label, idType string) (int, bool) {
 	return parsedID, true
 }
 
-// GetLifecycleUID returns the UID for lifecycle hooks from labels.
+// LifecycleUser returns the UID and GID that lifecycle hooks run as.
+//
+// Each ID comes from its lifecycle label when the label is set to a valid ID,
+// and from its default otherwise. An invalid label logs a warning once per
+// container and label.
+//
+// Parameters:
+//   - defaultUID: UID used when the UID label is unset or invalid.
+//   - defaultGID: GID used when the GID label is unset or invalid.
 //
 // Returns:
-//   - int: UID value if set and valid.
-//   - bool: True if label is present and valid, false otherwise.
-func (c *Container) GetLifecycleUID() (int, bool) {
-	return c.getLifecycleID(labels.LifecycleUID, "UID")
-}
+//   - uid: UID the hooks run as.
+//   - gid: GID the hooks run as.
+//
+//nolint:nonamedreturns // Same-type returns need names.
+func (c *Container) LifecycleUser(defaultUID, defaultGID int) (uid, gid int) {
+	uid, gid = defaultUID, defaultGID
 
-// GetLifecycleGID returns the GID for lifecycle hooks from labels.
-//
-// Returns:
-//   - int: GID value if set and valid.
-//   - bool: True if label is present and valid, false otherwise.
-func (c *Container) GetLifecycleGID() (int, bool) {
-	return c.getLifecycleID(labels.LifecycleGID, "GID")
+	if labelUID, ok := c.getLifecycleID(labels.LifecycleUID, "UID"); ok {
+		uid = labelUID
+	}
+
+	if labelGID, ok := c.getLifecycleID(labels.LifecycleGID, "GID"); ok {
+		gid = labelGID
+	}
+
+	return uid, gid
 }
 
 // Enabled checks if Watchtower should manage the container.
@@ -254,7 +325,7 @@ func (c *Container) Enabled() (bool, bool) {
 	// Parse enable label value.
 	parsedBool, err := strconv.ParseBool(rawBool)
 	if err != nil {
-		clog.Warn().
+		clog.WithLevel(invalidLabels.Level(string(c.ID()), labels.Enable)).
 			Err(err).
 			Str("label", labels.Enable).
 			Str("value", rawBool).
@@ -288,85 +359,85 @@ func (c *Container) GetLabel(label string) (string, bool) {
 
 // IsMonitorOnly determines if the container is monitor-only.
 //
-// It uses UpdateParams.MonitorOnly and label precedence.
+// It uses Policy.MonitorOnly and label precedence.
 //
 // Parameters:
-//   - params: Update parameters from types.UpdateParams.
+//   - policy: Update policy.
 //
 // Returns:
 //   - bool: True if monitor-only, false otherwise.
-func (c *Container) IsMonitorOnly(params types.UpdateParams) bool {
-	return c.getContainerOrGlobalBool(params.MonitorOnly, labels.MonitorOnly, params.LabelPrecedence)
+func (c *Container) IsMonitorOnly(policy updateConfig.Policy) bool {
+	return c.getContainerOrGlobalBool(policy.MonitorOnly, labels.MonitorOnly, policy.LabelPrecedence)
 }
 
 // IsNoPull determines if image pulls should be skipped.
 //
-// It uses UpdateParams.NoPull and label precedence.
+// It uses Policy.NoPull and label precedence.
 //
 // Parameters:
-//   - params: Update parameters from types.UpdateParams.
+//   - policy: Update policy.
 //
 // Returns:
 //   - bool: True if no-pull, false otherwise.
-func (c *Container) IsNoPull(params types.UpdateParams) bool {
-	return c.getContainerOrGlobalBool(params.NoPull, labels.NoPull, params.LabelPrecedence)
+func (c *Container) IsNoPull(policy updateConfig.Policy) bool {
+	return c.getContainerOrGlobalBool(policy.NoPull, labels.NoPull, policy.LabelPrecedence)
 }
 
 // IsChangelogEnabled reports whether the changelog notification line and the
 // versioned release link are enabled for this container.
 //
-// It uses UpdateParams.EnableChangelog and label precedence, with the same two
+// It uses Policy.EnableChangelog and label precedence, with the same two
 // sources no-pull uses. A changelog-url label is a value, not a switch, so it
 // never enables the feature on its own.
 // A user who authorizes the extra
 // registry request must say so explicitly.
 //
 // Parameters:
-//   - params: Update parameters from types.UpdateParams.
+//   - policy: Update policy.
 //
 // Returns:
 //   - bool: True when the changelog feature is enabled.
-func (c *Container) IsChangelogEnabled(params types.UpdateParams) bool {
+func (c *Container) IsChangelogEnabled(policy updateConfig.Policy) bool {
 	return c.getContainerOrGlobalBool(
-		params.EnableChangelog,
+		policy.EnableChangelog,
 		labels.EnableChangelog,
-		params.LabelPrecedence,
+		policy.LabelPrecedence,
 	)
 }
 
 // CooldownDelay returns the effective cooldown delay for this container.
 //
 // If the container has the cooldown-delay label set, its value is used (parsed
-// as a duration string). Otherwise, the global CooldownDelay from UpdateParams
+// as a duration string). Otherwise, the global CooldownDelay from the policy
 // is used. Setting the label to "0" disables cooldown for this container.
 //
 // Parameters:
-//   - params: Update parameters from types.UpdateParams.
+//   - policy: Update policy.
 //
 // Returns:
 //   - time.Duration: Effective cooldown delay for this container.
-func (c *Container) CooldownDelay(params types.UpdateParams) time.Duration {
+func (c *Container) CooldownDelay(policy updateConfig.Policy) time.Duration {
 	labelVal, ok := c.getLabelValue(labels.CooldownDelay)
 	if !ok {
 		// No label set — use global value.
-		return params.CooldownDelay
+		return policy.CooldownDelay
 	}
 
 	if labelVal == "" {
 		// Label present but empty — use global value.
-		return params.CooldownDelay
+		return policy.CooldownDelay
 	}
 
 	parsed, err := units.ParseDuration(labelVal)
 	if err != nil {
-		c.Logger().Warn().
+		c.Logger().WithLevel(invalidLabels.Level(string(c.ID()), labels.CooldownDelay)).
 			Err(err).
 			Str("container", c.Name()).
 			Str("label", labels.CooldownDelay).
 			Str("value", labelVal).
 			Msg("Failed to parse cooldown-delay label, using global value")
 
-		return params.CooldownDelay
+		return policy.CooldownDelay
 	}
 
 	c.Logger().Debug().
@@ -405,6 +476,17 @@ func (c *Container) Scope() (string, bool) {
 		Msg("Retrieved scope")
 
 	return rawString, true
+}
+
+// NormalizedScope returns the container's scope, or [labels.NoScope] when its
+// scope label is unset or empty.
+//
+// Returns:
+//   - string: The container's scope.
+func (c *Container) NormalizedScope() string {
+	scope, _ := c.Scope()
+
+	return labels.NormalizeScope(scope)
 }
 
 // GetEffectiveScope determines the effective operational scope by prioritizing explicit scope
@@ -505,11 +587,21 @@ func (c *Container) StopSignal() string {
 	return "SIGTERM"
 }
 
-// StopTimeout returns the container's configured stop timeout in seconds.
+// StopTimeout returns how long a stop waits for the container to exit before
+// killing it.
+//
+// A stop timeout of 0 or more set on the container itself, such as with
+// docker run --stop-timeout, takes precedence. Otherwise the stop waits for
+// fallback. A container stop timeout of -1, which tells Docker to wait
+// indefinitely, also uses fallback, so a stop always ends. A container stop
+// timeout too long for a [time.Duration] saturates at the longest duration.
+//
+// Parameters:
+//   - fallback: How long to wait when the container sets no usable stop timeout.
 //
 // Returns:
-//   - *int: Timeout in seconds if set, nil if unset.
-func (c *Container) StopTimeout() *int {
+//   - time.Duration: How long the stop waits.
+func (c *Container) StopTimeout(fallback time.Duration) time.Duration {
 	info := c.ContainerInfo()
 
 	clogVal := c.Logger().With().
@@ -517,20 +609,26 @@ func (c *Container) StopTimeout() *int {
 		Logger()
 	clog := &clogVal
 
-	// Check Config
-	if info != nil && info.Config != nil &&
-		info.Config.StopTimeout != nil {
-		timeout := *info.Config.StopTimeout
-		clog.Debug().
-			Int("timeout", timeout).
-			Msg("Retrieved stop timeout from Config")
+	if info == nil || info.Config == nil || info.Config.StopTimeout == nil {
+		clog.Debug().Msg("Stop timeout not set in container config")
 
-		return &timeout
+		return fallback
 	}
 
-	clog.Debug().Msg("Stop timeout not set in container config")
+	timeout := *info.Config.StopTimeout
+	clog.Debug().
+		Int("timeout", timeout).
+		Msg("Retrieved stop timeout from Config")
 
-	return nil
+	if timeout < 0 {
+		return fallback
+	}
+
+	if int64(timeout) > math.MaxInt64/int64(time.Second) {
+		return math.MaxInt64
+	}
+
+	return time.Duration(timeout) * time.Second
 }
 
 // containsWatchtowerLabel checks if the container is Watchtower.
@@ -548,6 +646,35 @@ func containsWatchtowerLabel(containerLabels map[string]string) bool {
 	val, ok := containerLabels[labels.Watchtower]
 
 	return ok && val == "true"
+}
+
+// parseHookTimeout parses a lifecycle hook timeout label value in minutes.
+//
+// A value too long to express as a [time.Duration], about 292 years, is
+// rejected, since converting it to a duration would overflow.
+//
+// Parameters:
+//   - value: The label value.
+//
+// Returns:
+//   - int: The timeout in minutes, where 0 means no timeout.
+//   - error: Non-nil when value is not a whole number of 0 or more, or is too
+//     long for a duration.
+func parseHookTimeout(value string) (int, error) {
+	minutes, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("%w: %w", errInvalidHookTimeout, err)
+	}
+
+	if minutes < 0 {
+		return 0, fmt.Errorf("%w: got %d", errInvalidHookTimeout, minutes)
+	}
+
+	if int64(minutes) > math.MaxInt64/int64(time.Minute) {
+		return 0, fmt.Errorf("%w: %d minutes is too long for a timeout", errInvalidHookTimeout, minutes)
+	}
+
+	return minutes, nil
 }
 
 // getRawLabelValue retrieves a raw label value.
@@ -626,13 +753,6 @@ func (c *Container) getBoolLabelValue(label string) (bool, error) {
 
 	value, err := strconv.ParseBool(strVal)
 	if err != nil {
-		c.Logger().Warn().
-			Err(err).
-			Str("container", c.Name()).
-			Str("label", label).
-			Str("value", strVal).
-			Msg("Failed to parse boolean label value")
-
 		return false, fmt.Errorf("%w: %s=%q", err, label, strVal)
 	}
 
@@ -664,7 +784,7 @@ func (c *Container) getContainerOrGlobalBool(
 	contVal, err := c.getBoolLabelValue(label)
 	if err != nil {
 		if !errors.Is(err, errLabelNotFound) {
-			clog.Warn().
+			clog.WithLevel(invalidLabels.Level(string(c.ID()), label)).
 				Err(err).
 				Str("label", label).
 				Msg("Failed to parse label value")
@@ -810,4 +930,26 @@ func IsSuperseded(container types.Container) bool {
 	chain, present := container.GetContainerChain()
 
 	return present && IsWatchtowerParent(container.ID(), chain)
+}
+
+// IsOrphanedReplacement reports whether a container counts as a replacement
+// that an interrupted self-update left in the created state.
+//
+// Any Watchtower container in the created state and in the current container's
+// scope counts, unless it is the current container or a renamed predecessor.
+// One scope runs one Watchtower instance, so such a container is never a separate
+// instance to keep.
+//
+// Parameters:
+//   - candidate: The container to check.
+//   - current: The running Watchtower container.
+//
+// Returns:
+//   - bool: True when the candidate is an orphaned replacement.
+func IsOrphanedReplacement(candidate, current types.Container) bool {
+	return candidate.IsWatchtower() &&
+		candidate.ID() != current.ID() &&
+		!IsOldContainer(candidate.Name()) &&
+		candidate.IsCreated() &&
+		candidate.NormalizedScope() == current.NormalizedScope()
 }

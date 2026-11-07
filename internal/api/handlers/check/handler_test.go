@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	mockCheck "github.com/nicholas-fedor/watchtower/internal/api/handlers/check/mocks"
 	"github.com/nicholas-fedor/watchtower/internal/observability/events"
 )
 
@@ -32,7 +33,7 @@ func TestNew(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := New(newTestLogger(t), tt.check, 5*time.Minute, nil, false, nil, events.ScanStartedData{})
+			h := New(newTestLogger(t), tt.check, 5*time.Minute, nil, nil, events.ScanStartedData{})
 			require.NotNil(t, h)
 			assert.Equal(t, "/v1/check", h.Path)
 		})
@@ -72,7 +73,7 @@ func TestHandler_Handle(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := New(newTestLogger(t), tt.checkFunc, 5*time.Minute, nil, false, nil, events.ScanStartedData{})
+			h := New(newTestLogger(t), tt.checkFunc, 5*time.Minute, nil, nil, events.ScanStartedData{})
 			app := fiber.New(fiber.Config{})
 			app.Post("/v1/check", h.Handle)
 
@@ -137,7 +138,7 @@ func TestHandler_Handle_WithFilters(t *testing.T) {
 				capturedNames = names
 
 				return []ContainerCheck{}, nil
-			}, 5*time.Minute, nil, false, nil, events.ScanStartedData{})
+			}, 5*time.Minute, nil, nil, events.ScanStartedData{})
 			app := fiber.New(fiber.Config{})
 			app.Post("/v1/check", h.Handle)
 
@@ -164,7 +165,7 @@ func TestHandler_Handle_TimeoutOverride(t *testing.T) {
 	t.Run("valid timeout is applied", func(t *testing.T) {
 		h := New(newTestLogger(t), func(ctx context.Context, _, _ []string) ([]ContainerCheck, error) {
 			return []ContainerCheck{}, nil
-		}, 5*time.Minute, nil, false, nil, events.ScanStartedData{})
+		}, 5*time.Minute, nil, nil, events.ScanStartedData{})
 		app := fiber.New(fiber.Config{})
 		app.Post("/v1/check", h.Handle)
 
@@ -180,7 +181,7 @@ func TestHandler_Handle_TimeoutOverride(t *testing.T) {
 	t.Run("timeout exceeding max is clamped", func(t *testing.T) {
 		h := New(newTestLogger(t), func(ctx context.Context, _, _ []string) ([]ContainerCheck, error) {
 			return []ContainerCheck{}, nil
-		}, 2*time.Minute, nil, false, nil, events.ScanStartedData{})
+		}, 2*time.Minute, nil, nil, events.ScanStartedData{})
 		app := fiber.New(fiber.Config{})
 		app.Post("/v1/check", h.Handle)
 
@@ -196,7 +197,7 @@ func TestHandler_Handle_TimeoutOverride(t *testing.T) {
 	t.Run("invalid timeout is ignored", func(t *testing.T) {
 		h := New(newTestLogger(t), func(ctx context.Context, _, _ []string) ([]ContainerCheck, error) {
 			return []ContainerCheck{}, nil
-		}, 5*time.Minute, nil, false, nil, events.ScanStartedData{})
+		}, 5*time.Minute, nil, nil, events.ScanStartedData{})
 		app := fiber.New(fiber.Config{})
 		app.Post("/v1/check", h.Handle)
 
@@ -238,7 +239,7 @@ func TestHandler_Handle_EmitsEvents(t *testing.T) {
 					{Name: "c2", Image: "redis:latest", ImageID: "sha256:def", UpdateAvailable: false, Error: "registry error"},
 				}, nil
 			},
-			5*time.Minute, nil, false, b, scanStartedData,
+			5*time.Minute, nil, b, scanStartedData,
 		)
 		app := fiber.New(fiber.Config{})
 		app.Post("/v1/check", h.Handle)
@@ -287,7 +288,7 @@ func TestHandler_Handle_EmitsEvents(t *testing.T) {
 			func(_ context.Context, _, _ []string) ([]ContainerCheck, error) {
 				return nil, errors.New("docker api error")
 			},
-			5*time.Minute, nil, false, b, scanStartedData,
+			5*time.Minute, nil, b, scanStartedData,
 		)
 		app := fiber.New(fiber.Config{})
 		app.Post("/v1/check", h.Handle)
@@ -327,7 +328,7 @@ func TestHandler_Handle_EmitsEvents(t *testing.T) {
 			func(_ context.Context, _, _ []string) ([]ContainerCheck, error) {
 				return []ContainerCheck{{Name: "c1"}}, nil
 			},
-			5*time.Minute, nil, false, nil, events.ScanStartedData{},
+			5*time.Minute, nil, nil, events.ScanStartedData{},
 		)
 		app := fiber.New(fiber.Config{})
 		app.Post("/v1/check", h.Handle)
@@ -340,4 +341,52 @@ func TestHandler_Handle_EmitsEvents(t *testing.T) {
 
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
 	})
+}
+
+// TestHandler_Handle_Notifications verifies that a check holds back the
+// notifications its log lines would send until it ends. It then releases them
+// once, also when the check fails.
+func TestHandler_Handle_Notifications(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		err        error
+		name       string
+		wantStatus int
+	}{
+		{name: "check succeeds", wantStatus: http.StatusOK},
+		{name: "check fails", err: errors.New("docker error"), wantStatus: http.StatusInternalServerError},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var released int
+
+			notifier := mockCheck.NewMockNotifier(t)
+			notifier.EXPECT().HoldNotifications().Return(func() { released++ }).Once()
+
+			// The check runs while the notifier holds entries back.
+			check := func(_ context.Context, _, _ []string) ([]ContainerCheck, error) {
+				notifier.AssertNumberOfCalls(t, "HoldNotifications", 1)
+				assert.Zero(t, released, "the check's entries are released after it")
+
+				return []ContainerCheck{{Name: "c1"}}, tt.err
+			}
+
+			h := New(newTestLogger(t), check, 5*time.Minute, notifier, nil, events.ScanStartedData{})
+			app := fiber.New(fiber.Config{})
+			app.Post("/v1/check", h.Handle)
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/check", nil)
+			resp, err := app.Test(req)
+			require.NoError(t, err)
+
+			defer resp.Body.Close()
+
+			assert.Equal(t, tt.wantStatus, resp.StatusCode)
+			assert.Equal(t, 1, released, "the check releases its entries once")
+		})
+	}
 }

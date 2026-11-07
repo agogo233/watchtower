@@ -10,6 +10,7 @@ import (
 
 	containerClient "github.com/nicholas-fedor/watchtower/internal/container/client"
 	containerImage "github.com/nicholas-fedor/watchtower/internal/container/image"
+	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
@@ -23,6 +24,8 @@ type ContainerDetails struct {
 	ImageID string `json:"image_id"`
 	// Digest is the registry manifest digest (sha256:...).
 	Digest string `json:"digest"`
+	// Scope is the monitoring scope of the container.
+	Scope string `json:"scope"`
 	// Running indicates whether the container is currently running.
 	Running bool `json:"running"`
 	// Watchtower indicates whether this is the Watchtower container itself.
@@ -35,8 +38,6 @@ type ContainerDetails struct {
 	Enabled bool `json:"enabled"`
 	// Stale indicates whether the container's image is outdated.
 	Stale bool `json:"stale"`
-	// Scope is the monitoring scope of the container.
-	Scope string `json:"scope"`
 }
 
 // GetFunc returns detailed container status for all watched containers.
@@ -140,7 +141,7 @@ func GetContainerDetails(
 	filter types.Filter,
 	nameFilter,
 	imageFilter string,
-	params types.UpdateParams,
+	params updateParams.Params,
 ) ([]ContainerDetails, error) {
 	var list []types.Container
 
@@ -184,8 +185,8 @@ func GetContainerDetails(
 			ImageID:     string(c.ImageID()),
 			Running:     c.IsRunning(),
 			Watchtower:  c.IsWatchtower(),
-			MonitorOnly: c.IsMonitorOnly(params),
-			NoPull:      c.IsNoPull(params),
+			MonitorOnly: c.IsMonitorOnly(params.Policy),
+			NoPull:      c.IsNoPull(params.Policy),
 			Enabled:     enabled,
 			Stale:       c.IsStale(),
 			Scope:       scope,

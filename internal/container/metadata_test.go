@@ -2,6 +2,8 @@ package container
 
 import (
 	"bytes"
+	"math"
+	"strconv"
 	"testing"
 	"time"
 
@@ -12,7 +14,9 @@ import (
 	dockerContainer "github.com/moby/moby/api/types/container"
 
 	"github.com/nicholas-fedor/watchtower/internal/container/labels"
+	updateConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/update"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/containerfixture"
+	"github.com/nicholas-fedor/watchtower/internal/testutil/logcapture"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
@@ -184,113 +188,127 @@ func TestContainer_GetLifecyclePostUpdateCommand(t *testing.T) {
 	}
 }
 
-func TestContainer_PreUpdateTimeout(t *testing.T) {
-	tests := []struct {
-		name string
-		c    *Container
-		want int
+// TestContainer_HookTimeouts verifies the lifecycle hook timeout labels. A
+// whole number of 0 or more is used as given, where 0 runs the hook without a
+// timeout. An unset label gives the 1 minute default. A non-numeric, empty or
+// negative value also gives the default and logs a warning.
+func TestContainer_HookTimeouts(t *testing.T) {
+	t.Parallel()
+
+	hooks := []struct {
+		name    string
+		label   string
+		warning string
+		timeout func(c *Container) int
 	}{
 		{
-			name: "ValidTimeout",
-			c: &Container{
-				containerInfo: &dockerContainer.InspectResponse{
-					Name: "/test-container",
-					Config: &dockerContainer.Config{
-						Labels: map[string]string{
-							labels.LifecyclePreUpdateTimeout: "5",
-						},
-					},
-				},
-			},
-			want: 5,
+			name:    "pre-check",
+			label:   labels.LifecyclePreCheckTimeout,
+			warning: "Invalid pre-check timeout value, using default",
+			timeout: (*Container).PreCheckTimeout,
 		},
 		{
-			name: "InvalidTimeout",
-			c: &Container{
-				containerInfo: &dockerContainer.InspectResponse{
-					Name: "/test-container",
-					Config: &dockerContainer.Config{
-						Labels: map[string]string{
-							labels.LifecyclePreUpdateTimeout: "invalid",
-						},
-					},
-				},
-			},
-			want: 1,
+			name:    "post-check",
+			label:   labels.LifecyclePostCheckTimeout,
+			warning: "Invalid post-check timeout value, using default",
+			timeout: (*Container).PostCheckTimeout,
 		},
 		{
-			name: "TimeoutNotSet",
-			c: &Container{
-				containerInfo: &dockerContainer.InspectResponse{
-					Name: "/test-container",
-					Config: &dockerContainer.Config{
-						Labels: map[string]string{},
-					},
-				},
-			},
-			want: 1,
+			name:    "pre-update",
+			label:   labels.LifecyclePreUpdateTimeout,
+			warning: "Invalid pre-update timeout value, using default",
+			timeout: (*Container).PreUpdateTimeout,
+		},
+		{
+			name:    "post-update",
+			label:   labels.LifecyclePostUpdateTimeout,
+			warning: "Invalid post-update timeout value, using default",
+			timeout: (*Container).PostUpdateTimeout,
 		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := tt.c.PreUpdateTimeout()
-			assert.Equal(t, tt.want, got)
-		})
+	tests := []struct {
+		name     string
+		value    *string
+		want     int
+		wantWarn bool
+	}{
+		{name: "valid", value: new("5"), want: 5},
+		{name: "zero disables the timeout", value: new("0"), want: 0},
+		{name: "not set", value: nil, want: 1},
+		{name: "not a number", value: new("invalid"), want: 1, wantWarn: true},
+		{name: "empty", value: new(""), want: 1, wantWarn: true},
+		{name: "negative", value: new("-1"), want: 1, wantWarn: true},
+	}
+
+	for _, hook := range hooks {
+		for _, tt := range tests {
+			t.Run(hook.name+" "+tt.name, func(t *testing.T) {
+				t.Parallel()
+
+				containerLabels := map[string]string{}
+				if tt.value != nil {
+					containerLabels[hook.label] = *tt.value
+				}
+
+				var out bytes.Buffer
+
+				log := zerolog.New(&out).Level(zerolog.WarnLevel)
+				// A fresh ID keeps the record of reported labels from hiding
+				// this case's warning behind another case or test run.
+				c := &Container{
+					containerInfo: &dockerContainer.InspectResponse{
+						ID:     containerfixture.RandomID(),
+						Name:   "/test-container",
+						Config: &dockerContainer.Config{Labels: containerLabels},
+					},
+					log: &log,
+				}
+
+				assert.Equal(t, tt.want, hook.timeout(c))
+
+				if tt.wantWarn {
+					assert.Contains(t, out.String(), hook.warning)
+				} else {
+					assert.Empty(t, out.String())
+				}
+			})
+		}
 	}
 }
 
-func TestContainer_PostUpdateTimeout(t *testing.T) {
+// Test_parseHookTimeout verifies that a hook timeout label value must be a
+// whole number of minutes of 0 or more.
+func Test_parseHookTimeout(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
-		name string
-		c    *Container
-		want int
+		name    string
+		value   string
+		want    int
+		wantErr bool
 	}{
-		{
-			name: "ValidTimeout",
-			c: &Container{
-				containerInfo: &dockerContainer.InspectResponse{
-					Name: "/test-container",
-					Config: &dockerContainer.Config{
-						Labels: map[string]string{
-							labels.LifecyclePostUpdateTimeout: "10",
-						},
-					},
-				},
-			},
-			want: 10,
-		},
-		{
-			name: "InvalidTimeout",
-			c: &Container{
-				containerInfo: &dockerContainer.InspectResponse{
-					Name: "/test-container",
-					Config: &dockerContainer.Config{
-						Labels: map[string]string{
-							labels.LifecyclePostUpdateTimeout: "invalid",
-						},
-					},
-				},
-			},
-			want: 1,
-		},
-		{
-			name: "TimeoutNotSet",
-			c: &Container{
-				containerInfo: &dockerContainer.InspectResponse{
-					Name: "/test-container",
-					Config: &dockerContainer.Config{
-						Labels: map[string]string{},
-					},
-				},
-			},
-			want: 1,
-		},
+		{name: "positive", value: "10", want: 10},
+		{name: "zero", value: "0", want: 0},
+		{name: "negative", value: "-1", wantErr: true},
+		{name: "fraction", value: "1.5", wantErr: true},
+		{name: "empty", value: "", wantErr: true},
+		{name: "longest duration", value: "153722867", want: 153722867},
+		{name: "too long for a duration", value: "153722868", wantErr: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := tt.c.PostUpdateTimeout()
+			t.Parallel()
+
+			got, err := parseHookTimeout(tt.value)
+			if tt.wantErr {
+				require.ErrorIs(t, err, errInvalidHookTimeout)
+
+				return
+			}
+
+			require.NoError(t, err)
 			assert.Equal(t, tt.want, got)
 		})
 	}
@@ -373,7 +391,7 @@ func TestContainer_Enabled(t *testing.T) {
 
 func TestContainer_IsMonitorOnly(t *testing.T) {
 	type args struct {
-		params types.UpdateParams
+		policy updateConfig.Policy
 	}
 
 	tests := []struct {
@@ -395,7 +413,7 @@ func TestContainer_IsMonitorOnly(t *testing.T) {
 				},
 			},
 			args: args{
-				params: types.UpdateParams{
+				policy: updateConfig.Policy{
 					MonitorOnly:     false,
 					LabelPrecedence: true,
 				},
@@ -415,7 +433,7 @@ func TestContainer_IsMonitorOnly(t *testing.T) {
 				},
 			},
 			args: args{
-				params: types.UpdateParams{
+				policy: updateConfig.Policy{
 					MonitorOnly:     true,
 					LabelPrecedence: false,
 				},
@@ -433,7 +451,7 @@ func TestContainer_IsMonitorOnly(t *testing.T) {
 				},
 			},
 			args: args{
-				params: types.UpdateParams{
+				policy: updateConfig.Policy{
 					MonitorOnly: false,
 				},
 			},
@@ -442,7 +460,7 @@ func TestContainer_IsMonitorOnly(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := tt.c.IsMonitorOnly(tt.args.params)
+			got := tt.c.IsMonitorOnly(tt.args.policy)
 			assert.Equal(t, tt.want, got)
 		})
 	}
@@ -450,7 +468,7 @@ func TestContainer_IsMonitorOnly(t *testing.T) {
 
 func TestContainer_IsNoPull(t *testing.T) {
 	type args struct {
-		params types.UpdateParams
+		policy updateConfig.Policy
 	}
 
 	tests := []struct {
@@ -472,7 +490,7 @@ func TestContainer_IsNoPull(t *testing.T) {
 				},
 			},
 			args: args{
-				params: types.UpdateParams{
+				policy: updateConfig.Policy{
 					NoPull:          false,
 					LabelPrecedence: true,
 				},
@@ -492,7 +510,7 @@ func TestContainer_IsNoPull(t *testing.T) {
 				},
 			},
 			args: args{
-				params: types.UpdateParams{
+				policy: updateConfig.Policy{
 					NoPull:          true,
 					LabelPrecedence: false,
 				},
@@ -510,7 +528,7 @@ func TestContainer_IsNoPull(t *testing.T) {
 				},
 			},
 			args: args{
-				params: types.UpdateParams{
+				policy: updateConfig.Policy{
 					NoPull: false,
 				},
 			},
@@ -519,7 +537,7 @@ func TestContainer_IsNoPull(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := tt.c.IsNoPull(tt.args.params)
+			got := tt.c.IsNoPull(tt.args.policy)
 			assert.Equal(t, tt.want, got)
 		})
 	}
@@ -678,74 +696,73 @@ func TestContainer_StopSignal(t *testing.T) {
 	}
 }
 
-// TestContainer_StopTimeout_WhenSet verifies StopTimeout returns the configured value.
-func TestContainer_StopTimeout_WhenSet(t *testing.T) {
-	timeout60 := 60
-	c := &Container{
-		containerInfo: &dockerContainer.InspectResponse{
-			Name: "/test-container",
-			Config: &dockerContainer.Config{
-				StopTimeout: &timeout60,
-				Labels:      map[string]string{},
+// TestContainer_StopTimeout verifies that a stop timeout of 0 or more set on
+// the container takes precedence, and that a missing timeout, missing inspect
+// data, and a timeout of -1 (wait indefinitely) use the fallback. A stop
+// timeout too long for a duration saturates instead of overflowing.
+func TestContainer_StopTimeout(t *testing.T) {
+	t.Parallel()
+
+	const fallback = 45 * time.Second
+
+	// largestStopTimeout is how long a stop waits for a container stop timeout
+	// of the largest int. A 64-bit int of seconds is too long for a duration,
+	// so it saturates. A 32-bit int of seconds fits.
+	largestStopTimeout := time.Duration(math.MaxInt64)
+	if strconv.IntSize == 32 {
+		largestStopTimeout = math.MaxInt32 * time.Second
+	}
+
+	// withStopTimeout returns a container whose config sets the given stop
+	// timeout in seconds.
+	withStopTimeout := func(seconds int) *Container {
+		return &Container{
+			containerInfo: &dockerContainer.InspectResponse{
+				Name: "/test-container",
+				Config: &dockerContainer.Config{
+					StopTimeout: &seconds,
+					Labels:      map[string]string{},
+				},
 			},
-		},
+		}
 	}
 
-	got := c.StopTimeout()
-	assert.NotNil(t, got)
-	assert.Equal(t, timeout60, *got)
-}
-
-// TestContainer_StopTimeout_WhenSetToZero verifies StopTimeout returns zero when configured as zero.
-func TestContainer_StopTimeout_WhenSetToZero(t *testing.T) {
-	timeout0 := 0
-	c := &Container{
-		containerInfo: &dockerContainer.InspectResponse{
-			Name: "/test-container",
-			Config: &dockerContainer.Config{
-				StopTimeout: &timeout0,
-				Labels:      map[string]string{},
+	tests := []struct {
+		name string
+		c    *Container
+		want time.Duration
+	}{
+		{name: "set", c: withStopTimeout(60), want: time.Minute},
+		{name: "set to zero", c: withStopTimeout(0), want: 0},
+		{name: "set to wait indefinitely", c: withStopTimeout(-1), want: fallback},
+		{name: "set to the largest int", c: withStopTimeout(math.MaxInt), want: largestStopTimeout},
+		{
+			name: "not set",
+			c: &Container{
+				containerInfo: &dockerContainer.InspectResponse{
+					Name:   "/test-container",
+					Config: &dockerContainer.Config{Labels: map[string]string{}},
+				},
 			},
+			want: fallback,
+		},
+		{name: "no inspect data", c: &Container{containerInfo: nil}, want: fallback},
+		{
+			name: "no config",
+			c: &Container{
+				containerInfo: &dockerContainer.InspectResponse{Name: "/test-container", Config: nil},
+			},
+			want: fallback,
 		},
 	}
 
-	got := c.StopTimeout()
-	assert.NotNil(t, got)
-	assert.Equal(t, timeout0, *got)
-}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-// TestContainer_StopTimeout_WhenNotSet verifies StopTimeout returns nil when not configured.
-func TestContainer_StopTimeout_WhenNotSet(t *testing.T) {
-	c := &Container{
-		containerInfo: &dockerContainer.InspectResponse{
-			Name:   "/test-container",
-			Config: &dockerContainer.Config{Labels: map[string]string{}},
-		},
+			assert.Equal(t, tt.want, tt.c.StopTimeout(fallback))
+		})
 	}
-
-	got := c.StopTimeout()
-	assert.Nil(t, got)
-}
-
-// TestContainer_StopTimeout_NilContainerInfo verifies StopTimeout returns nil for nil containerInfo.
-func TestContainer_StopTimeout_NilContainerInfo(t *testing.T) {
-	c := &Container{containerInfo: nil}
-
-	got := c.StopTimeout()
-	assert.Nil(t, got)
-}
-
-// TestContainer_StopTimeout_NilConfig verifies StopTimeout returns nil for nil Config.
-func TestContainer_StopTimeout_NilConfig(t *testing.T) {
-	c := &Container{
-		containerInfo: &dockerContainer.InspectResponse{
-			Name:   "/test-container",
-			Config: nil,
-		},
-	}
-
-	got := c.StopTimeout()
-	assert.Nil(t, got)
 }
 
 func TestContainsWatchtowerLabel(t *testing.T) {
@@ -1004,182 +1021,70 @@ func TestContainer_getBoolLabelValue(t *testing.T) {
 	}
 }
 
-func TestContainer_GetLifecycleUID(t *testing.T) {
-	tests := []struct {
-		name  string
-		c     *Container
-		want  int
-		want1 bool
-	}{
-		{
-			name: "UIDSet",
-			c: &Container{
-				containerInfo: &dockerContainer.InspectResponse{
-					Name: "/test-container",
-					Config: &dockerContainer.Config{
-						Labels: map[string]string{
-							labels.LifecycleUID: "1000",
-						},
-					},
-				},
-			},
-			want:  1000,
-			want1: true,
-		},
-		{
-			name: "UIDNotSet",
-			c: &Container{
-				containerInfo: &dockerContainer.InspectResponse{
-					Name: "/test-container",
-					Config: &dockerContainer.Config{
-						Labels: map[string]string{},
-					},
-				},
-			},
-			want:  0,
-			want1: false,
-		},
-		{
-			name: "InvalidUID",
-			c: &Container{
-				containerInfo: &dockerContainer.InspectResponse{
-					Name: "/test-container",
-					Config: &dockerContainer.Config{
-						Labels: map[string]string{
-							labels.LifecycleUID: "invalid",
-						},
-					},
-				},
-			},
-			want:  0,
-			want1: false,
-		},
-		{
-			name: "NegativeUID",
-			c: &Container{
-				containerInfo: &dockerContainer.InspectResponse{
-					Name: "/test-container",
-					Config: &dockerContainer.Config{
-						Labels: map[string]string{
-							labels.LifecycleUID: "-1",
-						},
-					},
-				},
-			},
-			want:  0,
-			want1: false,
-		},
-		{
-			name: "TooLargeUID",
-			c: &Container{
-				containerInfo: &dockerContainer.InspectResponse{
-					Name: "/test-container",
-					Config: &dockerContainer.Config{
-						Labels: map[string]string{
-							labels.LifecycleUID: "3000000000",
-						},
-					},
-				},
-			},
-			want:  0,
-			want1: false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, got1 := tt.c.GetLifecycleUID()
-			assert.Equal(t, tt.want, got)
-			assert.Equal(t, tt.want1, got1)
-		})
-	}
-}
+// TestContainer_LifecycleUser verifies that each lifecycle hook ID comes from
+// its label when the label holds a valid ID, and from the configured default
+// when the label is unset, not a number, negative or above the maximum.
+func TestContainer_LifecycleUser(t *testing.T) {
+	t.Parallel()
 
-func TestContainer_GetLifecycleGID(t *testing.T) {
+	const (
+		defaultUID = 500
+		defaultGID = 600
+	)
+
 	tests := []struct {
-		name  string
-		c     *Container
-		want  int
-		want1 bool
+		name    string
+		labels  map[string]string
+		wantUID int
+		wantGID int
 	}{
 		{
-			name: "GIDSet",
-			c: &Container{
-				containerInfo: &dockerContainer.InspectResponse{
-					Name: "/test-container",
-					Config: &dockerContainer.Config{
-						Labels: map[string]string{
-							labels.LifecycleGID: "1000",
-						},
-					},
-				},
-			},
-			want:  1000,
-			want1: true,
+			name:    "both labels set",
+			labels:  map[string]string{labels.LifecycleUID: "1000", labels.LifecycleGID: "1001"},
+			wantUID: 1000,
+			wantGID: 1001,
+		},
+		{name: "no labels", labels: map[string]string{}, wantUID: defaultUID, wantGID: defaultGID},
+		{
+			name:    "UID label only",
+			labels:  map[string]string{labels.LifecycleUID: "0"},
+			wantUID: 0,
+			wantGID: defaultGID,
 		},
 		{
-			name: "GIDNotSet",
-			c: &Container{
-				containerInfo: &dockerContainer.InspectResponse{
-					Name: "/test-container",
-					Config: &dockerContainer.Config{
-						Labels: map[string]string{},
-					},
-				},
-			},
-			want:  0,
-			want1: false,
+			name:    "UID that is not a number",
+			labels:  map[string]string{labels.LifecycleUID: "invalid", labels.LifecycleGID: "1001"},
+			wantUID: defaultUID,
+			wantGID: 1001,
 		},
 		{
-			name: "InvalidGID",
-			c: &Container{
-				containerInfo: &dockerContainer.InspectResponse{
-					Name: "/test-container",
-					Config: &dockerContainer.Config{
-						Labels: map[string]string{
-							labels.LifecycleGID: "invalid",
-						},
-					},
-				},
-			},
-			want:  0,
-			want1: false,
+			name:    "negative GID",
+			labels:  map[string]string{labels.LifecycleGID: "-100"},
+			wantUID: defaultUID,
+			wantGID: defaultGID,
 		},
 		{
-			name: "NegativeGID",
-			c: &Container{
-				containerInfo: &dockerContainer.InspectResponse{
-					Name: "/test-container",
-					Config: &dockerContainer.Config{
-						Labels: map[string]string{
-							labels.LifecycleGID: "-100",
-						},
-					},
-				},
-			},
-			want:  0,
-			want1: false,
-		},
-		{
-			name: "TooLargeGID",
-			c: &Container{
-				containerInfo: &dockerContainer.InspectResponse{
-					Name: "/test-container",
-					Config: &dockerContainer.Config{
-						Labels: map[string]string{
-							labels.LifecycleGID: "5000000000",
-						},
-					},
-				},
-			},
-			want:  0,
-			want1: false,
+			name:    "IDs above the maximum",
+			labels:  map[string]string{labels.LifecycleUID: "3000000000", labels.LifecycleGID: "5000000000"},
+			wantUID: defaultUID,
+			wantGID: defaultGID,
 		},
 	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, got1 := tt.c.GetLifecycleGID()
-			assert.Equal(t, tt.want, got)
-			assert.Equal(t, tt.want1, got1)
+			t.Parallel()
+
+			c := &Container{
+				containerInfo: &dockerContainer.InspectResponse{
+					Name:   "/test-container",
+					Config: &dockerContainer.Config{Labels: tt.labels},
+				},
+			}
+
+			uid, gid := c.LifecycleUser(defaultUID, defaultGID)
+			assert.Equal(t, tt.wantUID, uid)
+			assert.Equal(t, tt.wantGID, gid)
 		})
 	}
 }
@@ -1280,6 +1185,150 @@ func TestContainer_getContainerOrGlobalBool(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+// TestContainer_InvalidLabelsWarnOnce verifies that an invalid label value is
+// logged as a warning, which notifications include, on the first read for a
+// container, and at debug level on later reads. Each label is read on every
+// scan, hook run or API request, so a lasting misconfiguration would otherwise
+// notify every time. Another container with the same label warns again, and a
+// problem is warned about once, not by two log lines.
+func TestContainer_InvalidLabelsWarnOnce(t *testing.T) {
+	t.Parallel()
+
+	// aboveMaximumUID is the warning for a UID of 3000000000. A 64-bit int
+	// holds it, so it fails the range check. It overflows a 32-bit int, so
+	// parsing fails first there.
+	aboveMaximumUID := "Invalid lifecycle UID value: exceeds maximum reasonable value"
+	if strconv.IntSize == 32 {
+		aboveMaximumUID = "Invalid lifecycle UID value: not a valid integer"
+	}
+
+	tests := []struct {
+		name    string
+		labels  map[string]string
+		message string
+		read    func(c *Container)
+	}{
+		{
+			name:    "hook timeout",
+			labels:  map[string]string{labels.LifecyclePreCheckTimeout: "1.5"},
+			message: "Invalid pre-check timeout value, using default",
+			read:    func(c *Container) { c.PreCheckTimeout() },
+		},
+		{
+			name:    "lifecycle UID that is not a number",
+			labels:  map[string]string{labels.LifecycleUID: "root"},
+			message: "Invalid lifecycle UID value: not a valid integer",
+			read:    func(c *Container) { c.LifecycleUser(0, 0) },
+		},
+		{
+			name:    "negative lifecycle GID",
+			labels:  map[string]string{labels.LifecycleGID: "-1"},
+			message: "Invalid lifecycle GID value: must be non-negative",
+			read:    func(c *Container) { c.LifecycleUser(0, 0) },
+		},
+		{
+			name:    "lifecycle UID above the maximum",
+			labels:  map[string]string{labels.LifecycleUID: "3000000000"},
+			message: aboveMaximumUID,
+			read:    func(c *Container) { c.LifecycleUser(0, 0) },
+		},
+		{
+			name:    "enable label",
+			labels:  map[string]string{labels.Enable: "yes please"},
+			message: "Invalid enable label value",
+			read:    func(c *Container) { c.Enabled() },
+		},
+		{
+			name:    "cooldown delay",
+			labels:  map[string]string{labels.CooldownDelay: "soon"},
+			message: "Failed to parse cooldown-delay label, using global value",
+			read:    func(c *Container) { c.CooldownDelay(updateConfig.Policy{}) },
+		},
+		{
+			name:    "boolean label",
+			labels:  map[string]string{labels.MonitorOnly: "maybe"},
+			message: "Failed to parse label value",
+			read:    func(c *Container) { c.IsMonitorOnly(updateConfig.Policy{}) },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Fresh IDs per run keep the process-wide record of reported
+			// labels from carrying over between test runs.
+			first := &Container{
+				containerInfo: &dockerContainer.InspectResponse{
+					ID:     containerfixture.RandomID(),
+					Name:   "/first",
+					Config: &dockerContainer.Config{Labels: tt.labels},
+				},
+			}
+			second := &Container{
+				containerInfo: &dockerContainer.InspectResponse{
+					ID:     containerfixture.RandomID(),
+					Name:   "/second",
+					Config: &dockerContainer.Config{Labels: tt.labels},
+				},
+			}
+
+			firstRead := readLabelLogs(first, tt.read)
+			assert.Equal(t, []string{tt.message}, logcapture.Messages(t, firstRead, "warn"))
+
+			laterRead := readLabelLogs(first, tt.read)
+			assert.Empty(t, logcapture.Messages(t, laterRead, "warn"))
+			assert.Contains(t, logcapture.Messages(t, laterRead, "debug"), tt.message)
+
+			otherContainer := readLabelLogs(second, tt.read)
+			assert.Equal(t, []string{tt.message}, logcapture.Messages(t, otherContainer, "warn"))
+		})
+	}
+}
+
+// TestContainer_InvalidLabelsWarnOncePerLabel verifies that one container
+// warns about each of its invalid labels, since a reported label does not hide
+// a different one. A label read again after its warning is logged at debug.
+func TestContainer_InvalidLabelsWarnOncePerLabel(t *testing.T) {
+	t.Parallel()
+
+	const (
+		uidWarning = "Invalid lifecycle UID value: not a valid integer"
+		gidWarning = "Invalid lifecycle GID value: not a valid integer"
+	)
+
+	// A fresh ID per run keeps the process-wide record of reported labels
+	// from carrying over between test runs.
+	c := &Container{
+		containerInfo: &dockerContainer.InspectResponse{
+			ID:   containerfixture.RandomID(),
+			Name: "/app",
+			Config: &dockerContainer.Config{Labels: map[string]string{
+				labels.LifecycleUID: "root",
+				labels.LifecycleGID: "wheel",
+			}},
+		},
+	}
+	readUser := func(c *Container) { c.LifecycleUser(0, 0) }
+
+	assert.Equal(t, []string{uidWarning, gidWarning}, logcapture.Messages(t, readLabelLogs(c, readUser), "warn"))
+
+	laterRead := readLabelLogs(c, readUser)
+	assert.Empty(t, logcapture.Messages(t, laterRead, "warn"))
+	assert.Subset(t, logcapture.Messages(t, laterRead, "debug"), []string{uidWarning, gidWarning})
+}
+
+// readLabelLogs runs read on c with a debug-level JSON logger and returns
+// what it logged.
+func readLabelLogs(c *Container, read func(c *Container)) string {
+	log, out := logcapture.NewJSON(zerolog.DebugLevel)
+	c.log = log
+
+	read(c)
+
+	return out.String()
 }
 
 func TestContainer_GetContainerChain(t *testing.T) {
@@ -1441,7 +1490,7 @@ func cooldownTestContainer(labelValue *string) *Container {
 
 func TestContainer_CooldownDelay(t *testing.T) {
 	type args struct {
-		params types.UpdateParams
+		policy updateConfig.Policy
 	}
 
 	strPtr := func(s string) *string { return &s }
@@ -1456,7 +1505,7 @@ func TestContainer_CooldownDelay(t *testing.T) {
 			name: "NoLabelUsesGlobal",
 			c:    cooldownTestContainer(nil),
 			args: args{
-				params: types.UpdateParams{
+				policy: updateConfig.Policy{
 					CooldownDelay: 10 * time.Minute,
 				},
 			},
@@ -1466,7 +1515,7 @@ func TestContainer_CooldownDelay(t *testing.T) {
 			name: "LabelOverridesGlobal",
 			c:    cooldownTestContainer(strPtr("24h")),
 			args: args{
-				params: types.UpdateParams{
+				policy: updateConfig.Policy{
 					CooldownDelay: 10 * time.Minute,
 				},
 			},
@@ -1476,7 +1525,7 @@ func TestContainer_CooldownDelay(t *testing.T) {
 			name: "LabelZeroDisables",
 			c:    cooldownTestContainer(strPtr("0")),
 			args: args{
-				params: types.UpdateParams{
+				policy: updateConfig.Policy{
 					CooldownDelay: 10 * time.Minute,
 				},
 			},
@@ -1486,7 +1535,7 @@ func TestContainer_CooldownDelay(t *testing.T) {
 			name: "ExtendedUnitsDays",
 			c:    cooldownTestContainer(strPtr("3d")),
 			args: args{
-				params: types.UpdateParams{
+				policy: updateConfig.Policy{
 					CooldownDelay: 10 * time.Minute,
 				},
 			},
@@ -1496,7 +1545,7 @@ func TestContainer_CooldownDelay(t *testing.T) {
 			name: "InvalidLabelFallsBackToGlobal",
 			c:    cooldownTestContainer(strPtr("invalid")),
 			args: args{
-				params: types.UpdateParams{
+				policy: updateConfig.Policy{
 					CooldownDelay: 10 * time.Minute,
 				},
 			},
@@ -1506,7 +1555,7 @@ func TestContainer_CooldownDelay(t *testing.T) {
 			name: "EmptyLabelFallsBackToGlobal",
 			c:    cooldownTestContainer(strPtr("")),
 			args: args{
-				params: types.UpdateParams{
+				policy: updateConfig.Policy{
 					CooldownDelay: 10 * time.Minute,
 				},
 			},
@@ -1516,7 +1565,7 @@ func TestContainer_CooldownDelay(t *testing.T) {
 			name: "NegativeLabelFallsBackToGlobal",
 			c:    cooldownTestContainer(strPtr("-1h")),
 			args: args{
-				params: types.UpdateParams{
+				policy: updateConfig.Policy{
 					CooldownDelay: 10 * time.Minute,
 				},
 			},
@@ -1525,7 +1574,7 @@ func TestContainer_CooldownDelay(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := tt.c.CooldownDelay(tt.args.params)
+			got := tt.c.CooldownDelay(tt.args.policy)
 			assert.Equal(t, tt.want, got)
 		})
 	}
@@ -1807,6 +1856,109 @@ func TestIsSuperseded(t *testing.T) {
 			t.Parallel()
 
 			assert.Equal(t, tt.want, IsSuperseded(tt.container))
+		})
+	}
+}
+
+// TestNormalizedScope verifies that an unset, empty, or "none" scope label is
+// the scope "none", and that any other value is kept.
+func TestNormalizedScope(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		labels map[string]string
+		want   string
+	}{
+		{name: "no scope label", labels: map[string]string{}, want: "none"},
+		{name: "empty scope label", labels: map[string]string{labels.Scope: ""}, want: "none"},
+		{name: "none scope label", labels: map[string]string{labels.Scope: "none"}, want: "none"},
+		{name: "named scope", labels: map[string]string{labels.Scope: "prod"}, want: "prod"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			c := MockContainer(containerfixture.WithLabels(tt.labels))
+
+			assert.Equal(t, tt.want, c.NormalizedScope())
+		})
+	}
+}
+
+// TestIsOrphanedReplacement verifies which containers count as replacements
+// that an interrupted self-update left in the created state. Only a created
+// Watchtower container in the current container's scope counts, unless it is
+// the current container or a renamed predecessor. An unset scope label and an
+// empty one are the same scope.
+func TestIsOrphanedReplacement(t *testing.T) {
+	t.Parallel()
+
+	created := containerfixture.WithContainerState(dockerContainer.State{Status: dockerContainer.StateCreated})
+	running := containerfixture.WithContainerState(dockerContainer.State{Status: dockerContainer.StateRunning, Running: true})
+	watchtower := func(scope string) containerfixture.Update {
+		containerLabels := map[string]string{labels.Watchtower: "true"}
+		if scope != "" {
+			containerLabels[labels.Scope] = scope
+		}
+
+		return containerfixture.WithLabels(containerLabels)
+	}
+
+	current := MockContainer(containerfixture.WithID("current"), containerfixture.WithName("/watchtower"), running,
+		watchtower(""))
+
+	tests := []struct {
+		name      string
+		candidate types.Container
+		want      bool
+	}{
+		{
+			name:      "created Watchtower container in the same scope",
+			candidate: MockContainer(containerfixture.WithID("new"), containerfixture.WithName("/watchtower-new"), created, watchtower("")),
+			want:      true,
+		},
+		{
+			name: "empty scope label matches an unset one",
+			candidate: MockContainer(containerfixture.WithID("new"), containerfixture.WithName("/watchtower-new"), created,
+				containerfixture.WithLabels(map[string]string{labels.Watchtower: "true", labels.Scope: ""})),
+			want: true,
+		},
+		{
+			name:      "different scope",
+			candidate: MockContainer(containerfixture.WithID("new"), containerfixture.WithName("/watchtower-new"), created, watchtower("prod")),
+			want:      false,
+		},
+		{
+			name:      "not created",
+			candidate: MockContainer(containerfixture.WithID("new"), containerfixture.WithName("/watchtower-new"), running, watchtower("")),
+			want:      false,
+		},
+		{
+			name: "not a Watchtower container",
+			candidate: MockContainer(containerfixture.WithID("new"), containerfixture.WithName("/app"), created,
+				containerfixture.WithLabels(map[string]string{})),
+			want: false,
+		},
+		{
+			name: "renamed predecessor",
+			candidate: MockContainer(containerfixture.WithID("old"), containerfixture.WithName("/watchtower-old-abc123"), created,
+				watchtower("")),
+			want: false,
+		},
+		{
+			name:      "the current container",
+			candidate: MockContainer(containerfixture.WithID("current"), containerfixture.WithName("/watchtower"), created, watchtower("")),
+			want:      false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, tt.want, IsOrphanedReplacement(tt.candidate, current))
 		})
 	}
 }

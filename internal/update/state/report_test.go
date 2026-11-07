@@ -4,28 +4,31 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 	mockTypes "github.com/nicholas-fedor/watchtower/pkg/types/mocks"
 )
 
-func Test_report_Scanned(t *testing.T) {
+func TestReport_Scanned(t *testing.T) {
 	tests := []struct {
 		name string
-		r    *report
+		r    *Report
 		want []types.ContainerReport
 	}{
 		{
 			name: "empty report",
-			r:    &report{scanned: []types.ContainerReport{}},
+			r:    &Report{scanned: []types.ContainerReport{}},
 			want: []types.ContainerReport{},
 		},
 		{
 			name: "single scanned container",
-			r: func() *report {
+			r: func() *Report {
 				mock := mockTypes.NewMockContainerReport(t)
 				mock.EXPECT().ID().Return(types.ContainerID("cont1"))
 				// Only expect ID() since that's all we check
-				return &report{scanned: []types.ContainerReport{mock}}
+				return &Report{scanned: []types.ContainerReport{mock}}
 			}(),
 			want: []types.ContainerReport{
 				func() types.ContainerReport {
@@ -60,24 +63,24 @@ func Test_report_Scanned(t *testing.T) {
 	}
 }
 
-func Test_report_Updated(t *testing.T) {
+func TestReport_Updated(t *testing.T) {
 	tests := []struct {
 		name string
-		r    *report
+		r    *Report
 		want []types.ContainerReport
 	}{
 		{
 			name: "empty report",
-			r:    &report{updated: []types.ContainerReport{}},
+			r:    &Report{updated: []types.ContainerReport{}},
 			want: []types.ContainerReport{},
 		},
 		{
 			name: "single updated container",
-			r: func() *report {
+			r: func() *Report {
 				mock := mockTypes.NewMockContainerReport(t)
 				mock.EXPECT().ID().Return(types.ContainerID("cont2"))
 
-				return &report{updated: []types.ContainerReport{mock}}
+				return &Report{updated: []types.ContainerReport{mock}}
 			}(),
 			want: []types.ContainerReport{
 				func() types.ContainerReport {
@@ -112,24 +115,24 @@ func Test_report_Updated(t *testing.T) {
 	}
 }
 
-func Test_report_Failed(t *testing.T) {
+func TestReport_Failed(t *testing.T) {
 	tests := []struct {
 		name string
-		r    *report
+		r    *Report
 		want []types.ContainerReport
 	}{
 		{
 			name: "empty report",
-			r:    &report{failed: []types.ContainerReport{}},
+			r:    &Report{failed: []types.ContainerReport{}},
 			want: []types.ContainerReport{},
 		},
 		{
 			name: "single failed container",
-			r: func() *report {
+			r: func() *Report {
 				mock := mockTypes.NewMockContainerReport(t)
 				mock.EXPECT().ID().Return(types.ContainerID("cont3"))
 
-				return &report{failed: []types.ContainerReport{mock}}
+				return &Report{failed: []types.ContainerReport{mock}}
 			}(),
 			want: []types.ContainerReport{
 				func() types.ContainerReport {
@@ -164,24 +167,24 @@ func Test_report_Failed(t *testing.T) {
 	}
 }
 
-func Test_report_Skipped(t *testing.T) {
+func TestReport_Skipped(t *testing.T) {
 	tests := []struct {
 		name string
-		r    *report
+		r    *Report
 		want []types.ContainerReport
 	}{
 		{
 			name: "empty report",
-			r:    &report{skipped: []types.ContainerReport{}},
+			r:    &Report{skipped: []types.ContainerReport{}},
 			want: []types.ContainerReport{},
 		},
 		{
 			name: "single skipped container",
-			r: func() *report {
+			r: func() *Report {
 				mock := mockTypes.NewMockContainerReport(t)
 				mock.EXPECT().ID().Return(types.ContainerID("cont4"))
 
-				return &report{skipped: []types.ContainerReport{mock}}
+				return &Report{skipped: []types.ContainerReport{mock}}
 			}(),
 			want: []types.ContainerReport{
 				func() types.ContainerReport {
@@ -216,24 +219,24 @@ func Test_report_Skipped(t *testing.T) {
 	}
 }
 
-func Test_report_Stale(t *testing.T) {
+func TestReport_Stale(t *testing.T) {
 	tests := []struct {
 		name string
-		r    *report
+		r    *Report
 		want []types.ContainerReport
 	}{
 		{
 			name: "empty report",
-			r:    &report{stale: []types.ContainerReport{}},
+			r:    &Report{stale: []types.ContainerReport{}},
 			want: []types.ContainerReport{},
 		},
 		{
 			name: "single stale container",
-			r: func() *report {
+			r: func() *Report {
 				mock := mockTypes.NewMockContainerReport(t)
 				mock.EXPECT().ID().Return(types.ContainerID("cont5"))
 
-				return &report{stale: []types.ContainerReport{mock}}
+				return &Report{stale: []types.ContainerReport{mock}}
 			}(),
 			want: []types.ContainerReport{
 				func() types.ContainerReport {
@@ -268,24 +271,24 @@ func Test_report_Stale(t *testing.T) {
 	}
 }
 
-func Test_report_Fresh(t *testing.T) {
+func TestReport_Fresh(t *testing.T) {
 	tests := []struct {
 		name string
-		r    *report
+		r    *Report
 		want []types.ContainerReport
 	}{
 		{
 			name: "empty report",
-			r:    &report{fresh: []types.ContainerReport{}},
+			r:    &Report{fresh: []types.ContainerReport{}},
 			want: []types.ContainerReport{},
 		},
 		{
 			name: "single fresh container",
-			r: func() *report {
+			r: func() *Report {
 				mock := mockTypes.NewMockContainerReport(t)
 				mock.EXPECT().ID().Return(types.ContainerID("cont6"))
 
-				return &report{fresh: []types.ContainerReport{mock}}
+				return &Report{fresh: []types.ContainerReport{mock}}
 			}(),
 			want: []types.ContainerReport{
 				func() types.ContainerReport {
@@ -320,24 +323,24 @@ func Test_report_Fresh(t *testing.T) {
 	}
 }
 
-func Test_report_Restarted(t *testing.T) {
+func TestReport_Restarted(t *testing.T) {
 	tests := []struct {
 		name string
-		r    *report
+		r    *Report
 		want []types.ContainerReport
 	}{
 		{
 			name: "empty report",
-			r:    &report{restarted: []types.ContainerReport{}},
+			r:    &Report{restarted: []types.ContainerReport{}},
 			want: []types.ContainerReport{},
 		},
 		{
 			name: "single restarted container",
-			r: func() *report {
+			r: func() *Report {
 				mock := mockTypes.NewMockContainerReport(t)
 				mock.EXPECT().ID().Return(types.ContainerID("cont7"))
 
-				return &report{restarted: []types.ContainerReport{mock}}
+				return &Report{restarted: []types.ContainerReport{mock}}
 			}(),
 			want: []types.ContainerReport{
 				func() types.ContainerReport {
@@ -350,14 +353,14 @@ func Test_report_Restarted(t *testing.T) {
 		},
 		{
 			name: "multiple restarted containers",
-			r: func() *report {
+			r: func() *Report {
 				mock1 := mockTypes.NewMockContainerReport(t)
 				mock1.EXPECT().ID().Return(types.ContainerID("cont8"))
 
 				mock2 := mockTypes.NewMockContainerReport(t)
 				mock2.EXPECT().ID().Return(types.ContainerID("cont9"))
 
-				return &report{restarted: []types.ContainerReport{mock1, mock2}}
+				return &Report{restarted: []types.ContainerReport{mock1, mock2}}
 			}(),
 			want: []types.ContainerReport{
 				func() types.ContainerReport {
@@ -398,20 +401,20 @@ func Test_report_Restarted(t *testing.T) {
 	}
 }
 
-func Test_report_All(t *testing.T) {
+func TestReport_All(t *testing.T) {
 	tests := []struct {
 		name string
-		r    *report
+		r    *Report
 		want []string
 	}{
 		{
 			name: "empty report",
-			r:    &report{},
+			r:    &Report{},
 			want: []string{},
 		},
 		{
 			name: "mixed containers with deduplication",
-			r: func() *report {
+			r: func() *Report {
 				mock1 := mockTypes.NewMockContainerReport(t)
 				// No strict expectation. Allow calls without failing if unmet
 				mock1.EXPECT().ID().Return(types.ContainerID("cont1")).Times(0)
@@ -419,7 +422,7 @@ func Test_report_All(t *testing.T) {
 				mock2 := mockTypes.NewMockContainerReport(t)
 				mock2.EXPECT().ID().Return(types.ContainerID("cont2")).Times(0)
 
-				return &report{
+				return &Report{
 					updated: []types.ContainerReport{mock1},
 					scanned: []types.ContainerReport{mock1, mock2},
 				}
@@ -428,7 +431,7 @@ func Test_report_All(t *testing.T) {
 		},
 		{
 			name: "containers with restarted priority",
-			r: func() *report {
+			r: func() *Report {
 				mock1 := mockTypes.NewMockContainerReport(t)
 				mock1.EXPECT().ID().Return(types.ContainerID("cont1")).Times(0)
 
@@ -438,7 +441,7 @@ func Test_report_All(t *testing.T) {
 				mock3 := mockTypes.NewMockContainerReport(t)
 				mock3.EXPECT().ID().Return(types.ContainerID("cont3")).Times(0)
 
-				return &report{
+				return &Report{
 					updated:   []types.ContainerReport{mock1},
 					restarted: []types.ContainerReport{mock2},
 					failed:    []types.ContainerReport{mock3},
@@ -469,6 +472,72 @@ func Test_report_All(t *testing.T) {
 	}
 }
 
+// TestReport_AllKeepsMostSignificant verifies that All keeps the entry from
+// the most significant category when two entries share a container ID.
+func TestReport_AllKeepsMostSignificant(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		// moreSignificant and lessSignificant set the two lists that hold an
+		// entry with the same container ID.
+		moreSignificant, lessSignificant func(r *Report, entry types.ContainerReport)
+	}{
+		{
+			name:            "updated over restarted",
+			moreSignificant: func(r *Report, e types.ContainerReport) { r.updated = []types.ContainerReport{e} },
+			lessSignificant: func(r *Report, e types.ContainerReport) { r.restarted = []types.ContainerReport{e} },
+		},
+		{
+			name:            "restarted over failed",
+			moreSignificant: func(r *Report, e types.ContainerReport) { r.restarted = []types.ContainerReport{e} },
+			lessSignificant: func(r *Report, e types.ContainerReport) { r.failed = []types.ContainerReport{e} },
+		},
+		{
+			name:            "failed over scanned",
+			moreSignificant: func(r *Report, e types.ContainerReport) { r.failed = []types.ContainerReport{e} },
+			lessSignificant: func(r *Report, e types.ContainerReport) { r.scanned = []types.ContainerReport{e} },
+		},
+		{
+			name:            "fresh over scanned",
+			moreSignificant: func(r *Report, e types.ContainerReport) { r.fresh = []types.ContainerReport{e} },
+			lessSignificant: func(r *Report, e types.ContainerReport) { r.scanned = []types.ContainerReport{e} },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			kept := &ContainerStatus{containerID: "cont1", containerName: "kept"}
+			dropped := &ContainerStatus{containerID: "cont1", containerName: "dropped"}
+
+			report := &Report{}
+			tt.moreSignificant(report, kept)
+			tt.lessSignificant(report, dropped)
+
+			all := report.All()
+			require.Len(t, all, 1)
+			assert.Same(t, kept, all[0])
+		})
+	}
+}
+
+// TestReport_Focus verifies that a split report returns the container it is
+// about and that the report of a whole session has no focus.
+func TestReport_Focus(t *testing.T) {
+	t.Parallel()
+
+	updated := &ContainerStatus{containerID: "cont1", containerName: "updated", state: UpdatedState}
+	session := &Report{
+		scanned: []types.ContainerReport{updated},
+		updated: []types.ContainerReport{updated},
+	}
+
+	assert.Nil(t, session.Focus())
+	assert.Same(t, updated, NewSingleContainerReport(updated, session).Focus())
+}
+
 func TestNewReport(t *testing.T) {
 	type args struct {
 		progress Progress
@@ -477,12 +546,12 @@ func TestNewReport(t *testing.T) {
 	tests := []struct {
 		name string
 		args args
-		want types.Report
+		want *Report
 	}{
 		{
 			name: "empty progress",
 			args: args{progress: Progress{}},
-			want: &report{
+			want: &Report{
 				scanned:   []types.ContainerReport{},
 				updated:   []types.ContainerReport{},
 				failed:    []types.ContainerReport{},
@@ -539,7 +608,7 @@ func TestNewReport(t *testing.T) {
 					},
 				},
 			},
-			want: &report{
+			want: &Report{
 				scanned: []types.ContainerReport{
 					&ContainerStatus{
 						state:         UpdatedState,
@@ -643,7 +712,7 @@ func TestNewReport(t *testing.T) {
 					},
 				},
 			},
-			want: &report{
+			want: &Report{
 				scanned: []types.ContainerReport{
 					&ContainerStatus{
 						state:         StaleState,
@@ -685,7 +754,7 @@ func TestNewReport(t *testing.T) {
 					},
 				},
 			},
-			want: &report{
+			want: &Report{
 				scanned: []types.ContainerReport{
 					&ContainerStatus{
 						state:         StaleState,
@@ -727,7 +796,7 @@ func TestNewReport(t *testing.T) {
 					},
 				},
 			},
-			want: &report{
+			want: &Report{
 				scanned: []types.ContainerReport{
 					&ContainerStatus{
 						state:         RestartedState,
@@ -777,7 +846,7 @@ func TestNewReport(t *testing.T) {
 					},
 				},
 			},
-			want: &report{
+			want: &Report{
 				scanned: []types.ContainerReport{
 					&ContainerStatus{
 						state:         RestartedState,
@@ -825,7 +894,7 @@ func TestNewReport(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := newReport(newTestLogger(t), tt.args.progress)
-			if !compareReports(got.(*report), tt.want.(*report)) {
+			if !compareReports(got, tt.want) {
 				t.Errorf("newReport(testLog(), ) = %+v, want %+v", got, tt.want)
 			}
 			// Explicitly exercise Stale() to ensure coverage
@@ -851,7 +920,7 @@ func TestNewReport(t *testing.T) {
 }
 
 // compareReports compares two report structs by their fields, ignoring pointer addresses.
-func compareReports(got, want *report) bool {
+func compareReports(got, want *Report) bool {
 	compareSlice := func(gotSlice, wantSlice []types.ContainerReport) bool {
 		if len(gotSlice) != len(wantSlice) {
 			return false
@@ -886,22 +955,22 @@ func compareReports(got, want *report) bool {
 
 func Test_categorizeContainer(t *testing.T) {
 	type args struct {
-		r      *report
+		r      *Report
 		update *ContainerStatus
 	}
 
 	tests := []struct {
 		name string
 		args args
-		want *report
+		want *Report
 	}{
 		{
 			name: "skipped container",
 			args: args{
-				r:      &report{},
+				r:      &Report{},
 				update: &ContainerStatus{state: SkippedState, containerID: "cont1"},
 			},
-			want: &report{
+			want: &Report{
 				skipped: []types.ContainerReport{
 					&ContainerStatus{state: SkippedState, containerID: "cont1"},
 				},
@@ -910,7 +979,7 @@ func Test_categorizeContainer(t *testing.T) {
 		{
 			name: "fresh container",
 			args: args{
-				r: &report{},
+				r: &Report{},
 				update: &ContainerStatus{
 					state:       ScannedState,
 					oldImage:    "img1",
@@ -918,7 +987,7 @@ func Test_categorizeContainer(t *testing.T) {
 					containerID: "cont2",
 				},
 			},
-			want: &report{
+			want: &Report{
 				scanned: []types.ContainerReport{
 					&ContainerStatus{
 						state:       FreshState,
@@ -940,7 +1009,7 @@ func Test_categorizeContainer(t *testing.T) {
 		{
 			name: "updated container",
 			args: args{
-				r: &report{},
+				r: &Report{},
 				update: &ContainerStatus{
 					state:       UpdatedState,
 					oldImage:    "img1",
@@ -948,7 +1017,7 @@ func Test_categorizeContainer(t *testing.T) {
 					containerID: "cont3",
 				},
 			},
-			want: &report{
+			want: &Report{
 				scanned: []types.ContainerReport{
 					&ContainerStatus{
 						state:       UpdatedState,
@@ -970,7 +1039,7 @@ func Test_categorizeContainer(t *testing.T) {
 		{
 			name: "restarted container",
 			args: args{
-				r: &report{},
+				r: &Report{},
 				update: &ContainerStatus{
 					state:       RestartedState,
 					oldImage:    "img1",
@@ -978,7 +1047,7 @@ func Test_categorizeContainer(t *testing.T) {
 					containerID: "cont4",
 				},
 			},
-			want: &report{
+			want: &Report{
 				scanned: []types.ContainerReport{
 					&ContainerStatus{
 						state:       RestartedState,
@@ -1000,7 +1069,7 @@ func Test_categorizeContainer(t *testing.T) {
 		{
 			name: "restarted container with different images",
 			args: args{
-				r: &report{},
+				r: &Report{},
 				update: &ContainerStatus{
 					state:       RestartedState,
 					oldImage:    "img1",
@@ -1008,7 +1077,7 @@ func Test_categorizeContainer(t *testing.T) {
 					containerID: "cont5",
 				},
 			},
-			want: &report{
+			want: &Report{
 				scanned: []types.ContainerReport{
 					&ContainerStatus{
 						state:       RestartedState,
@@ -1041,25 +1110,25 @@ func Test_categorizeContainer(t *testing.T) {
 
 func Test_sortCategories(t *testing.T) {
 	type args struct {
-		r *report
+		r *Report
 	}
 
 	tests := []struct {
 		name string
 		args args
-		want *report
+		want *Report
 	}{
 		{
 			name: "unsorted scanned",
 			args: args{
-				r: &report{
+				r: &Report{
 					scanned: []types.ContainerReport{
 						&ContainerStatus{containerID: "cont2"},
 						&ContainerStatus{containerID: "cont1"},
 					},
 				},
 			},
-			want: &report{
+			want: &Report{
 				scanned: []types.ContainerReport{
 					&ContainerStatus{containerID: "cont1"},
 					&ContainerStatus{containerID: "cont2"},
@@ -1069,7 +1138,7 @@ func Test_sortCategories(t *testing.T) {
 		{
 			name: "mixed unsorted",
 			args: args{
-				r: &report{
+				r: &Report{
 					updated: []types.ContainerReport{
 						&ContainerStatus{containerID: "cont3"},
 						&ContainerStatus{containerID: "cont1"},
@@ -1080,7 +1149,7 @@ func Test_sortCategories(t *testing.T) {
 					},
 				},
 			},
-			want: &report{
+			want: &Report{
 				updated: []types.ContainerReport{
 					&ContainerStatus{containerID: "cont1"},
 					&ContainerStatus{containerID: "cont3"},
@@ -1103,151 +1172,105 @@ func Test_sortCategories(t *testing.T) {
 	}
 }
 
-func Test_SortableContainers_Len(t *testing.T) {
+// TestCompareIDs verifies that compareIDs orders container reports by
+// container ID.
+func TestCompareIDs(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name string
-		s    sortableContainers
+		a, b types.ContainerID
 		want int
 	}{
-		{
-			name: "empty slice",
-			s:    sortableContainers{},
-			want: 0,
-		},
-		{
-			name: "two elements",
-			s: sortableContainers{
-				mockTypes.NewMockContainerReport(t),
-				mockTypes.NewMockContainerReport(t),
-			},
-			want: 2,
-		},
+		{name: "first ID sorts first", a: "aaa", b: "bbb", want: -1},
+		{name: "second ID sorts first", a: "bbb", b: "aaa", want: 1},
+		{name: "equal IDs", a: "aaa", b: "aaa", want: 0},
 	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.s.Len(); got != tt.want {
-				t.Errorf("sortableContainers.Len() = %v, want %v", got, tt.want)
-			}
+			t.Parallel()
+
+			a := mockTypes.NewMockContainerReport(t)
+			a.EXPECT().ID().Return(tt.a)
+
+			b := mockTypes.NewMockContainerReport(t)
+			b.EXPECT().ID().Return(tt.b)
+
+			assert.Equal(t, tt.want, compareIDs(a, b))
 		})
 	}
 }
 
-func Test_SortableContainers_Less(t *testing.T) {
-	type args struct {
-		i int
-		j int
+// TestNewSingleContainerReport verifies the context rule of split reports. The
+// updated and restarted lists hold the focus container only when the session
+// lists it there. The other lists are the session's whatever the focus.
+func TestNewSingleContainerReport(t *testing.T) {
+	t.Parallel()
+
+	updated := &ContainerStatus{containerName: "updated", state: UpdatedState}
+	restarted := &ContainerStatus{containerName: "restarted", state: RestartedState}
+	stale := &ContainerStatus{containerName: "stale", state: StaleState}
+	skipped := &ContainerStatus{containerName: "skipped", state: SkippedState}
+	failed := &ContainerStatus{containerName: "failed", state: FailedState}
+	fresh := &ContainerStatus{containerName: "fresh", state: FreshState}
+	unlisted := &ContainerStatus{containerName: "unlisted", state: UpdatedState}
+
+	session := &Report{
+		scanned:   []types.ContainerReport{updated, restarted, stale, failed, fresh},
+		updated:   []types.ContainerReport{updated},
+		restarted: []types.ContainerReport{restarted},
+		stale:     []types.ContainerReport{stale},
+		skipped:   []types.ContainerReport{skipped},
+		failed:    []types.ContainerReport{failed},
+		fresh:     []types.ContainerReport{fresh},
+	}
+
+	// withContext returns a split report about focus with the session's
+	// context lists and the given primary lists.
+	withContext := func(focus types.ContainerReport, updatedList, restartedList []types.ContainerReport) *Report {
+		return &Report{
+			focus:     focus,
+			updated:   updatedList,
+			restarted: restartedList,
+			scanned:   session.scanned,
+			failed:    session.failed,
+			skipped:   session.skipped,
+			stale:     session.stale,
+			fresh:     session.fresh,
+		}
 	}
 
 	tests := []struct {
-		name string
-		s    sortableContainers
-		args args
-		want bool
+		name  string
+		focus types.ContainerReport
+		want  *Report
 	}{
 		{
-			name: "lower ID first",
-			s: sortableContainers{
-				func() types.ContainerReport {
-					mock := mockTypes.NewMockContainerReport(t)
-					mock.EXPECT().ID().Return(types.ContainerID("cont1"))
-
-					return mock
-				}(),
-				func() types.ContainerReport {
-					mock := mockTypes.NewMockContainerReport(t)
-					mock.EXPECT().ID().Return(types.ContainerID("cont2"))
-
-					return mock
-				}(),
-			},
-			args: args{i: 0, j: 1},
-			want: true,
+			name:  "updated container",
+			focus: updated,
+			want:  withContext(updated, []types.ContainerReport{updated}, nil),
 		},
 		{
-			name: "higher ID first",
-			s: sortableContainers{
-				func() types.ContainerReport {
-					mock := mockTypes.NewMockContainerReport(t)
-					mock.EXPECT().ID().Return(types.ContainerID("cont2"))
-
-					return mock
-				}(),
-				func() types.ContainerReport {
-					mock := mockTypes.NewMockContainerReport(t)
-					mock.EXPECT().ID().Return(types.ContainerID("cont1"))
-
-					return mock
-				}(),
-			},
-			args: args{i: 0, j: 1},
-			want: false,
+			name:  "restarted container",
+			focus: restarted,
+			want:  withContext(restarted, nil, []types.ContainerReport{restarted}),
 		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.s.Less(tt.args.i, tt.args.j); got != tt.want {
-				t.Errorf("sortableContainers.Less() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-func Test_SortableContainers_Swap(t *testing.T) {
-	type args struct {
-		i int
-		j int
-	}
-
-	tests := []struct {
-		name string
-		s    sortableContainers
-		args args
-		want []string // Use IDs directly instead of mocks for want
-	}{
+		{name: "stale container", focus: stale, want: withContext(stale, nil, nil)},
+		{name: "skipped container", focus: skipped, want: withContext(skipped, nil, nil)},
 		{
-			name: "swap first and second",
-			s: sortableContainers{
-				func() types.ContainerReport {
-					mock := mockTypes.NewMockContainerReport(t)
-					// Expect 1 call in the comparison loop after swap
-					mock.EXPECT().ID().Return(types.ContainerID("cont1")).Times(1)
-
-					return mock
-				}(),
-				func() types.ContainerReport {
-					mock := mockTypes.NewMockContainerReport(t)
-					mock.EXPECT().ID().Return(types.ContainerID("cont2")).Times(1)
-
-					return mock
-				}(),
-			},
-			args: args{i: 0, j: 1},
-			want: []string{"cont2", "cont1"},
+			// The session decides the category, not the container's own state.
+			name:  "updated state the session does not list as updated",
+			focus: unlisted,
+			want:  withContext(unlisted, nil, nil),
 		},
 	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tt.s.Swap(tt.args.i, tt.args.j)
+			t.Parallel()
 
-			if len(tt.s) != len(tt.want) {
-				t.Errorf("sortableContainers.Swap() length = %d, want %d", len(tt.s), len(tt.want))
-
-				return
-			}
-
-			for i := range tt.s {
-				t.Logf("Calling ID() on s[%d]", i)
-
-				gotID := tt.s[i].ID()
-				if gotID != types.ContainerID(tt.want[i]) {
-					t.Errorf(
-						"sortableContainers.Swap()[%d].ID() = %v, want %v",
-						i,
-						gotID,
-						tt.want[i],
-					)
-				}
-			}
+			assert.Equal(t, tt.want, NewSingleContainerReport(tt.focus, session))
 		})
 	}
 }

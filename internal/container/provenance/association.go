@@ -2,11 +2,14 @@ package provenance
 
 import (
 	"cmp"
+	"fmt"
 	"strings"
 
 	"github.com/rs/zerolog"
 
 	"github.com/nicholas-fedor/watchtower/internal/container/labels"
+	"github.com/nicholas-fedor/watchtower/internal/git/semver"
+	gitConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/git"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
@@ -22,6 +25,10 @@ type Association struct {
 	Dockerfile string
 	Context    string
 
+	// invalidPolicy is the git-semver-policy label value when it names no
+	// policy. Policy then holds the mapping or default policy instead.
+	invalidPolicy string
+
 	// RefFromDefault is true when Ref came from the process default, not a
 	// label or image mapping. ApplyGitAssociation does not persist those values.
 	RefFromDefault bool
@@ -33,6 +40,29 @@ type Association struct {
 	ContextFromDefault bool
 }
 
+// Validate reports an invalid git-semver-policy or git-host label.
+//
+// The policy label is checked first. A policy label that names no policy is
+// invalid even when an image mapping supplies the policy.
+//
+// Returns:
+//   - error: Wraps [semver.ErrInvalidPolicy] or [ErrInvalidHost]. It is nil
+//     when both labels are valid or unset.
+func (a Association) Validate() error {
+	if a.invalidPolicy != "" {
+		return fmt.Errorf("%w: %s", semver.ErrInvalidPolicy, a.invalidPolicy)
+	}
+
+	if a.Host != "" {
+		_, err := ParseAPIOrigin(a.Host)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // ResolveAssociation returns the monitor association for a container.
 //
 // Highest wins: Watchtower labels, then an exact ImageName() mapping.
@@ -40,24 +70,32 @@ type Association struct {
 //
 // Parameters:
 //   - c: Container to inspect.
-//   - params: Update parameters with image mappings and defaults.
+//   - defaults: Git settings with image mappings and defaults.
 //
 // Returns:
 //   - Association: Repo, ref, policy, and user-specified build paths when associated.
 //     Dockerfile and Context are empty when unset. Callers default to Dockerfile
 //     and the repository root.
 //   - bool: True when a git-repo label or image mapping is present.
-func ResolveAssociation(c types.Container, params types.UpdateParams) (Association, bool) {
+func ResolveAssociation(c types.Container, defaults gitConfig.Defaults) (Association, bool) {
 	if c == nil {
 		return Association{}, false
 	}
 
+	rawPolicy := label(c, labels.GitSemverPolicy)
+	labelPolicy := semver.ParsePolicy(rawPolicy)
+
+	invalidPolicy := ""
+	if labelPolicy == "" {
+		invalidPolicy = rawPolicy
+	}
+
 	// Container labels win over --git-image mappings.
 	if repo := label(c, labels.GitRepo); repo != "" {
-		ref, refDefault := sourced(refLabel(c), "", defaultRef(params))
-		policy, policyDefault := sourced(policyLabel(c), "", defaultPolicy(params))
-		dockerfile, dockerfileDefault := sourced(label(c, labels.GitDockerfile), "", params.GitDockerfile)
-		context, contextDefault := sourced(label(c, labels.GitContext), "", params.GitContext)
+		ref, refDefault := sourced(refLabel(c), "", defaultRef(defaults))
+		policy, policyDefault := sourced(labelPolicy, "", defaultPolicy(defaults))
+		dockerfile, dockerfileDefault := sourced(label(c, labels.GitDockerfile), "", defaults.Dockerfile)
+		context, contextDefault := sourced(label(c, labels.GitContext), "", defaults.Context)
 
 		return Association{
 			Repo:                  repo,
@@ -66,6 +104,7 @@ func ResolveAssociation(c types.Container, params types.UpdateParams) (Associati
 			Host:                  label(c, labels.GitHost),
 			Dockerfile:            dockerfile,
 			Context:               context,
+			invalidPolicy:         invalidPolicy,
 			RefFromDefault:        refDefault,
 			PolicyFromDefault:     policyDefault,
 			DockerfileFromDefault: dockerfileDefault,
@@ -73,15 +112,15 @@ func ResolveAssociation(c types.Container, params types.UpdateParams) (Associati
 		}, true
 	}
 
-	mapping := imageMapping(c.ImageName(), params.GitImages)
+	mapping := imageMapping(c.ImageName(), defaults.Images)
 	if mapping.Repo == "" {
 		return Association{}, false
 	}
 
-	ref, refDefault := sourced("", mapping.Ref, defaultRef(params))
-	policy, policyDefault := sourced("", mapping.Policy, defaultPolicy(params))
-	dockerfile, dockerfileDefault := sourced(label(c, labels.GitDockerfile), mapping.Dockerfile, params.GitDockerfile)
-	context, contextDefault := sourced(label(c, labels.GitContext), mapping.Context, params.GitContext)
+	ref, refDefault := sourced("", mapping.Ref, defaultRef(defaults))
+	policy, policyDefault := sourced("", mapping.Policy, defaultPolicy(defaults))
+	dockerfile, dockerfileDefault := sourced(label(c, labels.GitDockerfile), mapping.Dockerfile, defaults.Dockerfile)
+	context, contextDefault := sourced(label(c, labels.GitContext), mapping.Context, defaults.Context)
 
 	return Association{
 		Repo:                  mapping.Repo,
@@ -90,6 +129,7 @@ func ResolveAssociation(c types.Container, params types.UpdateParams) (Associati
 		Host:                  label(c, labels.GitHost),
 		Dockerfile:            dockerfile,
 		Context:               context,
+		invalidPolicy:         invalidPolicy,
 		RefFromDefault:        refDefault,
 		PolicyFromDefault:     policyDefault,
 		DockerfileFromDefault: dockerfileDefault,
@@ -128,17 +168,17 @@ func sourced(primary, secondary, fallback string) (string, bool) {
 // Parameters:
 //   - log: Optional logger for the unassociated git-watch=true debug line.
 //   - c: Container to inspect.
-//   - params: Update parameters including the process-wide monitor default.
+//   - defaults: Git settings including the process-wide monitor default.
 //
 // Returns:
 //   - bool: True when Git staleness checks and rebuilds apply.
-func ShouldMonitor(log *zerolog.Logger, c types.Container, params types.UpdateParams) bool {
+func ShouldMonitor(log *zerolog.Logger, c types.Container, defaults gitConfig.Defaults) bool {
 	if c == nil || c.IsWatchtower() {
 		return false
 	}
 
-	_, associated := ResolveAssociation(c, params)
-	watch := isWatch(c, params)
+	_, associated := ResolveAssociation(c, defaults)
+	watch := isWatch(c, defaults)
 
 	// A watch override without association is a misconfig. Stay on the registry path.
 	if watch && !associated {
@@ -215,22 +255,6 @@ func refLabel(c types.Container) string {
 	return cmp.Or(label(c, labels.GitRef), label(c, labels.GitBranch))
 }
 
-// policyLabel returns a valid semver policy from the container label.
-//
-// Parameters:
-//   - c: Container to inspect.
-//
-// Returns:
-//   - string: Canonical policy, or empty when unset or invalid.
-func policyLabel(c types.Container) string {
-	policy := strings.ToLower(label(c, labels.GitSemverPolicy))
-	if types.ValidGitPolicy(policy) {
-		return policy
-	}
-
-	return ""
-}
-
 // imageMapping returns the git-image mapping for an exact ImageName() key.
 //
 // Parameters:
@@ -238,10 +262,10 @@ func policyLabel(c types.Container) string {
 //   - images: Process-wide mappings.
 //
 // Returns:
-//   - types.GitImage: Zero value when no exact key exists.
-func imageMapping(imageName string, images map[string]types.GitImage) types.GitImage {
+//   - gitConfig.Image: Zero value when no exact key exists.
+func imageMapping(imageName string, images map[string]gitConfig.Image) gitConfig.Image {
 	if images == nil || imageName == "" {
-		return types.GitImage{}
+		return gitConfig.Image{}
 	}
 
 	return images[imageName]
@@ -251,14 +275,14 @@ func imageMapping(imageName string, images map[string]types.GitImage) types.GitI
 //
 // Parameters:
 //   - c: Container to inspect.
-//   - params: Update parameters with EnableGitMonitoring.
+//   - defaults: Git settings with the process-wide monitor default.
 //
 // Returns:
 //   - bool: True when the watcher should run, ignoring association.
-func isWatch(c types.Container, params types.UpdateParams) bool {
+func isWatch(c types.Container, defaults gitConfig.Defaults) bool {
 	val, ok := c.GetLabel(labels.GitWatch)
 	if !ok || strings.TrimSpace(val) == "" {
-		return params.EnableGitMonitoring
+		return defaults.Enable
 	}
 
 	// Match Docker's loose boolean parsing used elsewhere on Watchtower labels.
@@ -268,36 +292,33 @@ func isWatch(c types.Container, params types.UpdateParams) bool {
 	case "0", "f", "false", "no":
 		return false
 	default:
-		return params.EnableGitMonitoring
+		return defaults.Enable
 	}
 }
 
 // defaultRef returns the process default ref, or main.
 //
 // Parameters:
-//   - params: Update parameters.
+//   - defaults: Git settings.
 //
 // Returns:
 //   - string: Default Git ref.
-func defaultRef(params types.UpdateParams) string {
-	if params.GitDefaultRef != "" {
-		return params.GitDefaultRef
+func defaultRef(defaults gitConfig.Defaults) string {
+	if defaults.DefaultRef != "" {
+		return defaults.DefaultRef
 	}
 
 	return "main"
 }
 
-// defaultPolicy returns the process default semver policy, or none.
+// defaultPolicy returns the process default semver policy, or none when the
+// default names no policy.
 //
 // Parameters:
-//   - params: Update parameters.
+//   - defaults: Git settings.
 //
 // Returns:
 //   - string: Canonical policy.
-func defaultPolicy(params types.UpdateParams) string {
-	if types.ValidGitPolicy(params.GitSemverPolicy) {
-		return params.GitSemverPolicy
-	}
-
-	return types.GitPolicyNone
+func defaultPolicy(defaults gitConfig.Defaults) string {
+	return cmp.Or(semver.ParsePolicy(defaults.SemverPolicy), semver.PolicyNone)
 }

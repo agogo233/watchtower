@@ -17,6 +17,8 @@ import (
 	containerClient "github.com/nicholas-fedor/watchtower/internal/container/client"
 	containerImage "github.com/nicholas-fedor/watchtower/internal/container/image"
 	"github.com/nicholas-fedor/watchtower/internal/container/labels"
+	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
+	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
@@ -35,12 +37,12 @@ const orchestratorCreateTimeout = 60 * time.Second
 // after a handoff, which runs detached from the session context.
 const predecessorImageRemovalTimeout = 30 * time.Second
 
-// orchestratorRecoveryTimeout bounds each recovery helper after a failed
-// handoff.
+// orchestratorRecoveryTimeout bounds each recovery helper that renames or
+// starts the predecessor after a failed handoff.
 //
-// Recovery runs detached from the orchestration context, so it still
-// runs after that context's deadline. The 60 seconds cover the 30 second stop
-// of a failed replacement and the calls around it.
+// Recovery runs detached from the orchestration context, so it still runs
+// after that context's deadline. The 60 seconds match the shortest bound for
+// removing a failed replacement.
 const orchestratorRecoveryTimeout = 60 * time.Second
 
 // Errors for ephemeral self-update operations in ephemeral.go.
@@ -108,7 +110,7 @@ var fullContainerIDPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 func StartOrchestrator(log *zerolog.Logger, ctx context.Context,
 	client containerClient.Client,
 	sourceContainer types.Container,
-	config types.UpdateParams,
+	config updateParams.Params,
 ) (types.ContainerID, bool, error) {
 	clogVal := log.With().
 		Str("container", sourceContainer.Name()).
@@ -173,7 +175,7 @@ func StartOrchestrator(log *zerolog.Logger, ctx context.Context,
 		Str("container", sourceContainer.Name()).
 		Str("id", sourceContainer.ID().ShortID()).
 		Str("old_image_id", sourceContainer.ImageID().ShortID()).
-		Msg("Stopping container")
+		Msg(logging.StoppingContainer)
 	log.Info().Msg("Starting new Watchtower container")
 
 	// Log that the orchestrator has been started. The orchestrator ID identifies
@@ -447,7 +449,7 @@ func orchestrateSelfUpdate(log *zerolog.Logger, ctx context.Context,
 
 	err = ensureContainerRunning(ctx, client, clog, newContainerID)
 	if err != nil {
-		cleanupFailedNewContainer(ctx, client, clog, newContainerID)
+		cleanupFailedNewContainer(ctx, client, clog, oldContainer, newContainerID)
 
 		if !oldGone {
 			restoreAndStartOldContainer(ctx, client, clog, oldContainer, originalName)
@@ -473,7 +475,7 @@ func orchestrateSelfUpdate(log *zerolog.Logger, ctx context.Context,
 	// can consume the correct "new_id" field.
 	clog.Info().
 		Str("new_id", newContainerID.ShortID()).
-		Msg("Started new container")
+		Msg(logging.StartedNewContainer)
 
 	return nil
 }
@@ -642,18 +644,28 @@ func restartOldContainer(
 //     cancellation and deadline do not.
 //   - client: Container client for Docker operations.
 //   - clog: Logger with container context fields.
+//   - oldContainer: The container the replacement was created from. The
+//     replacement has its configuration, so its stop waits as long.
 //   - newContainerID: ID of the failed replacement container to remove.
 func cleanupFailedNewContainer(
 	ctx context.Context,
 	client containerClient.Client,
 	clog *zerolog.Logger,
+	oldContainer types.Container,
 	newContainerID types.ContainerID,
 ) {
 	if newContainerID == "" {
 		return
 	}
 
-	recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), orchestratorRecoveryTimeout)
+	// A stop timeout set on the container takes precedence over the 30 seconds
+	// passed to the stop, so the bound follows the longer of the two.
+	stopParams := updateParams.Params{Timeout: orchestratorStopTimeout}
+
+	recoveryCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		stopParams.DetachedStopTimeout(oldContainer),
+	)
 	defer cancel()
 
 	failedNew, err := client.GetContainer(recoveryCtx, newContainerID)
@@ -887,6 +899,11 @@ func removeOldImage(
 
 	err := client.RemoveImageByID(cleanupCtx, imageID, imageName)
 	if err == nil {
+		clog.Info().
+			Str("image_id", imageID.ShortID()).
+			Str("image_name", imageName).
+			Msg(logging.RemovingImage)
+
 		return
 	}
 
