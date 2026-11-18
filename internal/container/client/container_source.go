@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"os"
 	"slices"
 	"strings"
 	"time"
@@ -18,9 +17,8 @@ import (
 	dockerClient "github.com/moby/moby/client"
 
 	"github.com/nicholas-fedor/watchtower/internal/container"
-	"github.com/nicholas-fedor/watchtower/internal/container/recreate"
+	"github.com/nicholas-fedor/watchtower/internal/container/filters"
 	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // defaultStopSignal is the default signal for stopping containers ("SIGTERM").
@@ -50,15 +48,15 @@ var (
 //   - isPodmanOptional: Optional variadic flag indicating Podman runtime (defaults to false).
 //
 // Returns:
-//   - []types.Container: Filtered list of containers.
+//   - []*container.Container: Filtered list of containers.
 //   - error: Non-nil if listing fails, nil on success.
 func listSourceContainers(log *zerolog.Logger,
 	ctx context.Context,
 	api dockerClient.APIClient,
 	opts ClientOptions,
-	filter types.Filter,
+	filter filters.Filter,
 	isPodmanOptional ...bool,
-) ([]types.Container, error) {
+) ([]*container.Container, error) {
 	clogVal := log.With().
 		Bool("include_stopped", opts.IncludeStopped).
 		Bool("include_restarting", opts.IncludeRestarting).
@@ -82,35 +80,74 @@ func listSourceContainers(log *zerolog.Logger,
 		Msg("Built filter arguments")
 
 	// Fetch containers with status filters always applied based on ClientOptions.
-	listOptions := dockerClient.ContainerListOptions{Filters: filterArgs}
+	hostContainers, err := inspectListedContainers(clog, ctx, api, dockerClient.ContainerListOptions{Filters: filterArgs}, filter)
+	if err != nil {
+		return nil, err
+	}
 
-	clog.Debug().Msg("API status filters applied based on ClientOptions")
+	// An update needs each container's image, so a missing one is worth a warning.
+	for _, c := range hostContainers {
+		if !c.HasImageInfo() {
+			clog.Warn().
+				Str("container", c.Name()).
+				Str("container_id", string(c.ID())).
+				Str("image", c.ImageName()).
+				Msg("Failed to retrieve image info")
+		}
+	}
 
+	return hostContainers, nil
+}
+
+// inspectListedContainers lists containers with the given list options and
+// inspects each one.
+//
+// A container removed between the list and its inspect is left out. A
+// container whose image inspect fails is kept without image info.
+//
+// Parameters:
+//   - log: Logger for list and inspect diagnostics.
+//   - ctx: Context for cancellation and timeout control.
+//   - api: Docker API client.
+//   - listOptions: Docker list options, such as the states and labels to list.
+//   - filter: Function to filter containers, or nil to keep every container.
+//
+// Returns:
+//   - []*container.Container: The inspected containers that pass the filter.
+//   - error: Non-nil if listing fails or an inspect fails for a reason other
+//     than the container being gone. A 404 for the list itself returns no
+//     containers.
+func inspectListedContainers(log *zerolog.Logger,
+	ctx context.Context,
+	api dockerClient.APIClient,
+	listOptions dockerClient.ContainerListOptions,
+	filter filters.Filter,
+) ([]*container.Container, error) {
 	containers, err := api.ContainerList(ctx, listOptions)
 	if err != nil {
 		// Log detailed error information for debugging
-		clog.Debug().
+		log.Debug().
 			Err(err).
 			Str("error_type", fmt.Sprintf("%T", err)).
 			Str("endpoint", "/containers/json").
 			Str("api_version", strings.Trim(api.ClientVersion(), "\"")).
-			Str("docker_host", os.Getenv("DOCKER_HOST")).
+			Str("docker_host", api.DaemonHost()).
 			Str("list_options", fmt.Sprintf("%+v", listOptions)).
 			Msg("ContainerList API call failed")
 
 		// Check for 404 responses and return an empty container list instead of failing.
 		if cerrdefs.IsNotFound(err) {
-			clog.Warn().
+			log.Warn().
 				Err(err).
 				Str("endpoint", "/containers/json").
 				Str("api_version", strings.Trim(api.ClientVersion(), "\"")).
-				Str("docker_host", os.Getenv("DOCKER_HOST")).
+				Str("docker_host", api.DaemonHost()).
 				Msg("Docker API returned 404 for container list. Treating as empty list")
 
-			return []types.Container{}, nil
+			return []*container.Container{}, nil
 		}
 
-		clog.Debug().
+		log.Debug().
 			Err(err).
 			Msg("Failed to list containers")
 
@@ -118,12 +155,12 @@ func listSourceContainers(log *zerolog.Logger,
 	}
 
 	// Convert and filter containers.
-	hostContainers := make([]types.Container, 0, len(containers.Items))
+	hostContainers := make([]*container.Container, 0, len(containers.Items))
 	// Reuse ImageInspect results when multiple containers share an image ID.
 	imageCache := make(map[string]*dockerImage.InspectResponse, len(containers.Items))
 
 	for _, runningContainer := range containers.Items {
-		container, err := getSourceContainer(log, ctx, api, types.ContainerID(runningContainer.ID), imageCache)
+		c, err := getSourceContainer(log, ctx, api, container.ContainerID(runningContainer.ID), imageCache)
 		if err != nil {
 			// Log detailed error information for debugging container inspect failures
 			log.Debug().
@@ -131,7 +168,7 @@ func listSourceContainers(log *zerolog.Logger,
 				Err(err).
 				Str("error_type", fmt.Sprintf("%T", err)).
 				Str("api_version", strings.Trim(api.ClientVersion(), "\"")).
-				Str("docker_host", os.Getenv("DOCKER_HOST")).
+				Str("docker_host", api.DaemonHost()).
 				Msg("Failed to inspect individual container during list")
 
 			// Handle race condition where containers disappear between API calls
@@ -143,23 +180,16 @@ func listSourceContainers(log *zerolog.Logger,
 				continue
 			}
 
-			return nil, err // Logged above and in getSourceContainer
+			// The inspect is part of the listing, so the listing names the failure.
+			return nil, fmt.Errorf("%w: %w", errListContainersFailed, err)
 		}
 
-		if filter == nil || filter(container) {
-			if !container.HasImageInfo() {
-				log.Warn().
-					Str("container", container.Name()).
-					Str("container_id", runningContainer.ID).
-					Str("image", container.ImageName()).
-					Msg("Failed to retrieve image info")
-			}
-
-			hostContainers = append(hostContainers, container)
+		if filter == nil || filter(c) {
+			hostContainers = append(hostContainers, c)
 		}
 	}
 
-	clog.Debug().
+	log.Debug().
 		Int("count", len(hostContainers)).
 		Msg("Filtered container list")
 
@@ -168,7 +198,8 @@ func listSourceContainers(log *zerolog.Logger,
 
 // getSourceContainer inspects a container and optionally reuses ImageInspect results.
 //
-// It resolves the network mode when it references another container.
+// It rewrites the IDs of the containers whose network or volumes the
+// container uses to their names, when those containers still exist.
 //
 // Parameters:
 //   - log: Logger for debug output.
@@ -178,14 +209,14 @@ func listSourceContainers(log *zerolog.Logger,
 //   - imageCache: Optional per-list cache of ImageInspect results keyed by image ID.
 //
 // Returns:
-//   - types.Container: Container object if successful. It has no image info when only the image inspect fails.
+//   - *container.Container: Container object if successful. It has no image info when only the image inspect fails.
 //   - error: Non-nil if the container inspect fails or the image inspect is canceled or times out.
 func getSourceContainer(log *zerolog.Logger,
 	ctx context.Context,
 	api dockerClient.APIClient,
-	containerID types.ContainerID,
+	containerID container.ContainerID,
 	imageCache map[string]*dockerImage.InspectResponse,
-) (types.Container, error) {
+) (*container.Container, error) {
 	clogVal := log.With().
 		Str("container_id", string(containerID)).
 		Logger()
@@ -205,7 +236,7 @@ func getSourceContainer(log *zerolog.Logger,
 			Err(err).
 			Str("error_type", fmt.Sprintf("%T", err)).
 			Str("api_version", strings.Trim(api.ClientVersion(), "\"")).
-			Str("docker_host", os.Getenv("DOCKER_HOST")).
+			Str("docker_host", api.DaemonHost()).
 			Msg("ContainerInspect API call failed")
 
 		clog.Debug().
@@ -243,7 +274,7 @@ func getSourceContainer(log *zerolog.Logger,
 		}
 
 		// Rewrite volumes-from IDs to names while the source still exists.
-		recreate.ResolveVolumesFrom(ctx, api, clog, containerInfo)
+		resolveVolumesFrom(ctx, api, clog, containerInfo)
 	}
 
 	imageInfo, err := resolveImageInspect(ctx, api, containerInfo.Image, imageCache)
@@ -268,6 +299,71 @@ func getSourceContainer(log *zerolog.Logger,
 		Msg("Retrieved container and image info")
 
 	return container.NewContainer(log, containerInfo, imageInfo), nil
+}
+
+// resolveVolumesFrom replaces each volumes-from source ID in an inspected
+// container's host config with that source container's name.
+//
+// Docker reports volumes-from sources by ID. The replacement names them
+// instead, so it still finds a source that an update has recreated under a new
+// ID. A source that cannot be inspected keeps its ID. A mode suffix such as :ro
+// or :rw stays on its entry.
+//
+// Parameters:
+//   - ctx: Context for cancellation and timeout control.
+//   - api: Docker API client.
+//   - clog: Logger for warn and debug output.
+//   - containerInfo: Inspected container whose volumes-from entries are rewritten.
+func resolveVolumesFrom(
+	ctx context.Context,
+	api dockerClient.APIClient,
+	clog *zerolog.Logger,
+	containerInfo *dockerContainer.InspectResponse,
+) {
+	if containerInfo.HostConfig == nil || len(containerInfo.HostConfig.VolumesFrom) == 0 {
+		return
+	}
+
+	rewritten := slices.Clone(containerInfo.HostConfig.VolumesFrom)
+	containerName := container.NormalizeContainerName(containerInfo.Name)
+
+	for i, spec := range rewritten {
+		name, mode := container.ParseVolumesFromSpec(spec)
+		if name == "" {
+			continue
+		}
+
+		sourceResult, err := api.ContainerInspect(
+			ctx,
+			name,
+			dockerClient.ContainerInspectOptions{},
+		)
+		if err != nil {
+			// Leave the stored ID so create fails with a clear missing-container
+			// error instead of inventing a name.
+			clog.Warn().
+				Err(err).
+				Str("container", containerName).
+				Str("volumes_from", name).
+				Msg("Unable to resolve volumes-from container")
+
+			continue
+		}
+
+		resolved := container.NormalizeContainerName(sourceResult.Container.Name)
+		if mode != "" {
+			// Keep :ro/:rw/SELinux flags from the original spec.
+			resolved = resolved + ":" + mode
+		}
+
+		rewritten[i] = resolved
+		clog.Debug().
+			Str("container", containerName).
+			Str("volumes_from", resolved).
+			Msg("Resolved volumes-from container name")
+	}
+
+	containerInfo.HostConfig.VolumesFrom = rewritten
 }
 
 // resolveImageInspect returns image inspect metadata, using imageCache when set.
@@ -383,7 +479,7 @@ func cloneImageInspect(src *dockerImage.InspectResponse) *dockerImage.InspectRes
 func stopSourceContainer(log *zerolog.Logger,
 	ctx context.Context,
 	api dockerClient.APIClient,
-	sourceContainer types.Container,
+	sourceContainer *container.Container,
 	timeout time.Duration,
 ) error {
 	clogVal := log.With().
@@ -488,7 +584,7 @@ func stopSourceContainer(log *zerolog.Logger,
 func stopAndRemoveSourceContainer(log *zerolog.Logger,
 	ctx context.Context,
 	api dockerClient.APIClient,
-	sourceContainer types.Container,
+	sourceContainer *container.Container,
 	timeout time.Duration,
 	removeVolumes bool,
 ) error {
@@ -592,18 +688,40 @@ func stopAndRemoveSourceContainer(log *zerolog.Logger,
 // Returns:
 //   - dockerClient.Filters: Arguments for filtering Docker containers
 func buildListFilterArgs(opts ClientOptions, isPodman bool) dockerClient.Filters {
-	filterArgs := make(dockerClient.Filters)
-
-	filterArgs.Add("status", "running")
+	statuses := []string{"running"}
 
 	if opts.IncludeStopped {
-		filterArgs.Add("status", "created")
-		filterArgs.Add("status", "exited")
+		statuses = append(statuses, "created", "exited")
 	}
 
-	// Podman doesn't have the "restarting" status
-	if opts.IncludeRestarting && !isPodman {
-		filterArgs.Add("status", "restarting")
+	if opts.IncludeRestarting {
+		statuses = append(statuses, "restarting")
+	}
+
+	return statusFilter(isPodman, statuses...)
+}
+
+// statusFilter returns a Docker list filter for containers in the given
+// states.
+//
+// The restarting state is left out on Podman. Podman has no restarting state
+// and rejects a listing that asks for it, which would fail the whole list.
+//
+// Parameters:
+//   - podmanRuntime: Whether the runtime is Podman.
+//   - statuses: The container states to list.
+//
+// Returns:
+//   - dockerClient.Filters: A filter with one status value per state.
+func statusFilter(podmanRuntime bool, statuses ...string) dockerClient.Filters {
+	filterArgs := make(dockerClient.Filters)
+
+	for _, status := range statuses {
+		if podmanRuntime && status == "restarting" {
+			continue
+		}
+
+		filterArgs.Add("status", status)
 	}
 
 	return filterArgs

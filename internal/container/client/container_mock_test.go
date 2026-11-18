@@ -27,7 +27,6 @@ import (
 	mockContainer "github.com/nicholas-fedor/watchtower/internal/container/mocks"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/containerfixture"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/modelfixture"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // testTargetID is the ID the mocked daemon gives a created target container.
@@ -36,7 +35,7 @@ const testTargetID = "new_container_id"
 // dockerImageFixture is an image whose inspect response is read from testdata.
 type dockerImageFixture struct {
 	// id is the image ID.
-	id types.ImageID
+	id container.ImageID
 	// file names testdata/image_<file>.json.
 	file string
 }
@@ -47,7 +46,7 @@ type dockerContainerFixture struct {
 	// image is the container's image. Nil for a missing container.
 	image *dockerImageFixture
 	// id is the container ID.
-	id types.ContainerID
+	id container.ContainerID
 	// name names testdata/container_<name>.json unless file is set.
 	name string
 	// file overrides name as the testdata file name.
@@ -139,7 +138,7 @@ var (
 	}
 )
 
-// newDockerAPI returns a mocked Docker API whose client version is available
+// newDockerAPI returns a mocked Docker API whose client version and daemon host are available
 // for diagnostic logs.
 //
 // Parameters:
@@ -152,6 +151,7 @@ func newDockerAPI(t *testing.T) *mockContainer.MockAPIClient {
 
 	api := mockContainer.NewMockAPIClient(t)
 	api.EXPECT().ClientVersion().Return("1.47").Maybe()
+	api.EXPECT().DaemonHost().Return("unix:///var/run/docker.sock").Maybe()
 
 	return api
 }
@@ -251,7 +251,7 @@ func expectContainerList(t *testing.T, api *mockContainer.MockAPIClient, statuse
 func expectContainerFixtures(t *testing.T, api *mockContainer.MockAPIClient, fixtures ...*dockerContainerFixture) {
 	t.Helper()
 
-	seenImages := make(map[types.ImageID]bool, len(fixtures))
+	seenImages := make(map[container.ImageID]bool, len(fixtures))
 
 	for _, fixture := range fixtures {
 		expectContainerFixture(t, api, fixture)
@@ -398,8 +398,8 @@ func newImageAPI(t *testing.T) *mockContainer.MockAPIClient {
 func runningImage(imageID string) *container.Container {
 	return modelfixture.Container(
 		containerfixture.WithImageName("test-image:latest"),
-		func(container *dockerContainer.InspectResponse, image *dockerImage.InspectResponse) {
-			container.Image = imageID
+		func(c *dockerContainer.InspectResponse, image *dockerImage.InspectResponse) {
+			c.Image = imageID
 			image.ID = imageID
 		},
 	)

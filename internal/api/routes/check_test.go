@@ -7,13 +7,13 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	mockContainerClient "github.com/nicholas-fedor/watchtower/internal/container/client/mocks"
+	mockRoutes "github.com/nicholas-fedor/watchtower/internal/api/routes/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/container/filters"
 	"github.com/nicholas-fedor/watchtower/internal/observability/events"
 	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
 	"github.com/nicholas-fedor/watchtower/internal/observability/metrics"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/internal/update/schedule"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 func TestRegisterCheckRoute(t *testing.T) {
@@ -39,12 +39,12 @@ func TestRegisterCheckRoute(t *testing.T) {
 	t.Run("with client registers route", func(t *testing.T) {
 		app := testApp()
 		auth := testAuthMiddleware()
-		mockClient := mockContainerClient.NewMockClient(t)
+		mockClient := mockRoutes.NewMockClient(t)
 
 		opts := Options{
 			EnableCheckAPI:   true,
 			Client:           mockClient,
-			FilterByImage:    func(_ []string, f types.Filter) types.Filter { return f },
+			FilterByImage:    func(_ []string, f filters.Filter) filters.Filter { return f },
 			EventBroadcaster: events.NewBroadcaster(),
 		}
 
@@ -99,12 +99,12 @@ func TestRegisterUpdateRoute_WriteStartupMessage(t *testing.T) {
 		EnableUpdateAPI: true,
 		UpdateLock:      schedule.NewUpdateLock(),
 		UnblockHTTPAPI:  false,
-		RunUpdatesWithNotifications: func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
+		RunUpdatesWithNotifications: func(_ context.Context, _ filters.Filter, _ updateParams.Params) *metrics.Metric {
 			return &metrics.Metric{}
 		},
-		FilterByImage:  func(_ []string, f types.Filter) types.Filter { return f },
+		FilterByImage:  func(_ []string, f filters.Filter) filters.Filter { return f },
 		DefaultMetrics: func() *metrics.Metrics { return testMetrics },
-		WriteStartupMessage: func(_ logging.StartupParams) {
+		WriteStartupMessage: func(context.Context, logging.StartupParams) {
 		},
 	}
 

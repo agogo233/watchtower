@@ -23,7 +23,6 @@ import (
 	"github.com/nicholas-fedor/watchtower/internal/container/provenance"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/containerfixture"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/modelfixture"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // TestClientBuildRemoteImage verifies that the client builds a remote image
@@ -31,7 +30,7 @@ import (
 func TestClientBuildRemoteImage(t *testing.T) {
 	t.Parallel()
 
-	_, err := (&client{log: newTestLogger(t), api: mockContainer.NewMockAPIClient(t)}).
+	_, err := (&Client{log: newTestLogger(t), api: mockContainer.NewMockAPIClient(t)}).
 		BuildRemoteImage(t.Context(), "", "", []string{"app:latest"})
 	require.ErrorContains(t, err, "build image from Git: git remote is empty")
 
@@ -43,10 +42,10 @@ func TestClientBuildRemoteImage(t *testing.T) {
 		Dockerfile:    provenance.DefaultDockerfile,
 	}).Return(dockerClient.ImageBuildResult{Body: io.NopCloser(strings.NewReader(`{"aux":{"ID":"sha256:built"}}`))}, nil).Once()
 
-	id, err := (&client{log: newTestLogger(t), api: api}).
+	id, err := (&Client{log: newTestLogger(t), api: api}).
 		BuildRemoteImage(t.Context(), "https://github.com/org/app.git", "", []string{"app:latest"})
 	require.NoError(t, err)
-	assert.Equal(t, types.ImageID("sha256:built"), id)
+	assert.Equal(t, container.ImageID("sha256:built"), id)
 }
 
 // TestClientCopyFileStore verifies that the client snapshots labeled files
@@ -82,7 +81,7 @@ func TestClientCopyFileStore(t *testing.T) {
 	t.Run("snapshot empty label is a no-op", func(t *testing.T) {
 		t.Parallel()
 
-		cli := &client{log: newTestLogger(t), api: mockContainer.NewMockAPIClient(t)}
+		cli := &Client{log: newTestLogger(t), api: mockContainer.NewMockAPIClient(t)}
 		source := modelfixture.Container()
 		require.NoError(t, cli.SnapshotCopyFiles(t.Context(), source))
 
@@ -96,7 +95,7 @@ func TestClientCopyFileStore(t *testing.T) {
 		api := mockContainer.NewMockAPIClient(t)
 		expectConfigCopy(t, api)
 
-		cli := &client{log: newTestLogger(t), api: api}
+		cli := &Client{log: newTestLogger(t), api: api}
 		source := configSource()
 		require.NoError(t, cli.SnapshotCopyFiles(t.Context(), source))
 
@@ -108,7 +107,7 @@ func TestClientCopyFileStore(t *testing.T) {
 	t.Run("snapshot invalid label fails", func(t *testing.T) {
 		t.Parallel()
 
-		cli := &client{log: newTestLogger(t), api: mockContainer.NewMockAPIClient(t)}
+		cli := &Client{log: newTestLogger(t), api: mockContainer.NewMockAPIClient(t)}
 		err := cli.SnapshotCopyFiles(t.Context(), modelfixture.Container(containerfixture.WithLabels(map[string]string{
 			labels.CopyFile: "relative.conf",
 		})))
@@ -133,7 +132,7 @@ func TestClientCopyFileStore(t *testing.T) {
 				}, nil
 			})
 
-		cli := &client{log: newTestLogger(t), api: api}
+		cli := &Client{log: newTestLogger(t), api: api}
 
 		var err error
 
@@ -150,7 +149,7 @@ func TestClientCopyFileStore(t *testing.T) {
 	t.Run("inject missing snapshot is a no-op", func(t *testing.T) {
 		t.Parallel()
 
-		cli := &client{log: newTestLogger(t), api: mockContainer.NewMockAPIClient(t)}
+		cli := &Client{log: newTestLogger(t), api: mockContainer.NewMockAPIClient(t)}
 		require.NoError(t, cli.injectStoredCopyFiles(t.Context(), modelfixture.Container(), "new-id"))
 	})
 
@@ -164,7 +163,7 @@ func TestClientCopyFileStore(t *testing.T) {
 			CopyToContainer(mock.Anything, "new-id", mock.Anything).
 			Return(dockerClient.CopyToContainerResult{}, nil)
 
-		cli := &client{log: newTestLogger(t), api: api}
+		cli := &Client{log: newTestLogger(t), api: api}
 		source := configSource()
 		require.NoError(t, cli.SnapshotCopyFiles(t.Context(), source))
 		require.NoError(t, cli.injectStoredCopyFiles(t.Context(), source, "new-id"))
@@ -183,7 +182,7 @@ func TestClientCopyFileStore(t *testing.T) {
 			CopyToContainer(mock.Anything, "new-id", mock.Anything).
 			Return(dockerClient.CopyToContainerResult{}, errors.New("denied"))
 
-		cli := &client{log: newTestLogger(t), api: api}
+		cli := &Client{log: newTestLogger(t), api: api}
 		source := configSource()
 		require.NoError(t, cli.SnapshotCopyFiles(t.Context(), source))
 
@@ -200,7 +199,7 @@ func TestClientCopyFileStore(t *testing.T) {
 		api := mockContainer.NewMockAPIClient(t)
 		expectConfigCopy(t, api)
 
-		cli := &client{log: newTestLogger(t), api: api}
+		cli := &Client{log: newTestLogger(t), api: api}
 		source := configSource()
 		require.NoError(t, cli.SnapshotCopyFiles(t.Context(), source))
 

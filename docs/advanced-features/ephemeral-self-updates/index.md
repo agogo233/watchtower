@@ -40,17 +40,17 @@ The ephemeral self-update mechanism is an alternative to the default rename-base
         -v /var/run/docker.sock:/var/run/docker.sock \
         --restart unless-stopped \
         -e WATCHTOWER_EPHEMERAL_SELF_UPDATE=true \
-        nickfedor/watchtower \
+        nickfedor/watchtower
     ```
 
 ## Differences from Default Self-Update
 
-| Aspect                | Default (Rename)                   | Ephemeral                                         |
-|-----------------------|------------------------------------|---------------------------------------------------|
-| Mechanism             | Renames old container, creates new | Orchestrator handles stop/create/start            |
-| Port conflicts        | Skipped automatically              | Self-update not skipped when ports are configured |
-| Old container cleanup | Deferred to next startup           | Immediate removal by orchestrator                 |
-| Failure recovery      | Old container persists (renamed)   | Old container preserved if new one fails          |
+| Aspect                | Default (Rename)                                 | Ephemeral                                         |
+|-----------------------|--------------------------------------------------|---------------------------------------------------|
+| Mechanism             | Renames old container, creates new               | Orchestrator handles stop/create/start            |
+| Port conflicts        | Skipped automatically                            | Self-update not skipped when ports are configured |
+| Old container cleanup | Deferred to next startup                         | Immediate removal by orchestrator                 |
+| Failure recovery      | Old container takes its original name back       | Old container preserved if new one fails          |
 
 ## Limitations
 

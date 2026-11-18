@@ -3,9 +3,9 @@ package implicitrestart
 import (
 	"github.com/rs/zerolog"
 
+	"github.com/nicholas-fedor/watchtower/internal/container"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/internal/update/sorter"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // markImplicitRestarts marks each container that depends on a restarting
@@ -27,10 +27,10 @@ import (
 func markImplicitRestarts(
 	log *zerolog.Logger,
 	graph *sorter.DependencyGraph,
-	allContainers, containers []types.Container,
-	excluded map[types.ContainerID]struct{},
+	allContainers, containers []*container.Container,
+	excluded map[container.ContainerID]struct{},
 ) {
-	eligible := make(map[types.ContainerID]bool, len(containers))
+	eligible := make(map[container.ContainerID]bool, len(containers))
 
 	for _, c := range containers {
 		if _, skip := excluded[c.ID()]; !skip {
@@ -38,7 +38,7 @@ func markImplicitRestarts(
 		}
 	}
 
-	queue := make([]types.Container, 0, len(allContainers))
+	queue := make([]*container.Container, 0, len(allContainers))
 
 	for _, c := range allContainers {
 		if _, skip := excluded[c.ID()]; !skip && c.ToRestart() {
@@ -82,21 +82,21 @@ func markImplicitRestarts(
 //   - excluded: Container IDs that must not propagate or receive implicit restarts.
 //
 // Returns:
-//   - []types.Container: Containers that should still restart.
+//   - []*container.Container: Containers that should still restart.
 func Reconcile(
 	log *zerolog.Logger,
 	graph *sorter.DependencyGraph,
-	allContainers, containers []types.Container,
+	allContainers, containers []*container.Container,
 	params updateParams.Params,
-	excluded map[types.ContainerID]struct{},
-) []types.Container {
+	excluded map[container.ContainerID]struct{},
+) []*container.Container {
 	for _, c := range containers {
 		c.SetLinkedToRestarting(false)
 	}
 
 	markImplicitRestarts(log, graph, allContainers, containers, excluded)
 
-	restart := make([]types.Container, 0, len(containers))
+	restart := make([]*container.Container, 0, len(containers))
 	for _, c := range containers {
 		if _, skip := excluded[c.ID()]; skip {
 			continue

@@ -17,11 +17,12 @@ import (
 	dockerContainer "github.com/moby/moby/api/types/container"
 	dockerImage "github.com/moby/moby/api/types/image"
 
-	mockContainerClient "github.com/nicholas-fedor/watchtower/internal/container/client/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/container"
 	"github.com/nicholas-fedor/watchtower/internal/container/labels"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/containerfixture"
+	"github.com/nicholas-fedor/watchtower/internal/testutil/logcapture"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/modelfixture"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
+	mockCleanup "github.com/nicholas-fedor/watchtower/internal/update/cleanup/mocks"
 )
 
 // TestRemoveOrphanedOrchestrators verifies that orphaned orchestrators are
@@ -45,36 +46,10 @@ func TestRemoveOrphanedOrchestrators(t *testing.T) {
 		t.Run("should return 0 removed and no error", func(t *testing.T) {
 			t.Parallel()
 
-			mockAPIClient := mockContainerClient.NewMockClient(t)
+			mockAPIClient := mockCleanup.NewMockClient(t)
 			mockAPIClient.EXPECT().
-				ListContainers(ctx).
-				Return([]types.Container{}, nil)
-
-			count, err := RemoveOrphanedOrchestrators(newTestLogger(t), ctx, mockAPIClient)
-
-			require.NoError(t, err)
-			assert.Equal(t, 0, count)
-		})
-	})
-
-	t.Run("there are containers but none are orchestrators", func(t *testing.T) {
-		t.Parallel()
-
-		t.Run("should return 0 removed and no error", func(t *testing.T) {
-			t.Parallel()
-
-			regularContainer := modelfixture.Container(
-				containerfixture.WithID("regular123"),
-				containerfixture.WithName("regular-container"),
-				containerfixture.WithLabels(map[string]string{
-					"com.centurylinklabs.watchtower": "true",
-				}),
-			)
-
-			mockAPIClient := mockContainerClient.NewMockClient(t)
-			mockAPIClient.EXPECT().
-				ListContainers(ctx).
-				Return([]types.Container{regularContainer}, nil)
+				ListLabeledContainers(ctx, labels.EphemeralOrchestrator).
+				Return([]*container.Container{}, nil)
 
 			count, err := RemoveOrphanedOrchestrators(newTestLogger(t), ctx, mockAPIClient)
 
@@ -98,10 +73,10 @@ func TestRemoveOrphanedOrchestrators(t *testing.T) {
 				orphaned,
 			)
 
-			mockAPIClient := mockContainerClient.NewMockClient(t)
+			mockAPIClient := mockCleanup.NewMockClient(t)
 			mockAPIClient.EXPECT().
-				ListContainers(ctx).
-				Return([]types.Container{orchestrator}, nil)
+				ListLabeledContainers(ctx, labels.EphemeralOrchestrator).
+				Return([]*container.Container{orchestrator}, nil)
 			mockAPIClient.EXPECT().
 				StopAndRemoveContainer(
 					ctx,
@@ -139,15 +114,10 @@ func TestRemoveOrphanedOrchestrators(t *testing.T) {
 				}),
 				orphaned,
 			)
-			regular := modelfixture.Container(
-				containerfixture.WithID("regular1"),
-				containerfixture.WithName("app-container"),
-			)
-
-			mockAPIClient := mockContainerClient.NewMockClient(t)
+			mockAPIClient := mockCleanup.NewMockClient(t)
 			mockAPIClient.EXPECT().
-				ListContainers(ctx).
-				Return([]types.Container{orch1, regular, orch2}, nil)
+				ListLabeledContainers(ctx, labels.EphemeralOrchestrator).
+				Return([]*container.Container{orch1, orch2}, nil)
 			mockAPIClient.EXPECT().
 				StopAndRemoveContainer(
 					ctx,
@@ -170,21 +140,25 @@ func TestRemoveOrphanedOrchestrators(t *testing.T) {
 		})
 	})
 
-	t.Run("ListContainers fails", func(t *testing.T) {
+	t.Run("listing the orchestrators fails", func(t *testing.T) {
 		t.Parallel()
 
-		t.Run("should return an error", func(t *testing.T) {
+		t.Run("should return the error and log it only at debug", func(t *testing.T) {
 			t.Parallel()
 
-			mockAPIClient := mockContainerClient.NewMockClient(t)
+			mockAPIClient := mockCleanup.NewMockClient(t)
 			mockAPIClient.EXPECT().
-				ListContainers(ctx).
-				Return(nil, errors.New("docker daemon unavailable"))
+				ListLabeledContainers(ctx, labels.EphemeralOrchestrator).
+				Return(nil, errors.New("failed to list containers: docker daemon unavailable"))
 
-			count, err := RemoveOrphanedOrchestrators(newTestLogger(t), ctx, mockAPIClient)
+			log, out := logcapture.NewJSON(zerolog.DebugLevel)
 
-			require.ErrorContains(t, err, "failed to list containers")
+			count, err := RemoveOrphanedOrchestrators(log, ctx, mockAPIClient)
+
+			require.EqualError(t, err, "failed to list containers: docker daemon unavailable")
 			assert.Equal(t, 0, count)
+			// The caller's warning is the one report that can reach notifications.
+			assert.Equal(t, []string{"debug"}, logcapture.Levels(t, out.String(), "Failed to list ephemeral orchestrators"))
 		})
 	})
 
@@ -211,10 +185,10 @@ func TestRemoveOrphanedOrchestrators(t *testing.T) {
 				orphaned,
 			)
 
-			mockAPIClient := mockContainerClient.NewMockClient(t)
+			mockAPIClient := mockCleanup.NewMockClient(t)
 			mockAPIClient.EXPECT().
-				ListContainers(ctx).
-				Return([]types.Container{orch1, orch2}, nil)
+				ListLabeledContainers(ctx, labels.EphemeralOrchestrator).
+				Return([]*container.Container{orch1, orch2}, nil)
 			mockAPIClient.EXPECT().
 				StopAndRemoveContainer(
 					ctx,
@@ -236,36 +210,15 @@ func TestRemoveOrphanedOrchestrators(t *testing.T) {
 			assert.Equal(t, 1, count)
 		})
 	})
-
-	t.Run("a container has no orchestrator label", func(t *testing.T) {
-		t.Parallel()
-
-		t.Run("should skip the container without error", func(t *testing.T) {
-			t.Parallel()
-
-			noLabelContainer := modelfixture.Container(
-				containerfixture.WithID("no-label"),
-				containerfixture.WithName("no-label-container"),
-			)
-
-			mockAPIClient := mockContainerClient.NewMockClient(t)
-			mockAPIClient.EXPECT().
-				ListContainers(ctx).
-				Return([]types.Container{noLabelContainer}, nil)
-
-			count, err := RemoveOrphanedOrchestrators(newTestLogger(t), ctx, mockAPIClient)
-
-			require.NoError(t, err)
-			assert.Equal(t, 0, count)
-		})
-	})
 }
 
 // TestRemoveOrphanedOrchestrators_SkipsInFlight verifies that startup cleanup
-// removes only orchestrators that have run longer than any self-update can
-// take. A younger orchestrator may still be handing off to a new Watchtower,
-// whether this instance's or another scope's, so it is kept, as is one whose
-// start time cannot be read.
+// removes only orchestrators that started longer ago than any self-update can
+// take or were created that long ago without starting. An exited orchestrator
+// follows the same rule. A younger orchestrator is kept because it may still
+// be handing off to a new Watchtower, whether this instance's or another
+// scope's. An orchestrator whose start and creation times cannot be read is
+// kept too.
 func TestRemoveOrphanedOrchestrators_SkipsInFlight(t *testing.T) {
 	t.Parallel()
 
@@ -305,14 +258,29 @@ func TestRemoveOrphanedOrchestrators_SkipsInFlight(t *testing.T) {
 			state: dockerContainer.State{Running: true, StartedAt: "not-a-time"},
 		},
 		{
-			name:        "no start time and old creation time",
-			state:       dockerContainer.State{Running: true, StartedAt: "0001-01-01T00:00:00Z"},
+			name:        "unreadable start time and old creation time",
+			state:       dockerContainer.State{Running: true, StartedAt: "not-a-time"},
 			created:     startedAt(time.Hour),
 			wantRemoved: true,
 		},
 		{
-			name:    "no start time and recent creation time",
-			state:   dockerContainer.State{Running: true},
+			name:        "exited long ago",
+			state:       dockerContainer.State{Status: "exited", StartedAt: startedAt(time.Hour)},
+			wantRemoved: true,
+		},
+		{
+			name:  "exited after a recent start",
+			state: dockerContainer.State{Status: "exited", StartedAt: startedAt(time.Minute)},
+		},
+		{
+			name:        "never started and created long ago",
+			state:       dockerContainer.State{Status: "created", StartedAt: "0001-01-01T00:00:00Z"},
+			created:     startedAt(time.Hour),
+			wantRemoved: true,
+		},
+		{
+			name:    "never started and created recently",
+			state:   dockerContainer.State{Status: "created", StartedAt: "0001-01-01T00:00:00Z"},
 			created: startedAt(time.Minute),
 		},
 	}
@@ -330,12 +298,9 @@ func TestRemoveOrphanedOrchestrators_SkipsInFlight(t *testing.T) {
 					c.Created = tt.created
 				},
 			)
-			// A container without the orchestrator label is never removed.
-			app := modelfixture.Container(containerfixture.WithID("app123"), containerfixture.WithName("app"))
-
-			client := mockContainerClient.NewMockClient(t)
-			client.EXPECT().ListContainers(mock.Anything).
-				Return([]types.Container{orchestrator, app}, nil).Once()
+			client := mockCleanup.NewMockClient(t)
+			client.EXPECT().ListLabeledContainers(mock.Anything, labels.EphemeralOrchestrator).
+				Return([]*container.Container{orchestrator}, nil).Once()
 
 			wantCount := 0
 
@@ -369,8 +334,8 @@ func TestRemoveOrphanedOrchestrators_AlreadyGone(t *testing.T) {
 		}),
 	)
 
-	client := mockContainerClient.NewMockClient(t)
-	client.EXPECT().ListContainers(mock.Anything).Return([]types.Container{orchestrator}, nil).Once()
+	client := mockCleanup.NewMockClient(t)
+	client.EXPECT().ListLabeledContainers(mock.Anything, labels.EphemeralOrchestrator).Return([]*container.Container{orchestrator}, nil).Once()
 	client.EXPECT().StopAndRemoveContainer(mock.Anything, orchestrator, time.Duration(0)).
 		Return(fmt.Errorf("no such container: %w", cerrdefs.ErrNotFound)).Once()
 

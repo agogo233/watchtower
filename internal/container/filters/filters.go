@@ -10,9 +10,29 @@ import (
 	"github.com/distribution/reference"
 	"github.com/rs/zerolog"
 
+	"github.com/nicholas-fedor/watchtower/internal/container"
 	"github.com/nicholas-fedor/watchtower/internal/container/labels"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
+
+// Filter defines a function to filter containers.
+//
+// Parameters:
+//   - c: Container to evaluate.
+//
+// Returns:
+//   - bool: True if container passes filter, false otherwise.
+type Filter func(FilterableContainer) bool
+
+// FilterableContainer defines an interface for container filtering.
+type FilterableContainer interface {
+	Name() string                       // Container name.
+	IsWatchtower() bool                 // Check if Watchtower instance.
+	Enabled() (bool, bool)              // Enabled status and presence.
+	Scope() (string, bool)              // Scope value and presence.
+	NormalizedScope() string            // Scope, or "none" when unset or empty.
+	ImageName() string                  // Image name with tag.
+	GetLabel(key string) (string, bool) // Arbitrary label value lookup.
+}
 
 const (
 	// Expected number of parts in a key=value label pair.
@@ -57,7 +77,7 @@ type labelPair struct {
 //
 // Returns:
 //   - bool: True if container is Watchtower, false otherwise.
-func WatchtowerContainersFilter(c types.FilterableContainer) bool {
+func WatchtowerContainersFilter(c FilterableContainer) bool {
 	return c.IsWatchtower()
 }
 
@@ -71,7 +91,7 @@ func WatchtowerContainersFilter(c types.FilterableContainer) bool {
 // Returns:
 //   - bool: True if the container should be included, false if it is an old
 //     Watchtower container that should be excluded.
-func excludeOldWatchtowerFilter(c types.FilterableContainer) bool {
+func excludeOldWatchtowerFilter(c FilterableContainer) bool {
 	if !c.IsWatchtower() {
 		return true
 	}
@@ -91,8 +111,8 @@ func excludeOldWatchtowerFilter(c types.FilterableContainer) bool {
 //
 // Returns:
 //   - bool: True if the container is an old Watchtower container.
-func IsOldWatchtower(c types.FilterableContainer) bool {
-	return c.IsWatchtower() && strings.HasPrefix(strings.TrimLeft(c.Name(), "/"), types.WatchtowerOldPrefix)
+func IsOldWatchtower(c FilterableContainer) bool {
+	return c.IsWatchtower() && container.IsOldContainer(c.Name())
 }
 
 // excludeOldWatchtowerFilterChain wraps a base filter with old
@@ -103,11 +123,35 @@ func IsOldWatchtower(c types.FilterableContainer) bool {
 //   - baseFilter: Base filter to chain.
 //
 // Returns:
-//   - types.Filter: Filter function that excludes old Watchtower containers
+//   - Filter: Filter function that excludes old Watchtower containers
 //     and applies the base filter.
-func excludeOldWatchtowerFilterChain(baseFilter types.Filter) types.Filter {
-	return func(c types.FilterableContainer) bool {
+func excludeOldWatchtowerFilterChain(baseFilter Filter) Filter {
+	return func(c FilterableContainer) bool {
 		if !excludeOldWatchtowerFilter(c) {
+			return false
+		}
+
+		return baseFilter(c)
+	}
+}
+
+// excludeJobRunsFilterChain wraps a base filter so that it rejects the
+// containers Docker Engine runs for a job.
+//
+// The engine creates each run and removes it after a success. It keeps a
+// failed run for the job's history. A run that Watchtower recreated or
+// restarted would run outside the job's schedule. A recreated failed run would
+// lose its exit status and logs.
+//
+// Parameters:
+//   - baseFilter: Base filter to chain.
+//
+// Returns:
+//   - Filter: Filter function that excludes job runs and applies the base
+//     filter.
+func excludeJobRunsFilterChain(baseFilter Filter) Filter {
+	return func(c FilterableContainer) bool {
+		if _, ok := c.GetLabel(labels.JobID); ok {
 			return false
 		}
 
@@ -119,7 +163,7 @@ func excludeOldWatchtowerFilterChain(baseFilter types.Filter) types.Filter {
 //
 // Returns:
 //   - bool: Always true.
-func NoFilter(c types.FilterableContainer) bool {
+func NoFilter(c FilterableContainer) bool {
 	return true
 }
 
@@ -133,8 +177,8 @@ func NoFilter(c types.FilterableContainer) bool {
 //   - baseFilter: Base filter to chain.
 //
 // Returns:
-//   - types.Filter: Filter function combining name check with base filter.
-func FilterByNames(log *zerolog.Logger, normalizedNames []string, baseFilter types.Filter) types.Filter {
+//   - Filter: Filter function combining name check with base filter.
+func FilterByNames(log *zerolog.Logger, normalizedNames []string, baseFilter Filter) Filter {
 	if len(normalizedNames) == 0 {
 		return baseFilter
 	}
@@ -142,7 +186,7 @@ func FilterByNames(log *zerolog.Logger, normalizedNames []string, baseFilter typ
 	// Compile once. The returned closure only evaluates the compiled matchers.
 	compiled := compileNamePatterns(normalizedNames, true)
 
-	return func(c types.FilterableContainer) bool {
+	return func(c FilterableContainer) bool {
 		containerName := c.Name()
 
 		if compiled.match(containerName) {
@@ -177,8 +221,8 @@ func FilterByNames(log *zerolog.Logger, normalizedNames []string, baseFilter typ
 //   - baseFilter: Base filter to chain.
 //
 // Returns:
-//   - types.Filter: Filter function excluding names and applying base filter.
-func FilterByDisableNames(log *zerolog.Logger, normalizedDisableNames []string, baseFilter types.Filter) types.Filter {
+//   - Filter: Filter function excluding names and applying base filter.
+func FilterByDisableNames(log *zerolog.Logger, normalizedDisableNames []string, baseFilter Filter) Filter {
 	if len(normalizedDisableNames) == 0 {
 		return baseFilter
 	}
@@ -186,7 +230,7 @@ func FilterByDisableNames(log *zerolog.Logger, normalizedDisableNames []string, 
 	// Compile once. The returned closure only evaluates the compiled matchers.
 	compiled := compileNamePatterns(normalizedDisableNames, true)
 
-	return func(c types.FilterableContainer) bool {
+	return func(c FilterableContainer) bool {
 		containerName := c.Name()
 
 		if compiled.match(containerName) {
@@ -222,9 +266,9 @@ func FilterByDisableNames(log *zerolog.Logger, normalizedDisableNames []string, 
 //   - baseFilter: Base filter to chain.
 //
 // Returns:
-//   - types.Filter: Filter function restricting to matching image names, then
+//   - Filter: Filter function restricting to matching image names, then
 //     applying base filter.
-func filterByMonitoredImageNamePatterns(log *zerolog.Logger, namePatterns []string, baseFilter types.Filter) types.Filter {
+func filterByMonitoredImageNamePatterns(log *zerolog.Logger, namePatterns []string, baseFilter Filter) Filter {
 	if len(namePatterns) == 0 {
 		return baseFilter
 	}
@@ -232,7 +276,7 @@ func filterByMonitoredImageNamePatterns(log *zerolog.Logger, namePatterns []stri
 	// Compile once. The returned closure only evaluates the compiled matchers.
 	compiled := compileNamePatterns(namePatterns, false)
 
-	return func(c types.FilterableContainer) bool {
+	return func(c FilterableContainer) bool {
 		imageName := c.ImageName()
 
 		if compiled.match(imageName) {
@@ -270,9 +314,9 @@ func filterByMonitoredImageNamePatterns(log *zerolog.Logger, namePatterns []stri
 //   - baseFilter: Base filter to chain.
 //
 // Returns:
-//   - types.Filter: Filter function excluding matching image names, then applying
+//   - Filter: Filter function excluding matching image names, then applying
 //     base filter.
-func filterBySkippedImageNamePatterns(log *zerolog.Logger, namePatterns []string, baseFilter types.Filter) types.Filter {
+func filterBySkippedImageNamePatterns(log *zerolog.Logger, namePatterns []string, baseFilter Filter) Filter {
 	if len(namePatterns) == 0 {
 		return baseFilter
 	}
@@ -280,7 +324,7 @@ func filterBySkippedImageNamePatterns(log *zerolog.Logger, namePatterns []string
 	// Compile once. The returned closure only evaluates the compiled matchers.
 	compiled := compileNamePatterns(namePatterns, false)
 
-	return func(c types.FilterableContainer) bool {
+	return func(c FilterableContainer) bool {
 		imageName := c.ImageName()
 
 		if compiled.match(imageName) {
@@ -373,7 +417,7 @@ func parseLabelPairs(pairs []string) ([]labelPair, error) {
 // Returns:
 //   - string: Key of the matching pair.
 //   - bool: True when a pair matches.
-func matchLabelPair(c types.FilterableContainer, pairs []labelPair) (string, bool) {
+func matchLabelPair(c FilterableContainer, pairs []labelPair) (string, bool) {
 	for _, pair := range pairs {
 		labelValue, ok := c.GetLabel(pair.key)
 		if !ok {
@@ -429,15 +473,15 @@ func labelPairStrings(pairs []labelPair) []string {
 //   - baseFilter: Base filter to chain.
 //
 // Returns:
-//   - types.Filter: Filter function matching labels and applying base filter.
-func filterByEnabledLabels(log *zerolog.Logger, labels []labelPair, baseFilter types.Filter) types.Filter {
+//   - Filter: Filter function matching labels and applying base filter.
+func filterByEnabledLabels(log *zerolog.Logger, labels []labelPair, baseFilter Filter) Filter {
 	if len(labels) == 0 {
 		return baseFilter
 	}
 
 	formatted := labelPairStrings(labels)
 
-	return func(c types.FilterableContainer) bool {
+	return func(c FilterableContainer) bool {
 		key, matched := matchLabelPair(c, labels)
 		if matched {
 			if debugEnabled(log) {
@@ -477,15 +521,15 @@ func filterByEnabledLabels(log *zerolog.Logger, labels []labelPair, baseFilter t
 //   - baseFilter: Base filter to chain.
 //
 // Returns:
-//   - types.Filter: Filter function excluding matching labels and applying base filter.
-func filterByDisabledLabels(log *zerolog.Logger, labels []labelPair, baseFilter types.Filter) types.Filter {
+//   - Filter: Filter function excluding matching labels and applying base filter.
+func filterByDisabledLabels(log *zerolog.Logger, labels []labelPair, baseFilter Filter) Filter {
 	if len(labels) == 0 {
 		return baseFilter
 	}
 
 	formatted := labelPairStrings(labels)
 
-	return func(c types.FilterableContainer) bool {
+	return func(c FilterableContainer) bool {
 		key, matched := matchLabelPair(c, labels)
 		if matched {
 			if debugEnabled(log) {
@@ -523,9 +567,9 @@ func filterByDisabledLabels(log *zerolog.Logger, labels []labelPair, baseFilter 
 //   - baseFilter: base filter to chain.
 //
 // Returns:
-//   - types.Filter: filter function applying enable-label semantics and baseFilter.
-func filterByEnableLabel(enable bool, baseFilter types.Filter) types.Filter {
-	return func(c types.FilterableContainer) bool {
+//   - Filter: filter function applying enable-label semantics and baseFilter.
+func filterByEnableLabel(enable bool, baseFilter Filter) Filter {
+	return func(c FilterableContainer) bool {
 		enabled, ok := c.Enabled()
 		if ok && !enabled {
 			return false
@@ -549,11 +593,11 @@ func filterByEnableLabel(enable bool, baseFilter types.Filter) types.Filter {
 //   - baseFilter: Base filter to chain.
 //
 // Returns:
-//   - types.Filter: Filter function matching scope and applying base filter.
-func FilterByScope(log *zerolog.Logger, scope string, baseFilter types.Filter) types.Filter {
+//   - Filter: Filter function matching scope and applying base filter.
+func FilterByScope(log *zerolog.Logger, scope string, baseFilter Filter) Filter {
 	scope = labels.NormalizeScope(scope)
 
-	return func(c types.FilterableContainer) bool {
+	return func(c FilterableContainer) bool {
 		containerScope := c.NormalizedScope()
 
 		if containerScope == scope {
@@ -588,13 +632,13 @@ func FilterByScope(log *zerolog.Logger, scope string, baseFilter types.Filter) t
 //   - baseFilter: Base filter to chain.
 //
 // Returns:
-//   - types.Filter: Filter function matching images and applying base filter.
-func FilterByImage(log *zerolog.Logger, images []string, baseFilter types.Filter) types.Filter {
+//   - Filter: Filter function matching images and applying base filter.
+func FilterByImage(log *zerolog.Logger, images []string, baseFilter Filter) Filter {
 	if len(images) == 0 {
 		return baseFilter // No images specified, apply base filter only.
 	}
 
-	return func(c types.FilterableContainer) bool {
+	return func(c FilterableContainer) bool {
 		for _, targetImage := range images {
 			if matchImageAndTag(c.ImageName(), targetImage) {
 				if debugEnabled(log) {
@@ -774,7 +818,7 @@ func matchImageAndTag(containerImage, targetImage string) bool {
 //   - scope: Scope to match.
 //
 // Returns:
-//   - types.Filter: Combined filter function.
+//   - Filter: Combined filter function.
 //   - string: Description of the filter.
 //   - error: Non-nil if any enabled or disabled label pair is malformed.
 func BuildFilter(log *zerolog.Logger,
@@ -786,7 +830,7 @@ func BuildFilter(log *zerolog.Logger,
 	disabledLabels []string,
 	enableLabel bool,
 	scope string,
-) (types.Filter, string, error) {
+) (Filter, string, error) {
 	enabledLabelPairs, err := parseLabelPairs(enabledLabels)
 	if err != nil {
 		return nil, "", err
@@ -941,9 +985,15 @@ func BuildFilter(log *zerolog.Logger,
 		stringBuilder.WriteString(scope)
 	}
 
+	// The two exclusions below wrap the whole chain, so they reject a
+	// container before any configured filter runs.
+	//
 	// Exclude old Watchtower containers (predecessors from self-update).
-	// Applied last so it wraps the entire chain and short-circuits first.
 	filter = excludeOldWatchtowerFilterChain(filter)
+
+	// Exclude the containers Docker Engine runs for jobs. The engine owns
+	// their lifecycle, so no configuration option selects them.
+	filter = excludeJobRunsFilterChain(filter)
 
 	// Build filter description.
 	filterDesc := "Checking all containers (except explicitly disabled with label)"

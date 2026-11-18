@@ -9,12 +9,9 @@ import (
 	"strings"
 
 	"github.com/rs/zerolog"
-	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
-	"github.com/spf13/viper"
 
 	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
-	"github.com/nicholas-fedor/watchtower/internal/settings/flags/docker"
 	"github.com/nicholas-fedor/watchtower/internal/settings/flags/schedule"
 )
 
@@ -24,8 +21,6 @@ var (
 	errInvalidLogFormat = errors.New("invalid log format specified")
 	// errInvalidLogLevel indicates an invalid log level was specified in configuration.
 	errInvalidLogLevel = errors.New("invalid log level specified")
-	// errSetEnvFailed indicates a failure to set an environment variable during configuration.
-	errSetEnvFailed = errors.New("failed to set environment variable")
 	// errOpenFileFailed indicates a failure to open a file when reading secrets.
 	errOpenFileFailed = errors.New("failed to open secret file")
 	// errReplaceSliceFailed indicates a failure to replace a slice value in a flag.
@@ -46,139 +41,63 @@ var (
 	errIntervalAndSchedule = errors.New("cannot define both interval and schedule")
 )
 
-// EnvConfig sets Docker environment variables from flags.
+// prepareFlags readies the parsed root command flags in flagSet for loading
+// and returns the logger to use from then on.
+//
+// It applies environment variables to unset flags and sets the log format and
+// level. It then applies the alias flags, which can force a debug or trace
+// level, and sets the logging up again so that level applies. Last, it reads
+// secret files into their flags. Setting the format before the aliases makes
+// their errors use the chosen format.
 //
 // Parameters:
-//   - log: Logger for configuration diagnostics.
-//   - cmd: Cobra command with flags.
+//   - log: Logger to reconfigure.
+//   - flagSet: The root command's persistent flags, registered and parsed.
 //
 // Returns:
-//   - error: Non-nil if flag retrieval fails, nil on success.
-func EnvConfig(log *zerolog.Logger, cmd *cobra.Command) error {
-	flagSet := cmd.PersistentFlags()
-
-	// Resolve Docker settings via Viper (flag > env > static default) after BindAll.
-	vCfg := viper.New()
-
-	err := BindAll(vCfg, flagSet, docker.Specs())
+//   - *zerolog.Logger: The logger with the configured format and level. On a
+//     failure it is the last logger set up, for reporting the failure.
+//   - error: Non-nil when a step fails, naming the step.
+func prepareFlags(log *zerolog.Logger, flagSet *pflag.FlagSet) (*zerolog.Logger, error) {
+	err := applyEnvToFlags(flagSet, AllSpecs())
 	if err != nil {
-		return fmt.Errorf("bind docker flags: %w", err)
+		return log, fmt.Errorf("apply environment configuration: %w", err)
 	}
 
-	host := vCfg.GetString("host")
-	tls := vCfg.GetBool("tlsverify")
-	version := strings.Trim(vCfg.GetString("api-version"), "\"")
-	certPath := vCfg.GetString("cert-path")
-
-	// Convert tcp:// to https:// when TLS is enabled.
-	if tls && strings.HasPrefix(host, "tcp://") {
-		host = strings.Replace(host, "tcp://", "https://", 1)
-	}
-
-	// Warn about mismatched TLS settings.
-	if tls {
-		if strings.HasPrefix(host, "http://") {
-			log.Warn().
-				Msg("TLS verification is enabled but DOCKER_HOST uses insecure scheme 'http://'. Consider using 'https://' or disable TLS verification.")
-		} else if strings.HasPrefix(host, "unix://") {
-			log.Warn().
-				Msg("TLS verification is enabled but DOCKER_HOST uses local socket 'unix://'. TLS is not applicable for local sockets. Consider disabling TLS verification.")
-		}
-	}
-
-	// Set environment variables.
-	err = setEnvOptStr(log, "DOCKER_HOST", host)
+	log, err = setupLogging(log, flagSet)
 	if err != nil {
-		return err
+		return log, fmt.Errorf("set up logging: %w", err)
 	}
 
-	err = setEnvOptBool(log, "DOCKER_TLS_VERIFY", tls)
+	err = processFlagAliases(log, flagSet)
 	if err != nil {
-		return err
+		return log, fmt.Errorf("process flag aliases: %w", err)
 	}
 
-	err = setEnvOptStr(log, "DOCKER_API_VERSION", version)
+	log, err = setupLogging(log, flagSet)
 	if err != nil {
-		return err
+		return log, fmt.Errorf("set up logging: %w", err)
 	}
 
-	err = setEnvOptStr(log, "DOCKER_CERT_PATH", certPath)
+	err = getSecretsFromFiles(log, flagSet)
 	if err != nil {
-		return err
+		return log, fmt.Errorf("load secrets from files: %w", err)
 	}
 
-	log.Debug().
-		Str("host", host).
-		Bool("tls", tls).
-		Str("version", version).
-		Str("certPath", certPath).
-		Msg("Configured Docker environment variables")
-
-	return nil
+	return log, nil
 }
 
-// setEnvOptStr sets an environment variable if needed.
-//
-// Parameters:
-//   - log: Logger for configuration diagnostics.
-//   - env: Environment variable name.
-//   - opt: Value to set.
-//
-// Returns:
-//   - error: Non-nil if set fails, nil if skipped or successful.
-func setEnvOptStr(log *zerolog.Logger, env, opt string) error {
-	if opt == "" || opt == os.Getenv(env) {
-		return nil
-	}
-
-	err := os.Setenv(env, opt)
-	if err != nil {
-		log.Debug().
-			Err(err).
-			Str("env", env).
-			Str("value", opt).
-			Msg("Failed to set environment variable")
-
-		return fmt.Errorf("%w: %s: %w", errSetEnvFailed, env, err)
-	}
-
-	log.Debug().
-		Str("env", env).
-		Str("value", opt).
-		Msg("Set environment variable")
-
-	return nil
-}
-
-// setEnvOptBool sets an environment variable to "1" if true.
-//
-// Parameters:
-//   - log: Logger for configuration diagnostics.
-//   - env: Environment variable name.
-//   - opt: Boolean value.
-//
-// Returns:
-//   - error: Non-nil if set fails, nil otherwise.
-func setEnvOptBool(log *zerolog.Logger, env string, opt bool) error {
-	if opt {
-		return setEnvOptStr(log, env, "1")
-	}
-
-	return nil
-}
-
-// GetSecretsFromFiles updates flags with file contents for secrets.
+// getSecretsFromFiles updates flags with file contents for secrets.
 //
 // Parameters:
 //   - log: Logger for secret-loading diagnostics.
-//   - rootCmd: Root Cobra command.
+//   - flags: The root command's persistent flags.
 //
 // Returns:
 //   - error: Non-nil when a secret file cannot be loaded, naming its flag.
 //
 //nolint:godox
-func GetSecretsFromFiles(log *zerolog.Logger, rootCmd *cobra.Command) error {
-	flags := rootCmd.PersistentFlags()
+func getSecretsFromFiles(log *zerolog.Logger, flags *pflag.FlagSet) error {
 	secrets := []string{
 		// TODO: Remove just before v2 Release.
 		"notification-email-server-password",
@@ -245,10 +164,6 @@ func getSecretFromFile(log *zerolog.Logger, flags *pflag.FlagSet, secret string)
 
 			return fmt.Errorf("%w: %w", errReplaceSliceFailed, err)
 		}
-
-		// Mark the flag as explicitly set so downstream consumers read the expanded
-		// value from the flag rather than re-deriving from raw os.Getenv.
-		flag.Changed = true
 
 		return nil
 	}
@@ -381,37 +296,18 @@ func isFilePath(path string) bool {
 	return !errors.Is(err, os.ErrNotExist)
 }
 
-// ProcessFlagAliases applies environment values then syncs flag aliases.
+// processFlagAliases applies the alias flags: porcelain mode, an interval as a
+// schedule, and the debug and trace log levels.
 //
-// It bridges env onto unset flags, then applies porcelain mode, interval versus
-// schedule conflicts, and debug/trace log-level forcing.
-//
-// Intended production order (see cmd preRun / notify-upgrade):
-//
-//  1. ApplyEnvToFlags (or rely on the bridge inside this function)
-//  2. SetupLogging, which applies --log-format and the current level, so the
-//     caller logs an error from here in the selected format
-//  3. ProcessFlagAliases, which may force the log level to debug or trace
-//  4. SetupLogging again, which applies the level after alias changes
-//  5. GetSecretsFromFiles / EnvConfig / Load
-//
-// Call after Cobra parse. Do not call only after a single post-alias SetupLogging
-// if format-before-fatal matters. Sandwich this between the two SetupLogging calls.
+// The environment must already be applied to the flags.
 //
 // Parameters:
 //   - log: Logger for alias diagnostics.
 //   - flags: Parsed persistent flag set.
 //
 // Returns:
-//   - error: Non-nil when the flags or the environment hold an invalid
-//     configuration.
-func ProcessFlagAliases(log *zerolog.Logger, flags *pflag.FlagSet) error {
-	// Ensure env-sourced values are visible to alias logic via flag Gets.
-	err := ApplyEnvToFlags(flags, AllSpecs())
-	if err != nil {
-		return fmt.Errorf("apply environment configuration: %w", err)
-	}
-
+//   - error: Non-nil when the flags hold an invalid configuration.
+func processFlagAliases(log *zerolog.Logger, flags *pflag.FlagSet) error {
 	// Handle porcelain mode.
 	porcelain, err := flags.GetString("porcelain")
 	if err != nil {
@@ -510,7 +406,7 @@ func ProcessFlagAliases(log *zerolog.Logger, flags *pflag.FlagSet) error {
 	return nil
 }
 
-// SetupLogging configures format and level on the provided logger.
+// setupLogging configures format and level on the provided logger.
 //
 // Parameters:
 //   - log: Logger to reconfigure (typically from logging.New at process start).
@@ -519,7 +415,7 @@ func ProcessFlagAliases(log *zerolog.Logger, flags *pflag.FlagSet) error {
 // Returns:
 //   - *zerolog.Logger: Logger with format writer and level applied.
 //   - error: Non-nil if config fails, nil on success.
-func SetupLogging(log *zerolog.Logger, flags *pflag.FlagSet) (*zerolog.Logger, error) {
+func setupLogging(log *zerolog.Logger, flags *pflag.FlagSet) (*zerolog.Logger, error) {
 	logFormat, err := flags.GetString("log-format")
 	if err != nil {
 		log.Debug().
@@ -579,8 +475,8 @@ func SetupLogging(log *zerolog.Logger, flags *pflag.FlagSet) (*zerolog.Logger, e
 	// so GetString is rarely empty. The empty branch is defensive for tests or
 	// partial flag sets (for example orchestrator paths that never registered logging
 	// flags) and preserves the level already on log (typically InfoLevel from main).
-	// ProcessFlagAliases may have already forced debug/trace onto the log-level flag.
-	// Invalid levels fail fast (same contract as the previous SetupLogging behavior).
+	// processFlagAliases may have already forced debug/trace onto the log-level flag.
+	// Invalid levels fail fast.
 	if rawLogLevel != "" {
 		level, parseErr := logging.ParseLevel(rawLogLevel)
 		if parseErr != nil {
@@ -648,7 +544,7 @@ func appendFlagValue(log *zerolog.Logger, flags *pflag.FlagSet, name string, val
 }
 
 // setFlagIfDefault sets a flag's value unless it was set by a flag or by an
-// environment variable. ApplyEnvToFlags leaves environment values unmarked, so
+// environment variable. applyEnvToFlags leaves environment values unmarked, so
 // they are checked separately.
 //
 // Parameters:
@@ -677,7 +573,7 @@ func setFlagIfDefault(log *zerolog.Logger, flags *pflag.FlagSet, name, value str
 }
 
 // setByEnv reports whether an environment variable supplies the flag's value,
-// using the same rule as ApplyEnvToFlags.
+// using the same rule as applyEnvToFlags.
 //
 // Parameters:
 //   - name: Flag name.

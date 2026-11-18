@@ -5,14 +5,18 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
 	dockerContainer "github.com/moby/moby/api/types/container"
 
+	"github.com/nicholas-fedor/watchtower/internal/container"
+	"github.com/nicholas-fedor/watchtower/internal/container/labels"
 	"github.com/nicholas-fedor/watchtower/internal/registry/ratelimit"
+	gitConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/git"
+	updateConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/update"
 	mockUpdate "github.com/nicholas-fedor/watchtower/internal/update/mocks"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // TestUpdateAction_MonitorOnly verifies that monitor-only containers, set by
@@ -30,10 +34,10 @@ func TestUpdateAction_MonitorOnly(t *testing.T) {
 			t.Run("should not update those containers and collect no image IDs", func(t *testing.T) {
 				t.Parallel()
 
-				client := mockUpdate.CreateMockClient(
+				client := mockUpdate.CreateFakeClient(
 					&mockUpdate.TestData{
 						NameOfContainerToKeep: "test-container-02",
-						Containers: []types.Container{
+						Containers: []*container.Container{
 							mockUpdate.CreateMockContainer(
 								"test-container-01",
 								"test-container-01",
@@ -66,7 +70,7 @@ func TestUpdateAction_MonitorOnly(t *testing.T) {
 
 				require.NoError(t, err)
 				require.Len(t, report.Updated(), 1)
-				assert.Contains(t, removedImageIDs(cleanupImageInfos), types.ImageID("fake-image1:latest"))
+				assert.Contains(t, removedImageIDs(cleanupImageInfos), container.ImageID("fake-image1:latest"))
 				require.Len(t, cleanupImageInfos, 1)
 				assert.Equal(t, int32(0), client.TestData.TriedToRemoveImageCount.Load(), "RemoveImageByID should not be called during Update")
 			})
@@ -78,9 +82,9 @@ func TestUpdateAction_MonitorOnly(t *testing.T) {
 			t.Run("should not update any containers and collect no image IDs", func(t *testing.T) {
 				t.Parallel()
 
-				client := mockUpdate.CreateMockClient(
+				client := mockUpdate.CreateFakeClient(
 					&mockUpdate.TestData{
-						Containers: []types.Container{
+						Containers: []*container.Container{
 							mockUpdate.CreateMockContainer(
 								"test-container-01",
 								"test-container-01",
@@ -116,9 +120,9 @@ func TestUpdateAction_MonitorOnly(t *testing.T) {
 				t.Run("it should update containers when monitor only is set to false", func(t *testing.T) {
 					t.Parallel()
 
-					client := mockUpdate.CreateMockClient(
+					client := mockUpdate.CreateFakeClient(
 						&mockUpdate.TestData{
-							Containers: []types.Container{
+							Containers: []*container.Container{
 								mockUpdate.CreateMockContainerWithConfig(
 									"test-container-02",
 									"test-container-02",
@@ -148,7 +152,7 @@ func TestUpdateAction_MonitorOnly(t *testing.T) {
 
 					require.NoError(t, err)
 					require.Len(t, report.Updated(), 1)
-					assert.Contains(t, removedImageIDs(cleanupImageInfos), types.ImageID("fake-image2:latest"))
+					assert.Contains(t, removedImageIDs(cleanupImageInfos), container.ImageID("fake-image2:latest"))
 					require.Len(t, cleanupImageInfos, 1)
 					assert.Equal(t, int32(0), client.TestData.TriedToRemoveImageCount.Load(), "RemoveImageByID should not be called during Update")
 				})
@@ -156,9 +160,9 @@ func TestUpdateAction_MonitorOnly(t *testing.T) {
 				t.Run("it should not update containers when monitor only is set to true", func(t *testing.T) {
 					t.Parallel()
 
-					client := mockUpdate.CreateMockClient(
+					client := mockUpdate.CreateFakeClient(
 						&mockUpdate.TestData{
-							Containers: []types.Container{
+							Containers: []*container.Container{
 								mockUpdate.CreateMockContainerWithConfig(
 									"test-container-02",
 									"test-container-02",
@@ -195,9 +199,9 @@ func TestUpdateAction_MonitorOnly(t *testing.T) {
 				t.Run("it should not update containers when monitor only is not set", func(t *testing.T) {
 					t.Parallel()
 
-					client := mockUpdate.CreateMockClient(
+					client := mockUpdate.CreateFakeClient(
 						&mockUpdate.TestData{
-							Containers: []types.Container{
+							Containers: []*container.Container{
 								mockUpdate.CreateMockContainer(
 									"test-container-01",
 									"test-container-01",
@@ -226,4 +230,49 @@ func TestUpdateAction_MonitorOnly(t *testing.T) {
 			})
 		})
 	})
+}
+
+// TestUpdate_GitWatchedNoPullIsNotRebuilt verifies that a Git-watched
+// container with no-pull, set by label or globally, is reported stale when
+// its remote advances, but is neither rebuilt nor recreated. The client mock
+// expects only the listing, so a stop, build or recreate fails the test.
+func TestUpdate_GitWatchedNoPullIsNotRebuilt(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		labels map[string]string
+		policy updateConfig.Policy
+	}{
+		{
+			name:   "no-pull label",
+			labels: map[string]string{labels.NoPull: "true"},
+		},
+		{
+			name:   "no-pull configuration option",
+			policy: updateConfig.Policy{NoPull: true},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			app, gitClient, _ := gitWatchedTestContainer(t, tt.labels)
+
+			client := newMockClient(t)
+			client.EXPECT().ListContainers(mock.Anything, mock.Anything).Return([]*container.Container{app}, nil).Once()
+
+			report, _, err := update(newTestLogger(t), t.Context(), client,
+				updateParams.Params{Git: gitConfig.Defaults{Enable: true}, Policy: tt.policy},
+				ratelimit.New(), gitClient)
+			require.NoError(t, err)
+
+			require.Len(t, report.Stale(), 1)
+			assert.Equal(t, app.ID(), report.Stale()[0].ID())
+			assert.Empty(t, report.Updated())
+			assert.Empty(t, report.Failed())
+			assert.False(t, app.IsStale())
+		})
+	}
 }

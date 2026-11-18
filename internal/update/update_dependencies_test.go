@@ -14,7 +14,7 @@ import (
 	dockerContainer "github.com/moby/moby/api/types/container"
 	dockerNetwork "github.com/moby/moby/api/types/network"
 
-	mockContainerClient "github.com/nicholas-fedor/watchtower/internal/container/client/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/container"
 	"github.com/nicholas-fedor/watchtower/internal/container/filters"
 	"github.com/nicholas-fedor/watchtower/internal/container/labels"
 	"github.com/nicholas-fedor/watchtower/internal/registry/ratelimit"
@@ -24,7 +24,6 @@ import (
 	"github.com/nicholas-fedor/watchtower/internal/update/cleanup"
 	mockUpdate "github.com/nicholas-fedor/watchtower/internal/update/mocks"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // TestUpdateAction_Dependencies verifies that an update stops and starts
@@ -84,9 +83,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						containerA,
 						containerB,
 						containerC,
@@ -108,9 +107,15 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 
 			// Verify that all containers were updated (dependencies were handled correctly)
 			require.Len(t, cleanupImageInfos, 3)
-			assert.True(t, slices.ContainsFunc(cleanupImageInfos, func(info cleanup.RemovedImageInfo) bool { return info.ImageID == types.ImageID("fake-image-a:latest") }))
-			assert.True(t, slices.ContainsFunc(cleanupImageInfos, func(info cleanup.RemovedImageInfo) bool { return info.ImageID == types.ImageID("fake-image-b:latest") }))
-			assert.True(t, slices.ContainsFunc(cleanupImageInfos, func(info cleanup.RemovedImageInfo) bool { return info.ImageID == types.ImageID("fake-image-c:latest") }))
+			assert.True(t, slices.ContainsFunc(cleanupImageInfos, func(info cleanup.RemovedImageInfo) bool {
+				return info.ImageID == container.ImageID("fake-image-a:latest")
+			}))
+			assert.True(t, slices.ContainsFunc(cleanupImageInfos, func(info cleanup.RemovedImageInfo) bool {
+				return info.ImageID == container.ImageID("fake-image-b:latest")
+			}))
+			assert.True(t, slices.ContainsFunc(cleanupImageInfos, func(info cleanup.RemovedImageInfo) bool {
+				return info.ImageID == container.ImageID("fake-image-c:latest")
+			}))
 		})
 	})
 
@@ -150,7 +155,7 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			containers := []types.Container{
+			containers := []*container.Container{
 				provider,
 				consumer,
 			}
@@ -298,7 +303,7 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			containers := []types.Container{dbContainer, webContainer}
+			containers := []*container.Container{dbContainer, webContainer}
 
 			// db container is stale
 			dbContainer.SetStale(true)
@@ -348,7 +353,7 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			containers := []types.Container{dbContainer, webContainer}
+			containers := []*container.Container{dbContainer, webContainer}
 
 			// db container is stale
 			dbContainer.SetStale(true)
@@ -411,7 +416,7 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			containers := []types.Container{
+			containers := []*container.Container{
 				containerC,
 				containerB,
 				containerA,
@@ -439,9 +444,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 		t.Run("should handle malformed labels and missing containers gracefully", func(t *testing.T) {
 			t.Parallel()
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainerWithConfig(
 							"container-with-malformed-depends",
 							"/container-with-malformed-depends",
@@ -521,7 +526,7 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			containers := []types.Container{badContainer, base, dependent}
+			containers := []*container.Container{badContainer, base, dependent}
 			base.SetStale(true)
 
 			updateImplicitRestart(newTestLogger(t), containers, containers, true)
@@ -570,7 +575,7 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			containers := []types.Container{base, dependent}
+			containers := []*container.Container{base, dependent}
 			base.SetStale(true)
 
 			updateImplicitRestart(newTestLogger(t), containers, containers, true)
@@ -621,7 +626,7 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			containers := []types.Container{base, dependent}
+			containers := []*container.Container{base, dependent}
 			base.SetStale(true)
 
 			updateImplicitRestart(newTestLogger(t), containers, containers, true)
@@ -672,7 +677,7 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 			)
 			dependent.ContainerInfo().HostConfig.NetworkMode = "container:base"
 
-			containers := []types.Container{base, dependent}
+			containers := []*container.Container{base, dependent}
 			base.SetStale(true)
 
 			updateImplicitRestart(newTestLogger(t), containers, containers, true)
@@ -687,7 +692,7 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 			containers := createDependencyChain(
 				[]string{"container-a", "container-b", "container-c"},
 			)
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
 					Containers: containers,
 					Staleness: map[string]bool{
@@ -760,9 +765,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 					ExposedPorts: dockerNetwork.PortSet{},
 				},
 			)
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{base, dep1, indep},
+					Containers: []*container.Container{base, dep1, indep},
 					Staleness: map[string]bool{
 						"base":  true,
 						"dep1":  false,
@@ -820,9 +825,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						containerA,
 						containerB,
 					},
@@ -865,9 +870,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						dependent,
 					},
 					Staleness: map[string]bool{
@@ -885,7 +890,7 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 
 			// Verify that the container was updated
 			require.Len(t, cleanupImageInfos, 1)
-			assert.True(t, slices.ContainsFunc(cleanupImageInfos, func(info cleanup.RemovedImageInfo) bool { return info.ImageID == types.ImageID("dep-image:latest") }))
+			assert.True(t, slices.ContainsFunc(cleanupImageInfos, func(info cleanup.RemovedImageInfo) bool { return info.ImageID == container.ImageID("dep-image:latest") }))
 		})
 	})
 
@@ -954,9 +959,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						containerD,
 						containerB,
 						containerC,
@@ -980,7 +985,7 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 
 			// Verify that base container was updated
 			require.Len(t, cleanupImageInfos, 1)
-			assert.True(t, slices.ContainsFunc(cleanupImageInfos, func(info cleanup.RemovedImageInfo) bool { return info.ImageID == types.ImageID("image-d:latest") }))
+			assert.True(t, slices.ContainsFunc(cleanupImageInfos, func(info cleanup.RemovedImageInfo) bool { return info.ImageID == container.ImageID("image-d:latest") }))
 		})
 	})
 
@@ -1006,9 +1011,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						selfDependent,
 					},
 					Staleness: map[string]bool{
@@ -1049,9 +1054,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						dependent,
 					},
 					Staleness: map[string]bool{
@@ -1069,7 +1074,7 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 
 			// Verify that the container was updated
 			require.Len(t, cleanupImageInfos, 1)
-			assert.True(t, slices.ContainsFunc(cleanupImageInfos, func(info cleanup.RemovedImageInfo) bool { return info.ImageID == types.ImageID("dep-image:latest") }))
+			assert.True(t, slices.ContainsFunc(cleanupImageInfos, func(info cleanup.RemovedImageInfo) bool { return info.ImageID == container.ImageID("dep-image:latest") }))
 		})
 	})
 
@@ -1153,9 +1158,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						containerE,
 						containerD,
 						containerC,
@@ -1181,7 +1186,7 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 
 			// Verify that base container was updated
 			require.Len(t, cleanupImageInfos, 1)
-			assert.True(t, slices.ContainsFunc(cleanupImageInfos, func(info cleanup.RemovedImageInfo) bool { return info.ImageID == types.ImageID("image-e:latest") }))
+			assert.True(t, slices.ContainsFunc(cleanupImageInfos, func(info cleanup.RemovedImageInfo) bool { return info.ImageID == container.ImageID("image-e:latest") }))
 		})
 	})
 
@@ -1220,9 +1225,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						containerB,
 						containerA,
 					},
@@ -1242,7 +1247,7 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 
 			// Verify that base container was updated
 			require.Len(t, cleanupImageInfos, 1)
-			assert.True(t, slices.ContainsFunc(cleanupImageInfos, func(info cleanup.RemovedImageInfo) bool { return info.ImageID == types.ImageID("image-b:latest") }))
+			assert.True(t, slices.ContainsFunc(cleanupImageInfos, func(info cleanup.RemovedImageInfo) bool { return info.ImageID == container.ImageID("image-b:latest") }))
 		})
 	})
 
@@ -1282,7 +1287,7 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			containers := []types.Container{dependency, dependent}
+			containers := []*container.Container{dependency, dependent}
 
 			// Initially, only dependency should be marked for restart
 			dependency.SetStale(true)
@@ -1347,9 +1352,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{containerC, containerB, containerA},
+					Containers: []*container.Container{containerC, containerB, containerA},
 					Staleness: map[string]bool{
 						"container-c-rolling": true,
 						"container-b-rolling": true,
@@ -1412,9 +1417,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{dependency, dependent},
+					Containers: []*container.Container{dependency, dependent},
 					Staleness: map[string]bool{
 						"fresh-dependency": false,
 						"stale-dependent":  true,
@@ -1468,9 +1473,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{dependency, dependent},
+					Containers: []*container.Container{dependency, dependent},
 					Staleness: map[string]bool{
 						"stale-dependency": true,
 						"fresh-dependent":  false,
@@ -1560,9 +1565,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{app1, app2, app3, dbContainer},
+					Containers: []*container.Container{app1, app2, app3, dbContainer},
 					Staleness: map[string]bool{
 						"db":    true,
 						"app-1": false,
@@ -1663,9 +1668,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						cacheContainer,
 						databaseContainer,
 						webService,
@@ -1729,7 +1734,7 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			containers := []types.Container{dependency, dependent}
+			containers := []*container.Container{dependency, dependent}
 
 			// Test propagation from dependency to dependent
 			dependency.SetStale(true)
@@ -1825,9 +1830,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{database, webApp1, webApp2, apiService},
+					Containers: []*container.Container{database, webApp1, webApp2, apiService},
 					Staleness: map[string]bool{
 						"database":    true,
 						"web-app-1":   false,
@@ -1921,9 +1926,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						containerC,
 						containerB,
 						containerA,
@@ -2018,9 +2023,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{aDatabase, bService1, dService3, cService2},
+					Containers: []*container.Container{aDatabase, bService1, dService3, cService2},
 					Staleness: map[string]bool{
 						"a-database": false,
 						"b-service1": true,
@@ -2062,7 +2067,7 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 			t.Parallel()
 
 			testData := getNetworkModeTestData()
-			client := mockUpdate.CreateMockClient(testData, false, false)
+			client := mockUpdate.CreateFakeClient(testData, false, false)
 
 			report, cleanupImageInfos, err := update(newTestLogger(t), t.Context(), client, updateParams.Params{Cleanup: true}, ratelimit.New())
 
@@ -2085,7 +2090,7 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 			t.Parallel()
 
 			testData := getComposeDependsOnWithNetworkModeTestData()
-			client := mockUpdate.CreateMockClient(testData, false, false)
+			client := mockUpdate.CreateFakeClient(testData, false, false)
 
 			report, cleanupImageInfos, err := update(newTestLogger(t), t.Context(), client, updateParams.Params{Cleanup: true}, ratelimit.New())
 
@@ -2156,9 +2161,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 			)
 			web.ContainerInfo().HostConfig.NetworkMode = "container:net-proxy"
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{web, vpn},
+					Containers: []*container.Container{web, vpn},
 					Staleness: map[string]bool{
 						"web-app":   false,
 						"net-proxy": true,
@@ -2222,9 +2227,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 			)
 			qbittorrent.ContainerInfo().HostConfig.NetworkMode = "container:gluetun"
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{qbittorrent, gluetun},
+					Containers: []*container.Container{qbittorrent, gluetun},
 					Staleness: map[string]bool{
 						"qbittorrent": false,
 						"gluetun":     true,
@@ -2288,9 +2293,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 			)
 			qbittorrent.ContainerInfo().HostConfig.NetworkMode = "container:gluetun-vpn-1"
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{qbittorrent, gluetun},
+					Containers: []*container.Container{qbittorrent, gluetun},
 					Staleness: map[string]bool{
 						"qbittorrent-app-1": false,
 						"gluetun-vpn-1":     true,
@@ -2358,9 +2363,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				"container:" + providerID,
 			)
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{qbittorrent, gluetun},
+					Containers: []*container.Container{qbittorrent, gluetun},
 					Staleness: map[string]bool{
 						"qbittorrent": false,
 						"gluetun":     true,
@@ -2442,9 +2447,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 			)
 			prowlarr.ContainerInfo().HostConfig.NetworkMode = "container:/gluetun"
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{qbittorrent, prowlarr, gluetun},
+					Containers: []*container.Container{qbittorrent, prowlarr, gluetun},
 					Staleness: map[string]bool{
 						"qbittorrent": false,
 						"prowlarr":    false,
@@ -2516,9 +2521,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{app1Db, app2Web},
+					Containers: []*container.Container{app1Db, app2Web},
 					Staleness: map[string]bool{
 						"app1-database": true,
 						"app2-web":      false,
@@ -2591,9 +2596,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{databaseService, externalCache, webService},
+					Containers: []*container.Container{databaseService, externalCache, webService},
 					Staleness: map[string]bool{
 						"myproject-database": true,
 						"external-cache":     true,
@@ -2669,9 +2674,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{project1Db, project2Db, appService},
+					Containers: []*container.Container{project1Db, project2Db, appService},
 					Staleness: map[string]bool{
 						"project1-database": false,
 						"project2-database": true,
@@ -2748,9 +2753,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{db1, db2, worker},
+					Containers: []*container.Container{db1, db2, worker},
 					Staleness: map[string]bool{
 						"myapp-database-1": true,
 						"myapp-database-2": false,
@@ -2824,9 +2829,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{projectDB, standaloneCache, projectWeb},
+					Containers: []*container.Container{projectDB, standaloneCache, projectWeb},
 					Staleness: map[string]bool{
 						"project-db":       true,
 						"standalone-cache": false,
@@ -2907,9 +2912,9 @@ func TestUpdateAction_Dependencies(t *testing.T) {
 				},
 			)
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{dbContainer, appContainer, webContainer},
+					Containers: []*container.Container{dbContainer, appContainer, webContainer},
 					Staleness: map[string]bool{
 						"myproject-db-1":  true,
 						"myproject-app-1": false,
@@ -2945,7 +2950,7 @@ func TestUpdate_WarnsOnUnresolvedDependsOn(t *testing.T) {
 
 	// Problems are logged at warn once per process, so app needs an ID no
 	// earlier run has seen.
-	containers := []types.Container{
+	containers := []*container.Container{
 		modelfixture.Container(
 			containerfixture.WithID(containerfixture.RandomID()),
 			containerfixture.WithName("/app"),
@@ -2963,10 +2968,10 @@ func TestUpdate_WarnsOnUnresolvedDependsOn(t *testing.T) {
 		),
 	}
 
-	client := mockContainerClient.NewMockClient(t)
+	client := newMockClient(t)
 	client.EXPECT().ListContainers(mock.Anything, mock.Anything).Return(containers, nil).Once()
 	client.EXPECT().IsContainerStale(mock.Anything, mock.Anything, mock.Anything).
-		Return(false, types.ImageID(""), "", nil)
+		Return(false, container.ImageID(""), "", nil)
 
 	// The update logs from several goroutines, so the buffer is synchronized.
 	var output bytes.Buffer
@@ -2999,23 +3004,10 @@ func composeServiceLabels(project, service string) map[string]string {
 func TestRunUpdatesWithNotifications_IdentifierCollisionNotifiesOnce(t *testing.T) {
 	t.Parallel()
 
-	// collidingContainer returns a running container named /app with the given ID.
-	collidingContainer := func(id string) types.Container {
-		return mockUpdate.CreateMockContainerWithConfig(
-			id,
-			"/app",
-			"org/app:1",
-			true,
-			false,
-			time.Now(),
-			&dockerContainer.Config{Image: "org/app:1"},
-		)
-	}
-
-	client := mockUpdate.CreateMockClient(&mockUpdate.TestData{
-		Containers: []types.Container{
-			collidingContainer("a000000000000000000000000000000000000000000000000000000000000000"),
-			collidingContainer("b000000000000000000000000000000000000000000000000000000000000000"),
+	client := mockUpdate.CreateFakeClient(&mockUpdate.TestData{
+		Containers: []*container.Container{
+			skipTestContainer("a000000000000000000000000000000000000000000000000000000000000000", "app", nil),
+			skipTestContainer("b000000000000000000000000000000000000000000000000000000000000000", "app", nil),
 		},
 	}, false, false)
 
@@ -3055,4 +3047,27 @@ func TestRunUpdatesWithNotifications_IdentifierCollisionNotifiesOnce(t *testing.
 	require.True(t, ok, "the error field should be a string")
 	assert.Contains(t, errText, "app (a00000000000)")
 	assert.Contains(t, errText, "app (b00000000000)")
+}
+
+// TestUpdate_GraphFailureEndsBeforeChecksAndHooks verifies that a session
+// whose dependency graph cannot be built ends before it runs a pre-check hook
+// or checks any container for updates. Two containers named /app make the
+// graph fail. The client mock expects only the listing, so a hook command or a
+// staleness check fails the test.
+func TestUpdate_GraphFailureEndsBeforeChecksAndHooks(t *testing.T) {
+	t.Parallel()
+
+	preCheck := map[string]string{labels.LifecyclePreCheck: "echo checking"}
+
+	client := newMockClient(t)
+	client.EXPECT().ListContainers(mock.Anything, mock.Anything).Return([]*container.Container{
+		skipTestContainer("a000000000000000000000000000000000000000000000000000000000000000", "app", preCheck),
+		skipTestContainer("b000000000000000000000000000000000000000000000000000000000000000", "app", preCheck),
+	}, nil).Once()
+
+	report, _, err := update(newTestLogger(t), t.Context(), client,
+		updateParams.Params{LifecycleHooks: true}, ratelimit.New())
+
+	require.ErrorIs(t, err, errSortDependenciesFailed)
+	assert.Nil(t, report)
 }

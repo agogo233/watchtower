@@ -3,6 +3,7 @@ package rebuild
 import (
 	"bytes"
 	"context"
+	"maps"
 	"os"
 	"path/filepath"
 	"testing"
@@ -16,15 +17,16 @@ import (
 
 	composeApply "github.com/nicholas-fedor/watchtower/internal/compose/apply"
 	composeLabels "github.com/nicholas-fedor/watchtower/internal/compose/labels"
-	mockContainerClient "github.com/nicholas-fedor/watchtower/internal/container/client/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/container"
 	"github.com/nicholas-fedor/watchtower/internal/container/labels"
 	"github.com/nicholas-fedor/watchtower/internal/git"
 	"github.com/nicholas-fedor/watchtower/internal/git/project"
+	"github.com/nicholas-fedor/watchtower/internal/git/semver"
+	dockerConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/docker"
 	gitConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/git"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	mockRebuild "github.com/nicholas-fedor/watchtower/internal/update/rebuild/mocks"
 	"github.com/nicholas-fedor/watchtower/internal/update/state"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // writeComposeProjectDir writes a Compose project with two built services to a
@@ -74,7 +76,7 @@ func TestSession_applyCompose(t *testing.T) {
 			}, nil).
 			Once()
 
-		sess := NewSession(gitTestClient(t))
+		sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
 		sess.apply = applier
 
 		var checkouts int
@@ -112,13 +114,13 @@ func TestSession_applyCompose(t *testing.T) {
 		sess.store(api.ID(), result)
 		sess.store(worker.ID(), result)
 
-		failed := map[types.ContainerID]error{}
-		docker := mockContainerClient.NewMockClient(t)
+		failed := map[container.ContainerID]error{}
+		docker := mockRebuild.NewMockImageBuilder(t)
 		sess.PrepareRebuilds(
 			newTestLogger(t),
 			t.Context(),
 			docker,
-			[]types.Container{api, worker},
+			[]*container.Container{api, worker},
 			updateParams.Params{GitComposeStash: true, Git: gitConfig.Defaults{Enable: true}},
 			nil,
 			failed,
@@ -132,7 +134,7 @@ func TestSession_applyCompose(t *testing.T) {
 		assert.Equal(t, result.Commit, got.Labels["api"][labels.GitLastCommit])
 		assert.Contains(t, sess.applied, api.ID())
 		assert.Contains(t, sess.applied, worker.ID())
-		assert.True(t, sess.SkipRecreate(api, updateParams.Params{}))
+		assert.Empty(t, sess.ExcludeApplied([]*container.Container{api, worker}))
 	})
 
 	t.Run("separates projects that share a directory and config identity", func(t *testing.T) {
@@ -154,13 +156,13 @@ func TestSession_applyCompose(t *testing.T) {
 				return []composeApply.Container{{
 					Service: req.Services[0],
 					Name:    "/" + req.Ref.Name + "-api",
-					ID:      types.ContainerID("new-" + req.Ref.Name),
-					ImageID: types.ImageID("sha256:" + req.Ref.Name),
+					ID:      container.ContainerID("new-" + req.Ref.Name),
+					ImageID: container.ImageID("sha256:" + req.Ref.Name),
 				}}, nil
 			}).
 			Twice()
 
-		sess := NewSession(gitTestClient(t))
+		sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
 		sess.apply = applier
 
 		var checkouts int
@@ -191,9 +193,9 @@ func TestSession_applyCompose(t *testing.T) {
 		sess.store(alpha.ID(), result)
 		sess.store(beta.ID(), result)
 
-		failed := map[types.ContainerID]error{}
-		docker := mockContainerClient.NewMockClient(t)
-		sess.PrepareRebuilds(newTestLogger(t), t.Context(), docker, []types.Container{alpha, beta}, updateParams.Params{Git: gitConfig.Defaults{Enable: true}}, nil, failed)
+		failed := map[container.ContainerID]error{}
+		docker := mockRebuild.NewMockImageBuilder(t)
+		sess.PrepareRebuilds(newTestLogger(t), t.Context(), docker, []*container.Container{alpha, beta}, updateParams.Params{Git: gitConfig.Defaults{Enable: true}}, nil, failed)
 
 		assert.Empty(t, failed)
 		assert.Equal(t, 2, checkouts)
@@ -220,13 +222,13 @@ func TestSession_applyCompose(t *testing.T) {
 				return []composeApply.Container{{
 					Service: req.Services[0],
 					Name:    "/" + req.Ref.Name + "-api",
-					ID:      types.ContainerID("new-" + req.Ref.Name),
-					ImageID: types.ImageID("sha256:" + req.Ref.Name),
+					ID:      container.ContainerID("new-" + req.Ref.Name),
+					ImageID: container.ImageID("sha256:" + req.Ref.Name),
 				}}, nil
 			}).
 			Twice()
 
-		sess := NewSession(gitTestClient(t))
+		sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
 		sess.apply = applier
 		sess.checkout = func(context.Context, string, string, project.CheckoutOptions) error {
 			return nil
@@ -251,9 +253,9 @@ func TestSession_applyCompose(t *testing.T) {
 		sess.store(provider.ID(), result)
 		sess.store(dependent.ID(), result)
 
-		failed := map[types.ContainerID]error{}
-		docker := mockContainerClient.NewMockClient(t)
-		sess.PrepareRebuilds(newTestLogger(t), t.Context(), docker, []types.Container{dependent, provider}, updateParams.Params{Git: gitConfig.Defaults{Enable: true}}, nil, failed)
+		failed := map[container.ContainerID]error{}
+		docker := mockRebuild.NewMockImageBuilder(t)
+		sess.PrepareRebuilds(newTestLogger(t), t.Context(), docker, []*container.Container{dependent, provider}, updateParams.Params{Git: gitConfig.Defaults{Enable: true}}, nil, failed)
 
 		assert.Empty(t, failed)
 		assert.Equal(t, []string{"alpha", "beta"}, order)
@@ -277,8 +279,8 @@ func TestSession_applyCompose(t *testing.T) {
 					items = append(items, composeApply.Container{
 						Service: service,
 						Name:    "/" + req.Ref.Name + "-" + service,
-						ID:      types.ContainerID("new-" + req.Ref.Name + "-" + service),
-						ImageID: types.ImageID("sha256:" + req.Ref.Name),
+						ID:      container.ContainerID("new-" + req.Ref.Name + "-" + service),
+						ImageID: container.ImageID("sha256:" + req.Ref.Name),
 					})
 				}
 
@@ -286,7 +288,7 @@ func TestSession_applyCompose(t *testing.T) {
 			}).
 			Twice()
 
-		sess := NewSession(gitTestClient(t))
+		sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
 		sess.apply = applier
 		sess.checkout = func(context.Context, string, string, project.CheckoutOptions) error {
 			return nil
@@ -318,13 +320,13 @@ func TestSession_applyCompose(t *testing.T) {
 		sess.store(dependent.ID(), result)
 		sess.store(provider.ID(), result)
 
-		failed := map[types.ContainerID]error{}
-		docker := mockContainerClient.NewMockClient(t)
+		failed := map[container.ContainerID]error{}
+		docker := mockRebuild.NewMockImageBuilder(t)
 		sess.PrepareRebuilds(
 			newTestLogger(t),
 			t.Context(),
 			docker,
-			[]types.Container{metrics, dependent, provider},
+			[]*container.Container{metrics, dependent, provider},
 			updateParams.Params{Git: gitConfig.Defaults{Enable: true}},
 			nil,
 			failed,
@@ -354,7 +356,7 @@ func TestSession_applyCompose(t *testing.T) {
 				}).
 				Once()
 
-			sess := NewSession(gitTestClient(t))
+			sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
 			sess.apply = applier
 			sess.checkout = func(context.Context, string, string, project.CheckoutOptions) error {
 				return nil
@@ -368,13 +370,13 @@ func TestSession_applyCompose(t *testing.T) {
 			c.SetStale(true)
 			sess.store(c.ID(), git.CheckResult{Stale: true, Commit: "abc"})
 
-			failed := map[types.ContainerID]error{}
-			docker := mockContainerClient.NewMockClient(t)
+			failed := map[container.ContainerID]error{}
+			docker := mockRebuild.NewMockImageBuilder(t)
 			sess.PrepareRebuilds(
 				newTestLogger(t),
 				t.Context(),
 				docker,
-				[]types.Container{c},
+				[]*container.Container{c},
 				updateParams.Params{Git: gitConfig.Defaults{Enable: true}},
 				nil,
 				failed,
@@ -392,7 +394,7 @@ func TestSession_applyCompose(t *testing.T) {
 		applier := mockRebuild.NewMockApplier(t)
 		parent, cancel := context.WithCancel(t.Context())
 
-		sess := NewSession(gitTestClient(t))
+		sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
 		sess.apply = applier
 		sess.checkout = func(_ context.Context, _, _ string, opts project.CheckoutOptions) error {
 			if opts.Prior != nil {
@@ -412,13 +414,13 @@ func TestSession_applyCompose(t *testing.T) {
 		c.SetStale(true)
 		sess.store(c.ID(), git.CheckResult{Stale: true, Commit: "abc"})
 
-		failed := map[types.ContainerID]error{}
-		docker := mockContainerClient.NewMockClient(t)
+		failed := map[container.ContainerID]error{}
+		docker := mockRebuild.NewMockImageBuilder(t)
 		sess.PrepareRebuilds(
 			newTestLogger(t),
 			parent,
 			docker,
-			[]types.Container{c},
+			[]*container.Container{c},
 			updateParams.Params{Git: gitConfig.Defaults{Enable: true}},
 			nil,
 			failed,
@@ -438,7 +440,7 @@ func TestSession_applyCompose(t *testing.T) {
 			Return([]composeApply.Container{{Service: "api", ID: "new-api", ImageID: "sha256:api"}}, nil).
 			Once()
 
-		sess := NewSession(gitTestClient(t))
+		sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
 		sess.apply = applier
 		sess.checkout = func(context.Context, string, string, project.CheckoutOptions) error {
 			return nil
@@ -456,17 +458,17 @@ func TestSession_applyCompose(t *testing.T) {
 
 		params := updateParams.Params{Git: gitConfig.Defaults{Enable: true}}
 		progress := &state.Progress{}
-		progress.AddScanned(newTestLogger(t), c, types.ImageID("git:"+result.Commit), params)
+		progress.AddScanned(newTestLogger(t), c, container.ImageID("git:"+result.Commit), params)
 
-		failed := map[types.ContainerID]error{}
-		docker := mockContainerClient.NewMockClient(t)
-		sess.PrepareRebuilds(newTestLogger(t), t.Context(), docker, []types.Container{c}, params, progress, failed)
+		failed := map[container.ContainerID]error{}
+		docker := mockRebuild.NewMockImageBuilder(t)
+		sess.PrepareRebuilds(newTestLogger(t), t.Context(), docker, []*container.Container{c}, params, progress, failed)
 
 		report := progress.Report(newTestLogger(t))
 
 		assert.Empty(t, failed)
 		require.Len(t, report.Updated(), 1)
-		assert.Equal(t, types.ContainerID("new-api"), report.Updated()[0].NewContainerID())
+		assert.Equal(t, container.ContainerID("new-api"), report.Updated()[0].NewContainerID())
 		assert.Empty(t, report.Stale())
 	})
 
@@ -474,7 +476,7 @@ func TestSession_applyCompose(t *testing.T) {
 		t.Parallel()
 
 		dir := writeComposeProjectDir(t)
-		sess := NewSession(gitTestClient(t))
+		sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
 		sess.apply = mockRebuild.NewMockApplier(t)
 		c := gitAssociatedContainer("api", "/api", "webstack-api:latest", map[string]string{
 			labels.ComposeDir: dir,
@@ -482,9 +484,9 @@ func TestSession_applyCompose(t *testing.T) {
 		c.SetStale(true)
 		sess.store(c.ID(), git.CheckResult{Stale: true, Commit: "abc"})
 
-		failed := map[types.ContainerID]error{}
-		docker := mockContainerClient.NewMockClient(t)
-		sess.PrepareRebuilds(newTestLogger(t), t.Context(), docker, []types.Container{c}, updateParams.Params{Git: gitConfig.Defaults{Enable: true}}, nil, failed)
+		failed := map[container.ContainerID]error{}
+		docker := mockRebuild.NewMockImageBuilder(t)
+		sess.PrepareRebuilds(newTestLogger(t), t.Context(), docker, []*container.Container{c}, updateParams.Params{Git: gitConfig.Defaults{Enable: true}}, nil, failed)
 
 		require.ErrorIs(t, failed[c.ID()], errGitComposeService)
 		assert.False(t, c.IsStale())
@@ -495,7 +497,7 @@ func TestSession_applyCompose(t *testing.T) {
 
 		dir := writeComposeProjectDir(t)
 		applier := mockRebuild.NewMockApplier(t)
-		sess := NewSession(gitTestClient(t))
+		sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
 		sess.apply = applier
 		sess.checkout = func(context.Context, string, string, project.CheckoutOptions) error {
 			return project.ErrDirty
@@ -508,9 +510,9 @@ func TestSession_applyCompose(t *testing.T) {
 		c.SetStale(true)
 		sess.store(c.ID(), git.CheckResult{Stale: true, Commit: "abc"})
 
-		failed := map[types.ContainerID]error{}
-		docker := mockContainerClient.NewMockClient(t)
-		sess.PrepareRebuilds(newTestLogger(t), t.Context(), docker, []types.Container{c}, updateParams.Params{Git: gitConfig.Defaults{Enable: true}}, nil, failed)
+		failed := map[container.ContainerID]error{}
+		docker := mockRebuild.NewMockImageBuilder(t)
+		sess.PrepareRebuilds(newTestLogger(t), t.Context(), docker, []*container.Container{c}, updateParams.Params{Git: gitConfig.Defaults{Enable: true}}, nil, failed)
 
 		require.ErrorIs(t, failed[c.ID()], project.ErrDirty)
 		assert.False(t, c.IsStale())
@@ -526,7 +528,7 @@ func TestSession_applyCompose(t *testing.T) {
 			Return([]composeApply.Container{{Service: "api", Name: "/api", ID: "new-api", ImageID: "sha256:api"}}, nil).
 			Once()
 
-		sess := NewSession(git.New(newTestLogger(t), git.Options{Timeout: 10 * time.Millisecond}))
+		sess := NewSession(git.New(newTestLogger(t), git.Options{Timeout: 10 * time.Millisecond}), dockerConfig.Docker{})
 		sess.apply = applier
 		sess.checkout = func(ctx context.Context, _, _ string, _ project.CheckoutOptions) error {
 			<-ctx.Done()
@@ -541,9 +543,9 @@ func TestSession_applyCompose(t *testing.T) {
 		c.SetStale(true)
 		sess.store(c.ID(), git.CheckResult{Stale: true, Commit: "abc"})
 
-		failed := map[types.ContainerID]error{}
-		docker := mockContainerClient.NewMockClient(t)
-		sess.PrepareRebuilds(newTestLogger(t), t.Context(), docker, []types.Container{c}, updateParams.Params{Git: gitConfig.Defaults{Enable: true}}, nil, failed)
+		failed := map[container.ContainerID]error{}
+		docker := mockRebuild.NewMockImageBuilder(t)
+		sess.PrepareRebuilds(newTestLogger(t), t.Context(), docker, []*container.Container{c}, updateParams.Params{Git: gitConfig.Defaults{Enable: true}}, nil, failed)
 
 		assert.Empty(t, failed)
 		assert.Contains(t, sess.applied, c.ID())
@@ -565,7 +567,7 @@ func TestSession_applyCompose(t *testing.T) {
 		var logs bytes.Buffer
 
 		log := zerolog.New(&logs)
-		sess := NewSession(gitTestClient(t))
+		sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
 		sess.apply = applier
 		sess.checkout = func(context.Context, string, string, project.CheckoutOptions) error {
 			return nil
@@ -583,13 +585,13 @@ func TestSession_applyCompose(t *testing.T) {
 		c.SetStale(true)
 		sess.store(c.ID(), git.CheckResult{Stale: true, Commit: "abc"})
 
-		failed := map[types.ContainerID]error{}
-		docker := mockContainerClient.NewMockClient(t)
+		failed := map[container.ContainerID]error{}
+		docker := mockRebuild.NewMockImageBuilder(t)
 		params := updateParams.Params{Git: gitConfig.Defaults{Enable: true}}
 		progress := &state.Progress{}
-		progress.AddScanned(&log, c, types.ImageID("git:new"), params)
+		progress.AddScanned(&log, c, container.ImageID("git:new"), params)
 		progress.AddScanned(&log, fresh, fresh.ImageID(), params)
-		sess.PrepareRebuilds(&log, t.Context(), docker, []types.Container{c}, params, progress, failed)
+		sess.PrepareRebuilds(&log, t.Context(), docker, []*container.Container{c}, params, progress, failed)
 		progress.UpdateFailed(&log, failed)
 
 		report := progress.Report(&log)
@@ -615,7 +617,7 @@ func TestSession_applyCompose(t *testing.T) {
 			Return([]composeApply.Container{{Service: "api", ID: "new-api", ImageID: "sha256:api"}}, nil).
 			Once()
 
-		sess := NewSession(gitTestClient(t))
+		sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
 		sess.apply = applier
 		sess.checkout = func(context.Context, string, string, project.CheckoutOptions) error {
 			return nil
@@ -640,13 +642,13 @@ func TestSession_applyCompose(t *testing.T) {
 		var logs bytes.Buffer
 
 		log := zerolog.New(&logs)
-		failed := map[types.ContainerID]error{}
-		docker := mockContainerClient.NewMockClient(t)
+		failed := map[container.ContainerID]error{}
+		docker := mockRebuild.NewMockImageBuilder(t)
 		params := updateParams.Params{Git: gitConfig.Defaults{Enable: true}}
 		progress := &state.Progress{}
-		progress.AddScanned(&log, api, types.ImageID("git:abc"), params)
-		progress.AddScanned(&log, worker, types.ImageID("git:abc"), params)
-		sess.PrepareRebuilds(&log, t.Context(), docker, []types.Container{api, worker}, params, progress, failed)
+		progress.AddScanned(&log, api, container.ImageID("git:abc"), params)
+		progress.AddScanned(&log, worker, container.ImageID("git:abc"), params)
+		sess.PrepareRebuilds(&log, t.Context(), docker, []*container.Container{api, worker}, params, progress, failed)
 		progress.UpdateFailed(&log, failed)
 
 		report := progress.Report(&log)
@@ -678,7 +680,7 @@ func TestSession_applyCompose(t *testing.T) {
 			Return([]composeApply.Container{{Service: "api", ImageID: "sha256:built"}}, nil).
 			Once()
 
-		sess := NewSession(gitTestClient(t))
+		sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
 		sess.apply = applier
 		sess.checkout = func(context.Context, string, string, project.CheckoutOptions) error {
 			return nil
@@ -691,16 +693,16 @@ func TestSession_applyCompose(t *testing.T) {
 		c.SetStale(true)
 		sess.store(c.ID(), git.CheckResult{Stale: true, Commit: "abc"})
 
-		failed := map[types.ContainerID]error{}
-		docker := mockContainerClient.NewMockClient(t)
+		failed := map[container.ContainerID]error{}
+		docker := mockRebuild.NewMockImageBuilder(t)
 		params := updateParams.Params{NoRestart: true, Git: gitConfig.Defaults{Enable: true}}
 		progress := &state.Progress{}
-		progress.AddScanned(newTestLogger(t), c, types.ImageID("git:abc"), params)
+		progress.AddScanned(newTestLogger(t), c, container.ImageID("git:abc"), params)
 		sess.PrepareRebuilds(
 			newTestLogger(t),
 			t.Context(),
 			docker,
-			[]types.Container{c},
+			[]*container.Container{c},
 			params,
 			progress,
 			failed,
@@ -711,8 +713,8 @@ func TestSession_applyCompose(t *testing.T) {
 		assert.Empty(t, failed)
 		assert.True(t, got.BuildOnly)
 		assert.Empty(t, sess.applied)
-		assert.Equal(t, types.ImageID("sha256:built"), sess.built[c.ID()])
-		assert.True(t, sess.SkipRecreate(c, params))
+		assert.Equal(t, container.ImageID("sha256:built"), sess.built[c.ID()])
+		assert.Contains(t, sess.NoRestartBuiltIDs(params), c.ID())
 		assert.Empty(t, report.Updated())
 		require.Len(t, report.Stale(), 1)
 	})
@@ -727,7 +729,7 @@ func TestSession_applyCompose(t *testing.T) {
 			Return(nil, context.Canceled).
 			Once()
 
-		sess := NewSession(gitTestClient(t))
+		sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
 		sess.apply = applier
 		sess.checkout = func(context.Context, string, string, project.CheckoutOptions) error {
 			return nil
@@ -743,10 +745,10 @@ func TestSession_applyCompose(t *testing.T) {
 		var logs bytes.Buffer
 
 		log := zerolog.New(&logs)
-		failed := map[types.ContainerID]error{}
-		docker := mockContainerClient.NewMockClient(t)
+		failed := map[container.ContainerID]error{}
+		docker := mockRebuild.NewMockImageBuilder(t)
 		params := updateParams.Params{NoRestart: true, Git: gitConfig.Defaults{Enable: true}}
-		sess.PrepareRebuilds(&log, t.Context(), docker, []types.Container{c}, params, nil, failed)
+		sess.PrepareRebuilds(&log, t.Context(), docker, []*container.Container{c}, params, nil, failed)
 
 		require.ErrorIs(t, failed[c.ID()], context.Canceled)
 		assert.Contains(t, failed[c.ID()].Error(), "compose build failed")
@@ -761,7 +763,7 @@ func TestSession_applyCompose(t *testing.T) {
 
 		dir := writeComposeProjectDir(t)
 		checkedOut := false
-		sess := NewSession(gitTestClient(t))
+		sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
 		sess.apply = mockRebuild.NewMockApplier(t)
 		sess.checkout = func(context.Context, string, string, project.CheckoutOptions) error {
 			checkedOut = true
@@ -783,9 +785,9 @@ func TestSession_applyCompose(t *testing.T) {
 		sess.store(api.ID(), git.CheckResult{Stale: true, Commit: "aaa"})
 		sess.store(worker.ID(), git.CheckResult{Stale: true, Commit: "bbb"})
 
-		failed := map[types.ContainerID]error{}
-		docker := mockContainerClient.NewMockClient(t)
-		sess.PrepareRebuilds(newTestLogger(t), t.Context(), docker, []types.Container{api, worker}, updateParams.Params{Git: gitConfig.Defaults{Enable: true}}, nil, failed)
+		failed := map[container.ContainerID]error{}
+		docker := mockRebuild.NewMockImageBuilder(t)
+		sess.PrepareRebuilds(newTestLogger(t), t.Context(), docker, []*container.Container{api, worker}, updateParams.Params{Git: gitConfig.Defaults{Enable: true}}, nil, failed)
 
 		assert.False(t, checkedOut)
 		require.ErrorIs(t, failed[api.ID()], errGitComposeCommit)
@@ -813,7 +815,7 @@ func TestSession_applyCompose(t *testing.T) {
 			}, nil).
 			Once()
 
-		sess := NewSession(gitTestClient(t))
+		sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
 		sess.apply = applier
 		sess.checkout = func(context.Context, string, string, project.CheckoutOptions) error {
 			return nil
@@ -833,9 +835,9 @@ func TestSession_applyCompose(t *testing.T) {
 		sess.store(api.ID(), git.CheckResult{Stale: true, Commit: "abc", Tag: "v1.2.3"})
 		sess.store(worker.ID(), git.CheckResult{Stale: true, Commit: "abc", Tag: "v1.2.4"})
 
-		failed := map[types.ContainerID]error{}
-		docker := mockContainerClient.NewMockClient(t)
-		sess.PrepareRebuilds(newTestLogger(t), t.Context(), docker, []types.Container{api, worker}, updateParams.Params{Git: gitConfig.Defaults{Enable: true}}, nil, failed)
+		failed := map[container.ContainerID]error{}
+		docker := mockRebuild.NewMockImageBuilder(t)
+		sess.PrepareRebuilds(newTestLogger(t), t.Context(), docker, []*container.Container{api, worker}, updateParams.Params{Git: gitConfig.Defaults{Enable: true}}, nil, failed)
 
 		assert.Empty(t, failed)
 		assert.Equal(t, "v1.2.3", got.Labels["api"][labels.GitLastTag])
@@ -863,7 +865,7 @@ func TestSession_applyCompose(t *testing.T) {
 			}, nil).
 			Once()
 
-		sess := NewSession(gitTestClient(t))
+		sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
 		sess.apply = applier
 		sess.checkout = func(context.Context, string, string, project.CheckoutOptions) error {
 			return nil
@@ -885,9 +887,9 @@ func TestSession_applyCompose(t *testing.T) {
 		sess.store(one.ID(), result)
 		sess.store(two.ID(), result)
 
-		failed := map[types.ContainerID]error{}
-		docker := mockContainerClient.NewMockClient(t)
-		sess.PrepareRebuilds(newTestLogger(t), t.Context(), docker, []types.Container{one, two}, updateParams.Params{Git: gitConfig.Defaults{Enable: true}}, nil, failed)
+		failed := map[container.ContainerID]error{}
+		docker := mockRebuild.NewMockImageBuilder(t)
+		sess.PrepareRebuilds(newTestLogger(t), t.Context(), docker, []*container.Container{one, two}, updateParams.Params{Git: gitConfig.Defaults{Enable: true}}, nil, failed)
 
 		assert.Empty(t, failed)
 		assert.Equal(t, []string{"api"}, got.Services)
@@ -908,7 +910,7 @@ func TestSession_applyCompose(t *testing.T) {
 			}, nil).
 			Once()
 
-		sess := NewSession(gitTestClient(t))
+		sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
 		sess.apply = applier
 		sess.checkout = func(context.Context, string, string, project.CheckoutOptions) error {
 			return nil
@@ -930,12 +932,12 @@ func TestSession_applyCompose(t *testing.T) {
 
 		params := updateParams.Params{Git: gitConfig.Defaults{Enable: true}}
 		progress := &state.Progress{}
-		progress.AddScanned(newTestLogger(t), stale, types.ImageID("git:"+result.Commit), params)
+		progress.AddScanned(newTestLogger(t), stale, container.ImageID("git:"+result.Commit), params)
 		progress.AddScanned(newTestLogger(t), fresh, fresh.ImageID(), params)
 
-		failed := map[types.ContainerID]error{}
-		docker := mockContainerClient.NewMockClient(t)
-		sess.PrepareRebuilds(newTestLogger(t), t.Context(), docker, []types.Container{stale}, params, progress, failed)
+		failed := map[container.ContainerID]error{}
+		docker := mockRebuild.NewMockImageBuilder(t)
+		sess.PrepareRebuilds(newTestLogger(t), t.Context(), docker, []*container.Container{stale}, params, progress, failed)
 
 		report := progress.Report(newTestLogger(t))
 
@@ -946,7 +948,7 @@ func TestSession_applyCompose(t *testing.T) {
 		assert.Empty(t, report.Stale())
 		assert.NotEmpty(t, report.Updated()[0].NewContainerID())
 		assert.NotEmpty(t, report.Updated()[1].NewContainerID())
-		assert.Empty(t, sess.ExcludeApplied([]types.Container{stale, fresh}))
+		assert.Empty(t, sess.ExcludeApplied([]*container.Container{stale, fresh}))
 	})
 
 	t.Run("accepts additional Compose replicas absent from filtered progress", func(t *testing.T) {
@@ -962,7 +964,7 @@ func TestSession_applyCompose(t *testing.T) {
 			}, nil).
 			Once()
 
-		sess := NewSession(gitTestClient(t))
+		sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
 		sess.apply = applier
 		sess.checkout = func(context.Context, string, string, project.CheckoutOptions) error {
 			return nil
@@ -984,14 +986,14 @@ func TestSession_applyCompose(t *testing.T) {
 
 		params := updateParams.Params{Git: gitConfig.Defaults{Enable: true}}
 		progress := &state.Progress{}
-		progress.AddScanned(newTestLogger(t), stale, types.ImageID("git:"+result.Commit), params)
+		progress.AddScanned(newTestLogger(t), stale, container.ImageID("git:"+result.Commit), params)
 
 		var logs bytes.Buffer
 
 		log := zerolog.New(&logs)
-		failed := map[types.ContainerID]error{}
-		docker := mockContainerClient.NewMockClient(t)
-		sess.PrepareRebuilds(&log, t.Context(), docker, []types.Container{stale}, params, progress, failed)
+		failed := map[container.ContainerID]error{}
+		docker := mockRebuild.NewMockImageBuilder(t)
+		sess.PrepareRebuilds(&log, t.Context(), docker, []*container.Container{stale}, params, progress, failed)
 
 		report := progress.Report(&log)
 
@@ -1014,7 +1016,7 @@ func TestSession_applyCompose(t *testing.T) {
 			}, nil).
 			Once()
 
-		sess := NewSession(gitTestClient(t))
+		sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
 		sess.apply = applier
 		sess.checkout = func(context.Context, string, string, project.CheckoutOptions) error {
 			return nil
@@ -1036,9 +1038,9 @@ func TestSession_applyCompose(t *testing.T) {
 		sess.store(one.ID(), result)
 		sess.store(two.ID(), result)
 
-		failed := map[types.ContainerID]error{}
-		docker := mockContainerClient.NewMockClient(t)
-		sess.PrepareRebuilds(newTestLogger(t), t.Context(), docker, []types.Container{one, two}, updateParams.Params{Git: gitConfig.Defaults{Enable: true}}, nil, failed)
+		failed := map[container.ContainerID]error{}
+		docker := mockRebuild.NewMockImageBuilder(t)
+		sess.PrepareRebuilds(newTestLogger(t), t.Context(), docker, []*container.Container{one, two}, updateParams.Params{Git: gitConfig.Defaults{Enable: true}}, nil, failed)
 
 		assert.NotContains(t, failed, one.ID())
 		require.ErrorIs(t, failed[two.ID()], errGitComposeInstance)
@@ -1046,6 +1048,156 @@ func TestSession_applyCompose(t *testing.T) {
 		assert.Contains(t, sess.applied, one.ID())
 		assert.NotContains(t, sess.applied, two.ID())
 	})
+}
+
+// TestSession_recordCompose pins what recording an applied Compose container
+// leaves for the rest of the session: the report fields for the container, the
+// session's applied and built records, and the source container's labels,
+// which stay as they were.
+func TestSession_recordCompose(t *testing.T) {
+	t.Parallel()
+
+	const commit = "0123456789abcdef0123456789abcdef01234567"
+
+	type want struct {
+		gitRepo   string
+		gitRef    string
+		changelog string
+		newID     container.ContainerID
+		latestID  container.ImageID
+		applied   bool
+		built     container.ImageID
+		updated   bool
+	}
+
+	labeled := func() *container.Container {
+		return gitAssociatedContainer("api", "web-1", "webstack-api:latest", map[string]string{
+			labels.GitRepo: "https://user:secret@git.example.com/org/app.git",
+			labels.GitHost: "https://user:secret@git.example.com/gitea/",
+		})
+	}
+
+	mapped := func() *container.Container {
+		c := gitAssociatedContainer("api", "web-1", "webstack-api:latest", nil)
+		c.DeleteLabel(labels.GitRepo)
+		c.DeleteLabel(labels.GitRef)
+
+		return c
+	}
+
+	mapping := map[string]gitConfig.Image{
+		"webstack-api:latest": {Repo: "https://github.com/org/app.git", Ref: "release"},
+	}
+
+	tests := []struct {
+		name      string
+		source    func() *container.Container
+		noRestart bool
+		item      composeApply.Container
+		want      want
+	}{
+		{
+			name:   "label association, replaced",
+			source: labeled,
+			item:   composeApply.Container{Service: "api", ID: "new-api", ImageID: "sha256:api"},
+			want: want{
+				gitRepo:   "https://git.example.com/org/app.git",
+				gitRef:    "main",
+				changelog: "https://git.example.com/gitea/org/app/releases/tag/v1.2.3",
+				newID:     "new-api",
+				latestID:  "sha256:api",
+				applied:   true,
+				built:     "sha256:api",
+				updated:   true,
+			},
+		},
+		{
+			name:      "label association, no restart",
+			source:    labeled,
+			noRestart: true,
+			item:      composeApply.Container{Service: "api"},
+			want: want{
+				gitRepo:   "https://git.example.com/org/app.git",
+				gitRef:    "main",
+				changelog: "https://git.example.com/gitea/org/app/releases/tag/v1.2.3",
+				latestID:  "git:" + commit,
+				built:     "git:" + commit,
+			},
+		},
+		{
+			name:   "image mapping, replaced",
+			source: mapped,
+			item:   composeApply.Container{Service: "api", ID: "new-api", ImageID: "sha256:api"},
+			want: want{
+				gitRepo:   "https://github.com/org/app.git",
+				gitRef:    "release",
+				changelog: "https://github.com/org/app/releases/tag/v1.2.3",
+				newID:     "new-api",
+				latestID:  "sha256:api",
+				applied:   true,
+				built:     "sha256:api",
+				updated:   true,
+			},
+		},
+		{
+			name:      "image mapping, no restart",
+			source:    mapped,
+			noRestart: true,
+			item:      composeApply.Container{Service: "api", ImageID: "sha256:api"},
+			want: want{
+				gitRepo:   "https://github.com/org/app.git",
+				gitRef:    "release",
+				changelog: "https://github.com/org/app/releases/tag/v1.2.3",
+				latestID:  "sha256:api",
+				built:     "sha256:api",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
+			c := tt.source()
+			c.SetStale(true)
+
+			params := updateParams.Params{
+				Git:       gitConfig.Defaults{Images: mapping, Enable: true},
+				NoRestart: tt.noRestart,
+
+				EnableChangelog: true,
+			}
+
+			progress := &state.Progress{}
+			progress.AddScanned(newTestLogger(t), c, container.ImageID("git:"+commit), params)
+
+			sourceLabels := maps.Clone(containerLabels(c))
+
+			result := git.CheckResult{Stale: true, Commit: commit, Tag: "v1.2.3"}
+			sess.recordCompose(c, tt.item, params, result, progress, newTestLogger(t))
+
+			// The replacement takes its labels from the Compose service, so
+			// recording leaves the source's association and stamp labels alone.
+			assert.Equal(t, sourceLabels, containerLabels(c))
+
+			report := progress.Report(newTestLogger(t))
+			require.Len(t, report.Scanned(), 1)
+			status := report.Scanned()[0]
+
+			_, applied := sess.applied[c.ID()]
+			assert.Equal(t, tt.want, want{
+				gitRepo:   status.GitRepo(),
+				gitRef:    status.GitRef(),
+				changelog: status.Changelog(),
+				newID:     status.NewContainerID(),
+				latestID:  status.LatestImageID(),
+				applied:   applied,
+				built:     sess.built[c.ID()],
+				updated:   len(report.Updated()) == 1,
+			})
+		})
+	}
 }
 
 // Test_composeServiceLabels verifies the labels written onto Compose services,
@@ -1077,7 +1229,7 @@ func Test_composeServiceLabels(t *testing.T) {
 		t.Parallel()
 
 		c := gitAssociatedContainer("api", "/api", "webstack-api:latest", map[string]string{
-			labels.GitHost: "https://user:secret@git.example.com:8443/git/api?token=secret",
+			labels.GitHost: "https://user:secret@git.example.com:8443/git/api",
 		})
 		got := composeServiceLabels(c, updateParams.Params{Git: gitConfig.Defaults{Enable: true}}, git.CheckResult{Commit: "abc"})
 		assert.Equal(t, "https://git.example.com:8443/git/api", got[labels.GitHost])
@@ -1092,6 +1244,71 @@ func Test_composeServiceLabels(t *testing.T) {
 		})
 		got := composeServiceLabels(c, updateParams.Params{Git: gitConfig.Defaults{Enable: true}}, git.CheckResult{Commit: "abc"})
 		assert.NotContains(t, got, labels.GitHost)
+	})
+
+	// Defaults written as labels would count as the container's own settings
+	// on the next check. A later change to the git-dockerfile or git-context
+	// configuration option would then no longer reach the container.
+	t.Run("leaves process defaults off", func(t *testing.T) {
+		t.Parallel()
+
+		c := gitAssociatedContainer("api", "/api", "webstack-api:latest", nil)
+		c.DeleteLabel(labels.GitRef)
+
+		got := composeServiceLabels(c, updateParams.Params{Git: gitConfig.Defaults{
+			DefaultRef:   gitConfig.DefaultRef,
+			SemverPolicy: gitConfig.DefaultPolicy,
+			Dockerfile:   "build/Dockerfile",
+			Context:      "app",
+			Enable:       true,
+		}}, git.CheckResult{Commit: "abc"})
+
+		assert.Equal(t, map[string]string{
+			labels.GitLastCommit: "abc",
+			labels.GitRepo:       "https://github.com/org/app.git",
+		}, got)
+	})
+
+	t.Run("keeps values a git-image mapping supplied", func(t *testing.T) {
+		t.Parallel()
+
+		c := gitAssociatedContainer("api", "/api", "webstack-api:latest", nil)
+		c.DeleteLabel(labels.GitRepo)
+		c.DeleteLabel(labels.GitRef)
+
+		got := composeServiceLabels(c, updateParams.Params{Git: gitConfig.Defaults{
+			Images: map[string]gitConfig.Image{
+				"webstack-api:latest": {
+					Repo:       "https://github.com/org/app.git",
+					Ref:        "release",
+					Policy:     semver.PolicyMinor,
+					Dockerfile: "build/Dockerfile",
+					Context:    "app",
+				},
+			},
+			DefaultRef: gitConfig.DefaultRef,
+			Enable:     true,
+		}}, git.CheckResult{Commit: "abc"})
+
+		assert.Equal(t, map[string]string{
+			labels.GitLastCommit:   "abc",
+			labels.GitRepo:         "https://github.com/org/app.git",
+			labels.GitRef:          "release",
+			labels.GitSemverPolicy: semver.PolicyMinor,
+			labels.GitDockerfile:   "build/Dockerfile",
+			labels.GitContext:      "app",
+		}, got)
+	})
+
+	t.Run("writes no association when the repository cannot be redacted", func(t *testing.T) {
+		t.Parallel()
+
+		c := gitAssociatedContainer("api", "/api", "webstack-api:latest", map[string]string{
+			labels.GitRepo: "://invalid",
+		})
+		got := composeServiceLabels(c, updateParams.Params{Git: gitConfig.Defaults{Enable: true}}, git.CheckResult{Commit: "abc"})
+
+		assert.Equal(t, map[string]string{labels.GitLastCommit: "abc"}, got)
 	})
 
 	t.Run("writes git-watch when the source label enabled it", func(t *testing.T) {

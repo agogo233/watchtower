@@ -2,7 +2,6 @@ package cleanup
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -10,24 +9,27 @@ import (
 	cerrdefs "github.com/containerd/errdefs"
 	dockerContainer "github.com/moby/moby/api/types/container"
 
-	containerClient "github.com/nicholas-fedor/watchtower/internal/container/client"
 	"github.com/nicholas-fedor/watchtower/internal/container/labels"
 )
 
-// orphanedOrchestratorAge is how long an orchestrator must have been running
-// before startup cleanup treats it as orphaned. An orchestrator's handoff is
-// bounded by a 5-minute timeout plus short cleanup steps, so a younger one
-// may still be replacing a Watchtower container.
+// orphanedOrchestratorAge is how long ago an orchestrator must have started
+// before startup cleanup treats it as orphaned. An orchestrator that never
+// started counts from its creation instead. An orchestrator's handoff is
+// bounded by a 5-minute timeout plus short cleanup steps, so a younger one may
+// still be replacing a Watchtower container.
 const orphanedOrchestratorAge = 10 * time.Minute
 
 // RemoveOrphanedOrchestrators removes any ephemeral orchestrator containers
 // that may have persisted due to crashes or unexpected termination.
 //
 // This is called during startup alongside RemoveExcessWatchtowerInstances to
-// ensure a clean state. Only orchestrators running longer than any self-update
-// can take are removed. A younger orchestrator may still be handing off to a
-// new Watchtower, including the instance running this cleanup or an instance
-// in another scope, so it is kept, as is one whose start time cannot be read.
+// ensure a clean state. Orchestrators that are not running are checked too,
+// including one that a failed start left in the created state. An orchestrator
+// is removed only when it started longer ago than any self-update can take or
+// was created that long ago without starting. A younger orchestrator is kept because it may
+// still be handing off to a new Watchtower, such as the instance running this
+// cleanup or one in another scope. An orchestrator whose start and creation
+// times cannot be read is kept too.
 //
 // Parameters:
 //   - ctx: Context for cancellation and timeout control.
@@ -38,7 +40,7 @@ const orphanedOrchestratorAge = 10 * time.Minute
 //   - error: Non-nil if listing or removal fails, nil on success.
 func RemoveOrphanedOrchestrators(log *zerolog.Logger,
 	ctx context.Context,
-	client containerClient.Client,
+	client Client,
 ) (int, error) {
 	clogVal := log.With().
 		Str("function", "RemoveOrphanedOrchestrators").
@@ -47,31 +49,21 @@ func RemoveOrphanedOrchestrators(log *zerolog.Logger,
 
 	clog.Debug().Msg("Checking for orphaned ephemeral orchestrator containers")
 
-	// List all containers to find orphaned orchestrators.
-	allContainers, err := client.ListContainers(ctx)
+	orchestrators, err := client.ListLabeledContainers(ctx, labels.EphemeralOrchestrator)
 	if err != nil {
-		clog.Error().
+		// The caller reports the returned error, so it is logged here only at debug.
+		clog.Debug().
 			Err(err).
-			Msg("Failed to list containers for orchestrator cleanup")
+			Msg("Failed to list ephemeral orchestrators")
 
-		return 0, fmt.Errorf("failed to list containers: %w", err)
+		return 0, err //nolint:wrapcheck // The client's error already names the failed listing.
 	}
 
 	removed := 0
 
-	for _, c := range allContainers {
-		containerInfo := c.ContainerInfo()
-		if containerInfo == nil || containerInfo.Config == nil {
-			continue
-		}
-
-		// Check for the orchestrator label.
-		if containerInfo.Config.Labels[labels.EphemeralOrchestrator] != "true" {
-			continue
-		}
-
+	for _, c := range orchestrators {
 		// Keep orchestrators that may still be running a self-update.
-		started, ok := orchestratorStartTime(containerInfo)
+		started, ok := orchestratorStartTime(c.ContainerInfo())
 		if !ok || time.Since(started) < orphanedOrchestratorAge {
 			clog.Debug().
 				Str("container", c.Name()).

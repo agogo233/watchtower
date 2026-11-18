@@ -28,16 +28,15 @@ import (
 
 	"github.com/nicholas-fedor/watchtower/internal/api/auth"
 	"github.com/nicholas-fedor/watchtower/internal/api/routes"
+	mockRoutes "github.com/nicholas-fedor/watchtower/internal/api/routes/mocks"
 	"github.com/nicholas-fedor/watchtower/internal/container"
-	containerClient "github.com/nicholas-fedor/watchtower/internal/container/client"
-	mockContainerClient "github.com/nicholas-fedor/watchtower/internal/container/client/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/container/filters"
 	"github.com/nicholas-fedor/watchtower/internal/observability/events"
 	"github.com/nicholas-fedor/watchtower/internal/observability/metrics"
 	updateConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/update"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/golden"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/internal/update/schedule"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // Tokens used by the response fixtures.
@@ -92,7 +91,7 @@ func fixtureContainer(
 	running bool,
 	labels map[string]string,
 	repoDigests []string,
-) types.Container {
+) *container.Container {
 	info := &dockerContainer.InspectResponse{
 		ID:    fixtureID(id),
 		Name:  name,
@@ -118,11 +117,11 @@ func fixtureContainer(
 // Two containers share one image so the images endpoint aggregates them. The
 // worker image has digests from two repositories, the first of which does not
 // match its image name. The cache container has no image metadata.
-func fixtureContainers() []types.Container {
+func fixtureContainers() []*container.Container {
 	nginxID := "sha256:" + fixtureID("a")
 	nginxDigests := []string{"nginx@sha256:" + fixtureID("d")}
 
-	return []types.Container{
+	return []*container.Container{
 		fixtureContainer("1", "/web", "nginx:1.27", nginxID, true, map[string]string{
 			"com.centurylinklabs.watchtower.enable": "true",
 			"com.centurylinklabs.watchtower.scope":  "prod",
@@ -147,20 +146,20 @@ func fixtureContainers() []types.Container {
 
 // newFixtureClient returns a Docker client that lists the fixture containers and
 // reports a newer image for the web containers and a registry error for cache.
-func newFixtureClient(t *testing.T) *mockContainerClient.MockClient {
+func newFixtureClient(t *testing.T) *mockRoutes.MockClient {
 	t.Helper()
 
 	list := fixtureContainers()
 
-	client := mockContainerClient.NewMockClient(t)
+	client := mockRoutes.NewMockClient(t)
 	client.EXPECT().Ping(mock.Anything).Return(nil).Maybe()
 	client.EXPECT().ListContainers(mock.Anything, mock.Anything).Return(list, nil).Maybe()
 	client.EXPECT().ListContainers(mock.Anything).Return(list, nil).Maybe()
 	client.EXPECT().CheckContainerUpdate(mock.Anything, mock.Anything, mock.Anything).
-		RunAndReturn(func(_ context.Context, c types.Container, _ updateConfig.Policy) (bool, types.ImageID, string, error) {
+		RunAndReturn(func(_ context.Context, c *container.Container, _ updateConfig.Policy) (bool, container.ImageID, string, error) {
 			switch c.Name() {
 			case "web", "web-2":
-				return true, types.ImageID("sha256:" + fixtureID("7")), "sha256:" + fixtureID("8"), nil
+				return true, container.ImageID("sha256:" + fixtureID("7")), "sha256:" + fixtureID("8"), nil
 			case "cache":
 				return false, "", "", errFixtureRegistry
 			default:
@@ -172,10 +171,10 @@ func newFixtureClient(t *testing.T) *mockContainerClient.MockClient {
 }
 
 // newFailingClient returns a Docker client whose daemon is unreachable.
-func newFailingClient(t *testing.T) *mockContainerClient.MockClient {
+func newFailingClient(t *testing.T) *mockRoutes.MockClient {
 	t.Helper()
 
-	client := mockContainerClient.NewMockClient(t)
+	client := mockRoutes.NewMockClient(t)
 	client.EXPECT().Ping(mock.Anything).Return(errFixtureDocker).Maybe()
 	client.EXPECT().ListContainers(mock.Anything, mock.Anything).Return(nil, errFixtureDocker).Maybe()
 	client.EXPECT().ListContainers(mock.Anything).Return(nil, errFixtureDocker).Maybe()
@@ -197,7 +196,7 @@ func newFixtureMetrics(t *testing.T) *metrics.Metrics {
 
 // fixtureOptions returns API options with every endpoint enabled, backed by the
 // given Docker client and metrics store. Each update reports the same scan.
-func fixtureOptions(t *testing.T, client containerClient.Client, store *metrics.Metrics) routes.Options {
+func fixtureOptions(t *testing.T, client routes.Client, store *metrics.Metrics) routes.Options {
 	t.Helper()
 
 	return withTestLogger(t, routes.Options{
@@ -216,7 +215,7 @@ func fixtureOptions(t *testing.T, client containerClient.Client, store *metrics.
 		UnblockHTTPAPI:      true,
 		NoStartupMessage:    true,
 		Client:              client,
-		Filter:              func(types.FilterableContainer) bool { return true },
+		Filter:              func(filters.FilterableContainer) bool { return true },
 		FilterDesc:          "Checking all containers (except explicitly disabled with label)",
 		IncludeStopped:      true,
 		UpdateLock:          schedule.NewUpdateLock(),
@@ -224,10 +223,10 @@ func fixtureOptions(t *testing.T, client containerClient.Client, store *metrics.
 			Cleanup:        true,
 			LifecycleHooks: true,
 		},
-		RunUpdatesWithNotifications: func(context.Context, types.Filter, updateParams.Params) *metrics.Metric {
+		RunUpdatesWithNotifications: func(context.Context, filters.Filter, updateParams.Params) *metrics.Metric {
 			return &metrics.Metric{Scanned: 5, Updated: 2, Failed: 1, Restarted: 0, Skipped: 1}
 		},
-		FilterByImage:    func(_ []string, filter types.Filter) types.Filter { return filter },
+		FilterByImage:    func(_ []string, filter filters.Filter) filters.Filter { return filter },
 		DefaultMetrics:   func() *metrics.Metrics { return store },
 		EventBroadcaster: events.NewBroadcaster(),
 	})
@@ -460,7 +459,7 @@ func TestHTTPAPIResponses(t *testing.T) {
 	// reached, by the update, the status, and the history.
 	failedStore := newFixtureMetrics(t)
 	failedOpts := fixtureOptions(t, newFixtureClient(t), failedStore)
-	failedOpts.RunUpdatesWithNotifications = func(context.Context, types.Filter, updateParams.Params) *metrics.Metric {
+	failedOpts.RunUpdatesWithNotifications = func(context.Context, filters.Filter, updateParams.Params) *metrics.Metric {
 		return &metrics.Metric{Scanned: 5, Updated: 1, Failed: 0, Restarted: 0, Skipped: 0, ScanFailed: true}
 	}
 
@@ -508,7 +507,7 @@ func TestHTTPAPIErrorResponses(t *testing.T) {
 	recorder.record(t, responseRequest{method: http.MethodPost, target: "/v1/update", token: fixtureAPIToken})
 
 	failingOpts := fixtureOptions(t, newFailingClient(t), newFixtureMetrics(t))
-	failingOpts.RunUpdatesWithNotifications = func(context.Context, types.Filter, updateParams.Params) *metrics.Metric {
+	failingOpts.RunUpdatesWithNotifications = func(context.Context, filters.Filter, updateParams.Params) *metrics.Metric {
 		return nil
 	}
 

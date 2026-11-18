@@ -55,17 +55,18 @@ func newTestCommand() *cobra.Command {
 	return cmd
 }
 
-// parseWithEnv parses flags then applies environment values (mirrors production preRun).
+// parseWithEnv parses args, then applies the environment to unset flags, as
+// Load does first.
 func parseWithEnv(t *testing.T, cmd *cobra.Command, args ...string) {
 	t.Helper()
 
 	require.NoError(t, cmd.ParseFlags(args))
-	require.NoError(t, ApplyEnvToFlags(cmd.PersistentFlags(), AllSpecs()))
+	require.NoError(t, applyEnvToFlags(cmd.PersistentFlags(), AllSpecs()))
 }
 
-// TestApplyEnvToFlags_EmptyBoolEnvDoesNotEnable verifies empty non-NO_COLOR bool
+// Test_applyEnvToFlags_emptyBoolEnvDoesNotEnable verifies empty non-NO_COLOR bool
 // env vars are treated as unset, while NO_COLOR presence still enables no-color.
-func TestApplyEnvToFlags_EmptyBoolEnvDoesNotEnable(t *testing.T) {
+func Test_applyEnvToFlags_emptyBoolEnvDoesNotEnable(t *testing.T) {
 	t.Setenv("WATCHTOWER_CLEANUP", "")
 	t.Setenv("WATCHTOWER_DEBUG", "")
 	t.Setenv("NO_COLOR", "")
@@ -88,9 +89,9 @@ func TestApplyEnvToFlags_EmptyBoolEnvDoesNotEnable(t *testing.T) {
 	assert.True(t, noColor, "NO_COLOR presence (empty value) must enable no-color")
 }
 
-// TestApplyEnvToFlags_NOColorPresenceAlwaysEnables verifies NO_COLOR uses
+// Test_applyEnvToFlags_noColorPresenceAlwaysEnables verifies NO_COLOR uses
 // presence semantics (including 0/false) and a static false default.
-func TestApplyEnvToFlags_NOColorPresenceAlwaysEnables(t *testing.T) {
+func Test_applyEnvToFlags_noColorPresenceAlwaysEnables(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		value string
@@ -119,9 +120,9 @@ func TestApplyEnvToFlags_NOColorPresenceAlwaysEnables(t *testing.T) {
 	}
 }
 
-// TestApplyEnvToFlags_DoesNotMarkChanged ensures env bridging leaves pflag.Changed false
+// Test_applyEnvToFlags_doesNotMarkChanged ensures env bridging leaves pflag.Changed false
 // so API *Changed fields only reflect CLI overrides.
-func TestApplyEnvToFlags_DoesNotMarkChanged(t *testing.T) {
+func Test_applyEnvToFlags_doesNotMarkChanged(t *testing.T) {
 	t.Setenv("WATCHTOWER_HTTP_API_HOST", "127.0.0.1")
 	t.Setenv("WATCHTOWER_HTTP_API_PORT", "9090")
 	t.Setenv("WATCHTOWER_HTTP_API_RATE_LIMIT", "30")
@@ -168,292 +169,64 @@ func TestApplyEnvToFlags_DoesNotMarkChanged(t *testing.T) {
 	assert.Equal(t, "192.168.1.1", cliHost)
 }
 
-// TestEnvConfig tests EnvConfig functionality with various configurations.
-func TestEnvConfig(t *testing.T) {
-	testCases := []struct {
-		name          string
-		envVars       map[string]string
-		flags         []string
-		setupCmd      func(*cobra.Command)
-		expectEnv     map[string]string
-		expectError   bool
-		expectWarning string
+// Test_prepareFlags_failures verifies that each failing step returns an error
+// that names the step and wraps the step's own error, together with a logger
+// to report it.
+func Test_prepareFlags_failures(t *testing.T) {
+	invalidSecret := writeSecretFile(t, "not-a-url\n")
+
+	tests := []struct {
+		name     string
+		env      map[string]string
+		args     []string
+		wantErr  error
+		wantStep string
 	}{
 		{
-			name: "defaults",
-			envVars: map[string]string{
-				"DOCKER_TLS_VERIFY": "",
-				"DOCKER_HOST":       "",
-				"DOCKER_CERT_PATH":  "",
-			},
-			expectEnv: map[string]string{
-				"DOCKER_HOST":        "unix:///var/run/docker.sock",
-				"DOCKER_TLS_VERIFY":  "",
-				"DOCKER_API_VERSION": "",
-				"DOCKER_CERT_PATH":   "",
-			},
+			name:     "invalid environment value",
+			env:      map[string]string{"WATCHTOWER_HTTP_API_RATE_LIMIT": "many"},
+			wantStep: "apply environment configuration: ",
 		},
 		{
-			name: "custom",
-			flags: []string{
-				"--host", "some-custom-docker-host",
-				"--tlsverify",
-				"--api-version", "1.99",
-				"--cert-path", "/path/to/certs",
-			},
-			expectEnv: map[string]string{
-				"DOCKER_HOST":        "some-custom-docker-host",
-				"DOCKER_TLS_VERIFY":  "1",
-				"DOCKER_API_VERSION": "1.99",
-				"DOCKER_CERT_PATH":   "/path/to/certs",
-			},
+			name:     "invalid log format",
+			args:     []string{"--log-format", "bogus"},
+			wantErr:  errInvalidLogFormat,
+			wantStep: "set up logging: ",
 		},
 		{
-			name: "flag errors",
-			setupCmd: func(_ *cobra.Command) {
-				// Don't register flags to force retrieval errors
-			},
-			expectError: true,
+			name:     "interval with a schedule",
+			args:     []string{"--interval", "30", "--schedule", "@every 1h"},
+			wantErr:  errIntervalAndSchedule,
+			wantStep: "process flag aliases: ",
 		},
 		{
-			name: "flag retrieval errors partial",
-			setupCmd: func(cmd *cobra.Command) {
-				cmd.PersistentFlags().StringP("host", "H", "", "daemon socket")
-				// Only host defined, expect errors for others
-			},
-			flags:       []string{"--host", "test"},
-			expectError: true,
-		},
-		{
-			name: "flag retrieval errors tls",
-			setupCmd: func(cmd *cobra.Command) {
-				cmd.PersistentFlags().StringP("host", "H", "", "daemon socket")
-				cmd.PersistentFlags().BoolP("tlsverify", "v", false, "use TLS")
-				// Host and tlsverify defined, expect error for api-version
-			},
-			flags:       []string{"--host", "test", "--tlsverify"},
-			expectError: true,
-		},
-		{
-			name: "tls host conversion",
-			envVars: map[string]string{
-				"DOCKER_HOST":       "tcp://example.com:2376",
-				"DOCKER_TLS_VERIFY": "1",
-			},
-			expectEnv: map[string]string{
-				"DOCKER_HOST": "https://example.com:2376",
-			},
-		},
-		{
-			name: "cert path from env",
-			envVars: map[string]string{
-				"DOCKER_CERT_PATH": "/env/cert/path",
-			},
-			expectEnv: map[string]string{
-				"DOCKER_CERT_PATH": "/env/cert/path",
-			},
-		},
-		{
-			name: "tls warnings http with tls",
-			envVars: map[string]string{
-				"DOCKER_TLS_VERIFY": "1",
-			},
-			flags: []string{"--host", "http://example.com"},
-			expectEnv: map[string]string{
-				"DOCKER_HOST": "http://example.com",
-			},
-			expectWarning: "TLS verification is enabled but DOCKER_HOST uses insecure scheme 'http://'. Consider using 'https://' or disable TLS verification.",
-		},
-		{
-			name: "tls warnings unix with tls",
-			envVars: map[string]string{
-				"DOCKER_TLS_VERIFY": "1",
-			},
-			flags: []string{"--host", "unix:///var/run/docker.sock"},
-			expectEnv: map[string]string{
-				"DOCKER_HOST": "unix:///var/run/docker.sock",
-			},
-			expectWarning: "TLS verification is enabled but DOCKER_HOST uses local socket 'unix://'. TLS is not applicable for local sockets. Consider disabling TLS verification.",
-		},
-		{
-			name: "tls warnings https with tls",
-			envVars: map[string]string{
-				"DOCKER_TLS_VERIFY": "1",
-			},
-			flags: []string{"--host", "https://example.com"},
-			expectEnv: map[string]string{
-				"DOCKER_HOST": "https://example.com",
-			},
-		},
-		{
-			name: "tls warnings tcp with tls",
-			envVars: map[string]string{
-				"DOCKER_TLS_VERIFY": "1",
-			},
-			flags: []string{"--host", "tcp://example.com"},
-			expectEnv: map[string]string{
-				"DOCKER_HOST": "https://example.com",
-			},
-		},
-		{
-			name:  "tls warnings unix without tls",
-			flags: []string{"--host", "unix:///var/run/docker.sock"},
-			expectEnv: map[string]string{
-				"DOCKER_HOST": "unix:///var/run/docker.sock",
-			},
-		},
-		{
-			name: "docker host env var",
-			envVars: map[string]string{
-				"DOCKER_HOST": "unix:///var/run/docker.sock",
-			},
-			expectEnv: map[string]string{
-				"DOCKER_HOST": "unix:///var/run/docker.sock",
-			},
-		},
-		{
-			name: "docker tls verify env var",
-			envVars: map[string]string{
-				"DOCKER_TLS_VERIFY": "1",
-			},
-			expectEnv: map[string]string{
-				"DOCKER_TLS_VERIFY": "1",
-			},
-			// Default host is unix://; TLS verify on a local socket emits this warning.
-			expectWarning: "TLS verification is enabled but DOCKER_HOST uses local socket 'unix://'",
-		},
-		{
-			name: "docker cert path env var",
-			envVars: map[string]string{
-				"DOCKER_CERT_PATH": "/env/certs",
-			},
-			expectEnv: map[string]string{
-				"DOCKER_CERT_PATH": "/env/certs",
-			},
-		},
-		{
-			name: "docker api version env var",
-			envVars: map[string]string{
-				"DOCKER_API_VERSION": "1.41",
-			},
-			expectEnv: map[string]string{
-				"DOCKER_API_VERSION": "1.41",
-			},
-		},
-		{
-			name: "tls host conversion https no change",
-			envVars: map[string]string{
-				"DOCKER_HOST":       "https://example.com:2376",
-				"DOCKER_TLS_VERIFY": "1",
-			},
-			expectEnv: map[string]string{
-				"DOCKER_HOST": "https://example.com:2376",
-			},
-		},
-		{
-			name: "tls warnings tcp converted no warning",
-			envVars: map[string]string{
-				"DOCKER_HOST":       "tcp://example.com:2376",
-				"DOCKER_TLS_VERIFY": "1",
-			},
-			expectEnv: map[string]string{
-				"DOCKER_HOST": "https://example.com:2376",
-			},
-		},
-		{
-			name: "tls warnings unix without tls no warning",
-			envVars: map[string]string{
-				"DOCKER_HOST": "unix:///var/run/docker.sock",
-			},
-			expectEnv: map[string]string{
-				"DOCKER_HOST": "unix:///var/run/docker.sock",
-			},
-		},
-		{
-			name: "edge case empty api version",
-			envVars: map[string]string{
-				"DOCKER_API_VERSION": "",
-			},
-			expectEnv: map[string]string{
-				"DOCKER_API_VERSION": "",
-			},
+			name:     "invalid secret file",
+			args:     []string{"--notification-url", invalidSecret},
+			wantErr:  errInvalidSecretURL,
+			wantStep: "load secrets from files: ",
 		},
 	}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			// Clear Docker env written by prior EnvConfig calls so cases do not leak.
-			for _, key := range []string{
-				"DOCKER_HOST", "DOCKER_TLS_VERIFY", "DOCKER_API_VERSION", "DOCKER_CERT_PATH",
-			} {
-				t.Setenv(key, "")
-				os.Unsetenv(key)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for key, value := range tt.env {
+				t.Setenv(key, value)
 			}
 
-			// Set env vars for this case.
-			for k, v := range tc.envVars {
-				if v == "" {
-					os.Unsetenv(k)
-				} else {
-					t.Setenv(k, v)
-				}
+			log, err := prepareFlags(newInfoTestLogger(t), newParsedCommand(t, tt.args...).PersistentFlags())
+			require.ErrorContains(t, err, tt.wantStep)
+
+			if tt.wantErr != nil {
+				require.ErrorIs(t, err, tt.wantErr)
 			}
 
-			cmd := new(cobra.Command)
-			if tc.setupCmd != nil {
-				tc.setupCmd(cmd)
-			} else {
-				RegisterAll(cmd)
-			}
-
-			if len(tc.flags) > 0 {
-				err := cmd.ParseFlags(tc.flags)
-				require.NoError(t, err)
-			}
-
-			var logOutput bytes.Buffer
-
-			// Always capture through the shared buffer so no-warning cases can
-			// observe unexpected output. Use Warn when a warning is expected.
-			log := testLoggerAt(&logOutput, logging.InfoLevel)
-			if tc.expectWarning != "" {
-				log = testLoggerAt(&logOutput, logging.WarnLevel)
-			}
-
-			err := EnvConfig(log, cmd)
-
-			if tc.expectError {
-				require.Error(t, err)
-				// Partial flag registration fails during BindAll (flag not registered)
-				// or when setting Docker env vars.
-				errMsg := err.Error()
-				assert.True(t,
-					strings.Contains(errMsg, "failed to set flag value") ||
-						strings.Contains(errMsg, "not registered") ||
-						strings.Contains(errMsg, "bind docker"),
-					"unexpected error: %s", errMsg,
-				)
-
-				return
-			}
-
-			require.NoError(t, err)
-
-			for k, v := range tc.expectEnv {
-				assert.Equal(t, v, os.Getenv(k))
-			}
-
-			if tc.expectWarning != "" {
-				assert.Contains(t, logOutput.String(), tc.expectWarning)
-			} else if tc.expectWarning == "" && logOutput.Len() > 0 {
-				assert.Empty(t, logOutput.String())
-			}
+			assert.NotNil(t, log, "a logger is returned to report the failure")
 		})
 	}
 }
 
-// TestGetSecretsFromFiles tests GetSecretsFromFiles functionality with various scenarios.
-func TestGetSecretsFromFiles(t *testing.T) {
+// Test_getSecretsFromFiles tests getSecretsFromFiles functionality with various scenarios.
+func Test_getSecretsFromFiles(t *testing.T) {
 	testCases := []struct {
 		name     string
 		envVars  map[string]string
@@ -611,8 +384,8 @@ func TestIsFile(t *testing.T) {
 	)
 }
 
-// TestProcessFlagAliases tests flag alias processing with various configurations.
-func TestProcessFlagAliases(t *testing.T) {
+// Test_processFlagAliases tests flag alias processing with various configurations.
+func Test_processFlagAliases(t *testing.T) {
 	testCases := []struct {
 		name    string
 		envVars map[string]string
@@ -703,8 +476,8 @@ func TestProcessFlagAliases(t *testing.T) {
 			}
 
 			cmd := newTestCommand()
-			require.NoError(t, cmd.ParseFlags(tc.flags))
-			require.NoError(t, ProcessFlagAliases(newInfoTestLogger(t), cmd.Flags()))
+			parseWithEnv(t, cmd, tc.flags...)
+			require.NoError(t, processFlagAliases(newInfoTestLogger(t), cmd.Flags()))
 
 			if tc.checks != nil {
 				tc.checks(t, cmd.Flags())
@@ -713,9 +486,9 @@ func TestProcessFlagAliases(t *testing.T) {
 	}
 }
 
-// TestProcessFlagAliases_Errors verifies that an invalid porcelain version
+// Test_processFlagAliases_errors verifies that an invalid porcelain version
 // and an interval set together with a schedule are returned as errors.
-func TestProcessFlagAliases_Errors(t *testing.T) {
+func Test_processFlagAliases_errors(t *testing.T) {
 	tests := []struct {
 		name    string
 		flags   []string
@@ -738,20 +511,20 @@ func TestProcessFlagAliases_Errors(t *testing.T) {
 			cmd := newTestCommand()
 			require.NoError(t, cmd.ParseFlags(tt.flags))
 
-			err := ProcessFlagAliases(newInfoTestLogger(t), cmd.Flags())
+			err := processFlagAliases(newInfoTestLogger(t), cmd.Flags())
 			require.ErrorIs(t, err, tt.wantErr)
 		})
 	}
 }
 
-// TestSetupLogging tests logging setup with various formats and levels.
+// Test_setupLogging tests logging setup with various formats and levels.
 //
 // Format writer shape (JSON vs ConsoleWriter pretty/logfmt) is unit-tested in
-// internal/observability/logging/config_test.go. Here we assert SetupLogging integration:
+// internal/observability/logging/config_test.go. Here we assert setupLogging integration:
 // success/error contracts, applied levels, and that the returned logger accepts
 // write-through without panic. Optional: capture writer output samples per
 // format via injectable writer or subprocess if ConfigureWriter gains a test seam.
-func TestSetupLogging(t *testing.T) {
+func Test_setupLogging(t *testing.T) {
 	testCases := []struct {
 		name        string
 		flags       []string
@@ -831,7 +604,7 @@ func TestSetupLogging(t *testing.T) {
 			cmd := newTestCommand()
 			require.NoError(t, cmd.ParseFlags(tc.flags))
 
-			log, err := SetupLogging(newInfoTestLogger(t), cmd.Flags())
+			log, err := setupLogging(newInfoTestLogger(t), cmd.Flags())
 
 			if tc.expectError {
 				require.Error(t, err)
@@ -918,16 +691,6 @@ func TestFlagsArePresentInDocumentation(t *testing.T) {
 			}
 		}
 	}
-}
-
-// TestSetEnvOptStr_Error tests error handling in setEnvOptStr.
-// Note: This test is limited without mocking os.Setenv; real failure requires system-specific conditions.
-func TestSetEnvOptStr_Error(t *testing.T) {
-	// Mocking os.Setenv is complex without dependency injection; test assumes rare failure case
-	// For coverage, ensure environment is writable and check logic
-	err := setEnvOptStr(newInfoTestLogger(t), "TEST_ENV", "value")
-	assert.NoError(t, err) // Normally succeeds; mock needed for failure
-	// To truly test setenv failure, use a system where Setenv fails (e.g., read-only env)
 }
 
 // TestGetSecretFromFile_SkipCommentsAndEmptyLines verifies that comment and empty
@@ -1058,10 +821,9 @@ func TestGetSecretFromFile_StringPathStillMarksChanged(t *testing.T) {
 	assert.Equal(t, "supersecretstring", flag.Value.String())
 }
 
-// TestGetSecretFromFile_SlicePath_MarksChangedAfterReplace verifies that
-// getSecretFromFile marks Changed=true after expanding a file path so the
-// pflag value is preferred over raw os.Getenv.
-func TestGetSecretFromFile_SlicePath_MarksChangedAfterReplace(t *testing.T) {
+// TestGetSecretFromFile_SlicePath_ReadsFile verifies that getSecretFromFile
+// replaces a file path in a list secret with the file's content.
+func TestGetSecretFromFile_SlicePath_ReadsFile(t *testing.T) {
 	cmd := newTestCommand()
 	file, err := os.CreateTemp(t.TempDir(), "watchtower-")
 	require.NoError(t, err)
@@ -1073,20 +835,16 @@ func TestGetSecretFromFile_SlicePath_MarksChangedAfterReplace(t *testing.T) {
 	require.NoError(t, err)
 	parseWithEnv(t, cmd)
 
-	flag := cmd.PersistentFlags().Lookup("notification-url")
-	require.NotNil(t, flag)
-
 	err = getSecretFromFile(newInfoTestLogger(t), cmd.PersistentFlags(), "notification-url")
 	require.NoError(t, err)
 
 	urls, err := cmd.PersistentFlags().GetStringArray("notification-url")
 	require.NoError(t, err)
 	assert.Equal(t, []string{"gotify://gotify.example.com/token123"}, urls)
-	assert.True(t, flag.Changed, "slice secret expansion must mark Changed=true")
 }
 
 // TestGetSecretFromFile_SlicePath_MultiLineFile verifies that a multi-line
-// docker secret file expands into multiple slice values with Changed=true.
+// docker secret file expands into multiple slice values.
 func TestGetSecretFromFile_SlicePath_MultiLineFile(t *testing.T) {
 	cmd := newTestCommand()
 	file, err := os.CreateTemp(t.TempDir(), "watchtower-")
@@ -1105,14 +863,10 @@ func TestGetSecretFromFile_SlicePath_MultiLineFile(t *testing.T) {
 	urls, err := cmd.PersistentFlags().GetStringArray("notification-url")
 	require.NoError(t, err)
 	assert.Equal(t, []string{"gotify://host1/token1", "discord://host2/token2"}, urls)
-
-	flag := cmd.PersistentFlags().Lookup("notification-url")
-	assert.True(t, flag.Changed)
 }
 
 // TestGetSecretFromFile_SlicePath_LiteralURLsUnchanged verifies that literal
-// notification URLs survive getSecretFromFile without modification and that
-// Changed=true is set on the processed flag.
+// notification URLs survive getSecretFromFile without modification.
 func TestGetSecretFromFile_SlicePath_LiteralURLsUnchanged(t *testing.T) {
 	cmd := newTestCommand()
 
@@ -1123,24 +877,17 @@ func TestGetSecretFromFile_SlicePath_LiteralURLsUnchanged(t *testing.T) {
 	require.NoError(t, err)
 	parseWithEnv(t, cmd)
 
-	flag := cmd.PersistentFlags().Lookup("notification-url")
-	require.NotNil(t, flag)
-
 	err = getSecretFromFile(newInfoTestLogger(t), cmd.PersistentFlags(), "notification-url")
 	require.NoError(t, err)
 
 	urls, err := cmd.PersistentFlags().GetStringArray("notification-url")
 	require.NoError(t, err)
 	assert.Equal(t, []string{"gotify://gotify.example.com/token123", "discord://token@channel"}, urls)
-
-	// Changed is true after Replace regardless of whether expansion occurred; the
-	// processed value is explicit user config and downstream consumers must read it.
-	assert.True(t, flag.Changed)
 }
 
 // TestGetSecretsFromFile_PorcelainAppendPreservedWithSecret verifies that
 // porcelain mode appends logger:// before secret expansion and the merged
-// slice retains both values with Changed=true.
+// slice retains both values.
 func TestGetSecretsFromFile_PorcelainAppendPreservedWithSecret(t *testing.T) {
 	t.Setenv("WATCHTOWER_NOTIFICATION_URL", "/file/that/does/not/exist") // placeholder; real file used via flag
 
@@ -1156,7 +903,7 @@ func TestGetSecretsFromFile_PorcelainAppendPreservedWithSecret(t *testing.T) {
 		"--porcelain", "v1",
 	})
 	require.NoError(t, err)
-	require.NoError(t, ProcessFlagAliases(newInfoTestLogger(t), cmd.PersistentFlags()))
+	require.NoError(t, processFlagAliases(newInfoTestLogger(t), cmd.PersistentFlags()))
 
 	urls, err := cmd.PersistentFlags().GetStringArray("notification-url")
 	require.NoError(t, err)
@@ -1169,54 +916,10 @@ func TestGetSecretsFromFile_PorcelainAppendPreservedWithSecret(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, urls, "logger://")
 	assert.Contains(t, urls, "gotify://host/token")
-
-	flag := cmd.PersistentFlags().Lookup("notification-url")
-	assert.True(t, flag.Changed)
 }
 
-// TestApplyEnvToFlags_DoesNotReBrideExpandedSecret verifies that re-running
-// ApplyEnvToFlags does not overwrite an expanded secret with the raw file path.
-func TestApplyEnvToFlags_DoesNotReBrideExpandedSecret(t *testing.T) {
-	cmd := newTestCommand()
-	file, err := os.CreateTemp(t.TempDir(), "watchtower-")
-	require.NoError(t, err)
-	_, err = file.WriteString("gotify://host/token")
-	require.NoError(t, err)
-	require.NoError(t, file.Close())
-
-	// Step 1: env bridge sets pflag to the file path
-	t.Setenv("WATCHTOWER_NOTIFICATION_URL", file.Name())
-
-	err = cmd.ParseFlags([]string{})
-	require.NoError(t, err)
-	err = ApplyEnvToFlags(cmd.PersistentFlags(), AllSpecs())
-	require.NoError(t, err)
-
-	flag := cmd.PersistentFlags().Lookup("notification-url")
-	require.NotNil(t, flag)
-	assert.False(t, flag.Changed, "env bridge must leave Changed=false")
-
-	// Step 2: secret expansion replaces content and marks Changed=true
-	err = getSecretFromFile(newInfoTestLogger(t), cmd.PersistentFlags(), "notification-url")
-	require.NoError(t, err)
-
-	urls, err := cmd.PersistentFlags().GetStringArray("notification-url")
-	require.NoError(t, err)
-	assert.Equal(t, []string{"gotify://host/token"}, urls)
-	assert.True(t, flag.Changed)
-
-	// Step 3: re-running ApplyEnvToFlags must not overwrite the expanded value
-	err = ApplyEnvToFlags(cmd.PersistentFlags(), AllSpecs())
-	require.NoError(t, err)
-
-	urls, err = cmd.PersistentFlags().GetStringArray("notification-url")
-	require.NoError(t, err)
-	assert.Equal(t, []string{"gotify://host/token"}, urls, "re-applying env must not clobber expanded secret")
-	assert.True(t, flag.Changed)
-}
-
-// TestProcessFlagAliases_FlagSetErrors tests error logging for flag operations.
-func TestProcessFlagAliases_FlagSetErrors(t *testing.T) {
+// Test_processFlagAliases_flagSetErrors tests error logging for flag operations.
+func Test_processFlagAliases_flagSetErrors(t *testing.T) {
 	// Capture log output to verify debug logging
 	var logOutput bytes.Buffer
 
@@ -1236,7 +939,7 @@ func TestProcessFlagAliases_FlagSetErrors(t *testing.T) {
 
 	defer func() { flag.Value = originalValue }() // Restore original value
 
-	require.NoError(t, ProcessFlagAliases(log, flags))
+	require.NoError(t, processFlagAliases(log, flags))
 	assert.Contains(
 		t,
 		logOutput.String(),
@@ -1254,12 +957,12 @@ func (e *errorStringValue) String() string   { return "" }
 func (e *errorStringValue) Set(string) error { return e.err }
 func (e *errorStringValue) Type() string     { return "string" }
 
-// TestSetupLogging_FlagErrors tests error handling in SetupLogging.
-func TestSetupLogging_FlagErrors(t *testing.T) {
+// Test_setupLogging_flagErrors tests error handling in setupLogging.
+func Test_setupLogging_flagErrors(t *testing.T) {
 	cmd := new(cobra.Command)
 
 	// Don't register flags to force retrieval errors
-	_, err := SetupLogging(newInfoTestLogger(t), cmd.Flags())
+	_, err := setupLogging(newInfoTestLogger(t), cmd.Flags())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to set flag value")
 }
@@ -1273,7 +976,7 @@ func testGetSecretsFromFiles(t *testing.T, flagName, expected string, args ...st
 
 	RegisterAll(cmd)
 	parseWithEnv(t, cmd, args...)
-	require.NoError(t, GetSecretsFromFiles(newInfoTestLogger(t), cmd))
+	require.NoError(t, getSecretsFromFiles(newInfoTestLogger(t), cmd.PersistentFlags()))
 	flag := cmd.PersistentFlags().Lookup(flagName)
 	require.NotNil(t, flag)
 	value := flag.Value.String()
@@ -1609,8 +1312,8 @@ func TestNotificationParsingFlagOverridesEnv(t *testing.T) {
 	assert.Equal(t, []string{"slack"}, notifications)
 }
 
-// TestGetSecretsFromFilesReadErrors verifies file read errors.
-func TestGetSecretsFromFilesReadErrors(t *testing.T) {
+// Test_getSecretsFromFiles_readErrors verifies file read errors.
+func Test_getSecretsFromFiles_readErrors(t *testing.T) {
 	// Create a file and then remove it to simulate read error
 	file, err := os.CreateTemp(t.TempDir(), "watchtower-")
 	require.NoError(t, err)
@@ -1660,7 +1363,7 @@ func TestRegexpSplittingLogic(t *testing.T) {
 }
 
 // TestNotificationURLEnvToFlagWiring verifies WATCHTOWER_NOTIFICATION_URL reaches
-// notification-url via ApplyEnvToFlags and ListNotificationURLs parsing for
+// notification-url via applyEnvToFlags and ListNotificationURLs parsing for
 // representative comma-in-query and mixed-separator cases.
 //
 // Full SplitNotificationValues coverage lives in internal/settings/flags/utils.

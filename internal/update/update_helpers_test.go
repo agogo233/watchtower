@@ -1,22 +1,31 @@
 package update
 
 import (
+	"maps"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 
+	goGit "github.com/go-git/go-git/v5"
 	dockerContainer "github.com/moby/moby/api/types/container"
 	dockerImage "github.com/moby/moby/api/types/image"
 	dockerNetwork "github.com/moby/moby/api/types/network"
 
+	"github.com/nicholas-fedor/watchtower/internal/container"
+	"github.com/nicholas-fedor/watchtower/internal/container/labels"
+	"github.com/nicholas-fedor/watchtower/internal/git"
 	"github.com/nicholas-fedor/watchtower/internal/update/implicitrestart"
 	mockUpdate "github.com/nicholas-fedor/watchtower/internal/update/mocks"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/internal/update/sorter"
 	"github.com/nicholas-fedor/watchtower/internal/update/state"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // sessionBatch records what an update session does with the notification
@@ -26,6 +35,11 @@ type sessionBatch struct {
 	ended int             // Times the session ended the batch.
 }
 
+// The hand-written fake must satisfy the update client interface. Nothing else
+// reports a missing or renamed method until a test passes it where the
+// interface is required.
+var _ Client = mockUpdate.FakeClient{}
+
 // record keeps report as one the session sent. It serves as the send of an
 // update session's notification batch.
 //
@@ -33,6 +47,25 @@ type sessionBatch struct {
 //   - report: The report sent.
 func (b *sessionBatch) record(report *state.Report) {
 	b.sent = append(b.sent, report)
+}
+
+// newMockClient returns a client mock that stores no copy files. The restart
+// package's tests cover copy files, so the update tests leave the copy-file
+// calls unchecked.
+//
+// Parameters:
+//   - t: Test the mock belongs to.
+//
+// Returns:
+//   - *mockUpdate.MockClient: The client mock.
+func newMockClient(t *testing.T) *mockUpdate.MockClient {
+	t.Helper()
+
+	client := mockUpdate.NewMockClient(t)
+	client.EXPECT().SnapshotCopyFiles(mock.Anything, mock.Anything).Return(nil).Maybe()
+	client.EXPECT().DiscardCopyFiles(mock.Anything).Maybe()
+
+	return client
 }
 
 // updateImplicitRestart marks the containers that depend on a restarting
@@ -44,7 +77,7 @@ func (b *sessionBatch) record(report *state.Report) {
 //   - allContainers: Every listed container.
 //   - containers: The monitored containers, which may be marked.
 //   - useComposeDependsOn: Whether to include Compose depends_on labels as links.
-func updateImplicitRestart(log *zerolog.Logger, allContainers, containers []types.Container, useComposeDependsOn bool) {
+func updateImplicitRestart(log *zerolog.Logger, allContainers, containers []*container.Container, useComposeDependsOn bool) {
 	reconcileImplicitRestarts(log, allContainers, containers, updateParams.Params{UseComposeDependsOn: useComposeDependsOn})
 }
 
@@ -59,12 +92,12 @@ func updateImplicitRestart(log *zerolog.Logger, allContainers, containers []type
 //   - params: Update parameters.
 //
 // Returns:
-//   - []types.Container: Containers that should still restart.
+//   - []*container.Container: Containers that should still restart.
 func reconcileImplicitRestarts(
 	log *zerolog.Logger,
-	allContainers, containers []types.Container,
+	allContainers, containers []*container.Container,
 	params updateParams.Params,
-) []types.Container {
+) []*container.Container {
 	graph, err := sorter.NewDependencyGraph(log,
 		containers,
 		unmonitoredContainers(allContainers, containers),
@@ -80,7 +113,7 @@ func reconcileImplicitRestarts(
 func getCommonTestData() *mockUpdate.TestData {
 	return &mockUpdate.TestData{
 		NameOfContainerToKeep: "",
-		Containers: []types.Container{
+		Containers: []*container.Container{
 			mockUpdate.CreateMockContainer(
 				"test-container-01",
 				"test-container-01",
@@ -127,7 +160,7 @@ func getLinkedTestData(withImageInfo bool) *mockUpdate.TestData {
 
 	return &mockUpdate.TestData{
 		Staleness: map[string]bool{linkingContainer.Name(): false},
-		Containers: []types.Container{
+		Containers: []*container.Container{
 			staleContainer,
 			linkingContainer,
 		},
@@ -161,7 +194,7 @@ func getNetworkModeTestData() *mockUpdate.TestData {
 
 	return &mockUpdate.TestData{
 		Staleness:  map[string]bool{staleContainer.Name(): true, dependentContainer.Name(): false},
-		Containers: []types.Container{staleContainer, dependentContainer},
+		Containers: []*container.Container{staleContainer, dependentContainer},
 	}
 }
 
@@ -204,7 +237,7 @@ func getComposeTestData() *mockUpdate.TestData {
 
 	return &mockUpdate.TestData{
 		Staleness:  map[string]bool{dbContainer.Name(): true, webContainer.Name(): false},
-		Containers: []types.Container{dbContainer, webContainer},
+		Containers: []*container.Container{dbContainer, webContainer},
 	}
 }
 
@@ -248,7 +281,7 @@ func getComposeProjectPrefixedTestData() *mockUpdate.TestData {
 
 	return &mockUpdate.TestData{
 		Staleness:  map[string]bool{dbContainer.Name(): true, webContainer.Name(): false},
-		Containers: []types.Container{dbContainer, webContainer},
+		Containers: []*container.Container{dbContainer, webContainer},
 	}
 }
 
@@ -311,7 +344,7 @@ func getComposeMultiHopTestData() *mockUpdate.TestData {
 			dbContainer.Name():    false,
 			appContainer.Name():   false,
 		},
-		Containers: []types.Container{cacheContainer, dbContainer, appContainer},
+		Containers: []*container.Container{cacheContainer, dbContainer, appContainer},
 	}
 }
 
@@ -361,7 +394,7 @@ func getComposeHyphenatedProjectTestData() *mockUpdate.TestData {
 
 	return &mockUpdate.TestData{
 		Staleness:  map[string]bool{baseContainer.Name(): true, dependentContainer.Name(): false},
-		Containers: []types.Container{baseContainer, dependentContainer},
+		Containers: []*container.Container{baseContainer, dependentContainer},
 	}
 }
 
@@ -436,12 +469,12 @@ func getHyphenatedProjectWithContainerNameTestData() *mockUpdate.TestData {
 			dependentSimple.Name():  false,
 			dependentNetwork.Name(): false,
 		},
-		Containers: []types.Container{base, dependentSimple, dependentNetwork},
+		Containers: []*container.Container{base, dependentSimple, dependentNetwork},
 	}
 }
 
-func createDependencyChain(names []string) []types.Container {
-	containers := make([]types.Container, len(names))
+func createDependencyChain(names []string) []*container.Container {
+	containers := make([]*container.Container, len(names))
 	for i := range names {
 		name := names[i]
 
@@ -514,7 +547,7 @@ func getComposeDependsOnWithNetworkModeTestData() *mockUpdate.TestData {
 
 	return &mockUpdate.TestData{
 		Staleness:  map[string]bool{staleContainer.Name(): true, dependentContainer.Name(): false},
-		Containers: []types.Container{staleContainer, dependentContainer},
+		Containers: []*container.Container{staleContainer, dependentContainer},
 	}
 }
 
@@ -543,4 +576,71 @@ func expectSessionBatch(t *testing.T, notifier *mockUpdate.MockNotifier) *sessio
 	).Once()
 
 	return batch
+}
+
+// gitWatchedTestContainer returns a container named app that is associated
+// with a local Git repository whose tip is newer than the container's stamp,
+// and a Git client that checks it without a network.
+//
+// Parameters:
+//   - t: Test that owns the repository.
+//   - extra: Labels added to the Git association labels.
+//
+// Returns:
+//   - *container.Container: The container.
+//   - *git.Client: Git client for the check.
+//   - string: The repository's tip commit.
+func gitWatchedTestContainer(t *testing.T, extra map[string]string) (*container.Container, *git.Client, string) {
+	t.Helper()
+
+	repoDir, branch, commit := initGitRepoWithCommit(t)
+
+	containerLabels := map[string]string{
+		labels.GitRepo: repoDir,
+		labels.GitRef:  branch,
+		// The running revision is older than the remote's tip.
+		labels.GitLastCommit: "0123456789abcdef0123456789abcdef01234567",
+	}
+	maps.Copy(containerLabels, extra)
+
+	app := skipTestContainer("app-id", "app", containerLabels)
+
+	return app, git.New(newTestLogger(t), git.Options{Timeout: 5 * time.Second}), commit
+}
+
+// initGitRepoWithCommit creates a Git repository with one commit in a
+// temporary directory, so a Git check can list its refs without a network.
+//
+// Parameters:
+//   - t: Test that owns the directory.
+//
+// Returns:
+//   - dir: The repository directory.
+//   - branch: The branch the commit is on.
+//   - commit: The commit's hash.
+//
+//nolint:nonamedreturns // Same-type returns need names.
+func initGitRepoWithCommit(t *testing.T) (dir, branch, commit string) {
+	t.Helper()
+
+	dir = t.TempDir()
+	repo, err := goGit.PlainInit(dir, false)
+	require.NoError(t, err)
+
+	worktree, err := repo.Worktree()
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "README"), []byte("hello\n"), 0o600))
+
+	_, err = worktree.Add("README")
+	require.NoError(t, err)
+
+	hash, err := worktree.Commit("init", &goGit.CommitOptions{
+		Author: &object.Signature{Name: "test", Email: "test@example.com", When: time.Now()},
+	})
+	require.NoError(t, err)
+
+	head, err := repo.Head()
+	require.NoError(t, err)
+
+	return dir, head.Name().Short(), hash.String()
 }

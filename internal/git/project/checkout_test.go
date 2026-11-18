@@ -7,10 +7,13 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/go-git/go-git/v5/config"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	"github.com/stretchr/testify/assert"
@@ -171,6 +174,87 @@ func TestCheckoutRestoreFailureRollsBack(t *testing.T) {
 	compose, err := os.ReadFile(filepath.Join(dir, "compose.yaml"))
 	require.NoError(t, err)
 	assert.Equal(t, "services: {api: {}}\n", string(compose))
+}
+
+// TestCheckoutRestoreAndRollbackFailureKeepsLocalFiles verifies that when the
+// stashed files cannot be written back and HEAD cannot be rolled back either,
+// the checkout still tries to write the local files back and reports both
+// failures.
+//
+// The first write-back fails and leaves the worktree read-only, so the HEAD
+// rollback cannot rewrite compose.yaml. The second write-back makes the
+// worktree writable again and succeeds. The test is skipped for root and on
+// Windows because file modes stop neither.
+func TestCheckoutRestoreAndRollbackFailureKeepsLocalFiles(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("file permissions do not block writes here")
+	}
+
+	dir, first, _ := initTwoCommitRepo(t)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ".env"), []byte("SECRET=local\n"), 0o600))
+
+	compose := filepath.Join(dir, "compose.yaml")
+	writable := func() {
+		_ = os.Chmod(dir, 0o700)
+		_ = os.Chmod(compose, 0o600)
+	}
+	t.Cleanup(writable)
+
+	calls := 0
+	err := Checkout(t.Context(), dir, first, CheckoutOptions{
+		Stash: true,
+		restore: func(root string, saved []savedFile) error {
+			calls++
+			if calls == 1 {
+				require.NoError(t, os.Chmod(compose, 0o400))
+				require.NoError(t, os.Chmod(dir, 0o500))
+
+				return os.ErrPermission
+			}
+
+			writable()
+
+			return restoreSaved(root, saved)
+		},
+	})
+	require.ErrorIs(t, err, os.ErrPermission)
+	require.ErrorContains(t, err, "rollback checkout")
+	assert.Equal(t, 2, calls)
+
+	got, err := os.ReadFile(filepath.Join(dir, ".env"))
+	require.NoError(t, err)
+	assert.Equal(t, "SECRET=local\n", string(got))
+}
+
+// TestCheckoutRestoreFailureKeepsSnapshot verifies that when the stashed files
+// can never be written back, the checkout keeps their temp copy and names it in
+// the error, since that copy is then the only intact copy of the local files.
+func TestCheckoutRestoreFailureKeepsSnapshot(t *testing.T) {
+	t.Parallel()
+
+	dir, first, _ := initTwoCommitRepo(t)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ".env"), []byte("SECRET=local\n"), 0o600))
+
+	err := Checkout(t.Context(), dir, first, CheckoutOptions{
+		Stash: true,
+		restore: func(string, []savedFile) error {
+			return os.ErrPermission
+		},
+	})
+	require.ErrorIs(t, err, os.ErrPermission)
+
+	_, snapshot, found := strings.Cut(err.Error(), "snapshot ")
+	require.True(t, found, "error names no snapshot: %v", err)
+
+	snapshot = strings.TrimSuffix(snapshot, ")")
+
+	t.Cleanup(func() { _ = os.RemoveAll(snapshot) })
+
+	got, err := os.ReadFile(filepath.Join(snapshot, ".env"))
+	require.NoError(t, err)
+	assert.Equal(t, "SECRET=local\n", string(got))
 }
 
 func TestCheckoutCleanWorktree(t *testing.T) {
@@ -371,6 +455,73 @@ func TestCheckoutAuthForUsesOriginURL(t *testing.T) {
 	assert.Equal(t, origin, seen)
 }
 
+// TestCheckoutReadsWorktreeAfterFetch verifies that an edit to a tracked file
+// made while origin is fetched counts as a local change.
+//
+// AuthFor runs as the fetch starts, so it stands in for a user editing the
+// worktree then. Without Stash the checkout must fail as dirty and leave the
+// edit and HEAD alone. With Stash the edit must be written back after the
+// checkout.
+func TestCheckoutReadsWorktreeAfterFetch(t *testing.T) {
+	t.Parallel()
+
+	const edited = "services: {local: {}}\n"
+
+	tests := []struct {
+		name       string
+		wantErr    error
+		stash      bool
+		checkedOut bool
+	}{
+		{
+			name:       "without stash fails as dirty",
+			wantErr:    ErrDirty,
+			stash:      false,
+			checkedOut: false,
+		},
+		{
+			name:       "with stash keeps the edit",
+			wantErr:    nil,
+			stash:      true,
+			checkedOut: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir, first, second := initTwoCommitRepo(t)
+			addBrokenOrigin(t, dir)
+
+			err := Checkout(t.Context(), dir, first, CheckoutOptions{
+				Stash: tt.stash,
+				AuthFor: func(string) (transport.AuthMethod, error) {
+					return nil, os.WriteFile(filepath.Join(dir, "compose.yaml"), []byte(edited), 0o600)
+				},
+			})
+			require.ErrorIs(t, err, tt.wantErr)
+
+			got, err := os.ReadFile(filepath.Join(dir, "compose.yaml"))
+			require.NoError(t, err)
+			assert.Equal(t, edited, string(got))
+
+			repo, err := goGit.PlainOpen(dir)
+			require.NoError(t, err)
+
+			head, err := repo.Head()
+			require.NoError(t, err)
+
+			wantHead := second
+			if tt.checkedOut {
+				wantHead = first
+			}
+
+			assert.Equal(t, wantHead, head.Hash().String())
+		})
+	}
+}
+
 func TestCheckoutAuthErrorWithoutLocalCommit(t *testing.T) {
 	t.Parallel()
 
@@ -487,4 +638,111 @@ func addBrokenOrigin(t *testing.T, dir string) {
 		URLs: []string{"https://127.0.0.1:1/nope.git"},
 	})
 	require.NoError(t, err)
+}
+
+// TestCheckoutRecordsPriorHead verifies that Checkout reports the HEAD from
+// before the checkout through CheckoutOptions.Prior, which a caller uses to
+// put the worktree back when it does not apply the commit.
+func TestCheckoutRecordsPriorHead(t *testing.T) {
+	t.Parallel()
+
+	dir, first, second := initTwoCommitRepo(t)
+
+	var prior string
+
+	require.NoError(t, Checkout(t.Context(), dir, first, CheckoutOptions{Prior: &prior}))
+	assert.Equal(t, second, prior)
+}
+
+// TestCheckoutRecordsHeadAfterFetch verifies that Checkout records the HEAD
+// the worktree has when the fetch ends, not the one it had when the checkout
+// began.
+//
+// AuthFor runs as the fetch starts, so it stands in for a user who checks
+// out another commit then. Prior must name that commit, because a caller's
+// undo returns to it.
+func TestCheckoutRecordsHeadAfterFetch(t *testing.T) {
+	t.Parallel()
+
+	dir, first, second := initTwoCommitRepo(t)
+	addBrokenOrigin(t, dir)
+
+	repo, err := goGit.PlainOpen(dir)
+	require.NoError(t, err)
+
+	worktree, err := repo.Worktree()
+	require.NoError(t, err)
+
+	var prior string
+
+	err = Checkout(t.Context(), dir, second, CheckoutOptions{
+		Prior: &prior,
+		AuthFor: func(string) (transport.AuthMethod, error) {
+			return nil, worktree.Checkout(&goGit.CheckoutOptions{Hash: plumbing.NewHash(first)})
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, first, prior)
+}
+
+// TestCheckoutFailureRollsBack verifies that a checkout that fails part way
+// puts HEAD back and writes the stashed local files back.
+//
+// The target commit adds a file under a directory the worktree has made
+// read-only, so go-git cannot write it. The test is skipped for root and on
+// Windows because the directory mode stops neither.
+func TestCheckoutFailureRollsBack(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("directory permissions do not block writes here")
+	}
+
+	dir, _, second := initTwoCommitRepo(t)
+
+	repo, err := goGit.PlainOpen(dir)
+	require.NoError(t, err)
+	worktree, err := repo.Worktree()
+	require.NoError(t, err)
+
+	// The third commit changes a tracked file as well as adding one, so the
+	// test also shows that the rollback restores file contents.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "compose.yaml"), []byte("services: {web: {}}\n"), 0o600))
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "config"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "config", "app.yaml"), []byte("app: {}\n"), 0o600))
+
+	_, err = worktree.Add("compose.yaml")
+	require.NoError(t, err)
+	_, err = worktree.Add("config/app.yaml")
+	require.NoError(t, err)
+
+	third, err := worktree.Commit("config", &goGit.CommitOptions{
+		Author: &object.Signature{Name: "t", Email: "t@example.com", When: time.Now()},
+	})
+	require.NoError(t, err)
+
+	// Go back to the second commit and leave an empty read-only config
+	// directory that the third commit cannot write into. Git does not track
+	// empty directories, so the worktree stays clean apart from the local .env
+	// file.
+	require.NoError(t, RestoreHead(dir, second, false))
+	require.NoError(t, os.RemoveAll(filepath.Join(dir, "config")))
+	require.NoError(t, os.Mkdir(filepath.Join(dir, "config"), 0o500))
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(dir, "config"), 0o700) })
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ".env"), []byte("SECRET=local\n"), 0o600))
+
+	err = Checkout(t.Context(), dir, third.String(), CheckoutOptions{Stash: true})
+	require.Error(t, err)
+
+	head, err := repo.Head()
+	require.NoError(t, err)
+	assert.Equal(t, second, head.Hash().String())
+
+	compose, err := os.ReadFile(filepath.Join(dir, "compose.yaml"))
+	require.NoError(t, err)
+	assert.Equal(t, "services: {api: {}}\n", string(compose))
+
+	got, err := os.ReadFile(filepath.Join(dir, ".env"))
+	require.NoError(t, err)
+	assert.Equal(t, "SECRET=local\n", string(got))
 }

@@ -13,15 +13,16 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
-	mockContainerClient "github.com/nicholas-fedor/watchtower/internal/container/client/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/container"
 	"github.com/nicholas-fedor/watchtower/internal/container/labels"
 	"github.com/nicholas-fedor/watchtower/internal/container/provenance"
 	"github.com/nicholas-fedor/watchtower/internal/git"
+	dockerConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/docker"
 	gitConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/git"
 	mockUpdate "github.com/nicholas-fedor/watchtower/internal/update/mocks"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
+	mockRebuild "github.com/nicholas-fedor/watchtower/internal/update/rebuild/mocks"
 	"github.com/nicholas-fedor/watchtower/internal/update/state"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // TestSession_build verifies a remote Git URL build of one container. It checks
@@ -33,9 +34,9 @@ func TestSession_build(t *testing.T) {
 	t.Run("returns errGitNotAssociated when the container has no repo", func(t *testing.T) {
 		t.Parallel()
 
-		sess := NewSession(gitTestClient(t))
+		sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
 		c := mockUpdate.CreateMockContainer("plain", "/plain", "nginx:latest", time.Now())
-		docker := mockContainerClient.NewMockClient(t)
+		docker := mockRebuild.NewMockImageBuilder(t)
 
 		err := sess.build(newTestLogger(t), t.Context(), docker, c, git.CheckResult{Commit: "abc"}, updateParams.Params{}, nil)
 		require.ErrorIs(t, err, errGitNotAssociated)
@@ -44,9 +45,9 @@ func TestSession_build(t *testing.T) {
 	t.Run("returns an error when the commit is empty", func(t *testing.T) {
 		t.Parallel()
 
-		sess := NewSession(gitTestClient(t))
+		sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
 		c := gitAssociatedContainer("id", "/app", "myapp:latest", nil)
-		docker := mockContainerClient.NewMockClient(t)
+		docker := mockRebuild.NewMockImageBuilder(t)
 
 		err := sess.build(newTestLogger(t), t.Context(), docker, c, git.CheckResult{Stale: true}, updateParams.Params{Git: gitConfig.Defaults{Enable: true}}, nil)
 		require.Error(t, err)
@@ -56,9 +57,9 @@ func TestSession_build(t *testing.T) {
 	t.Run("returns an error when the build context is cancelled", func(t *testing.T) {
 		t.Parallel()
 
-		sess := NewSession(gitTestClient(t))
+		sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
 		c := gitAssociatedContainer("id", "/app", "myapp:latest", nil)
-		docker := mockContainerClient.NewMockClient(t)
+		docker := mockRebuild.NewMockImageBuilder(t)
 		expectGitBuild(docker)
 
 		ctx, cancel := context.WithCancel(t.Context())
@@ -72,9 +73,9 @@ func TestSession_build(t *testing.T) {
 	t.Run("logs exactly one changelog entry resolved from the git tag", func(t *testing.T) {
 		t.Parallel()
 
-		sess := NewSession(gitTestClient(t))
+		sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
 		c := gitAssociatedContainer("id", "/app", "myapp:latest", nil)
-		docker := mockContainerClient.NewMockClient(t)
+		docker := mockRebuild.NewMockImageBuilder(t)
 		expectGitBuild(docker)
 
 		params := updateParams.Params{EnableChangelog: true, Git: gitConfig.Defaults{Enable: true}}
@@ -105,12 +106,12 @@ func TestSession_build(t *testing.T) {
 	t.Run("keeps a nested dockerfile and context on the rebuilt container", func(t *testing.T) {
 		t.Parallel()
 
-		sess := NewSession(gitTestClient(t))
+		sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
 		c := gitAssociatedContainer("id", "/app", "myapp:latest", map[string]string{
 			labels.GitDockerfile: "build/docker/Dockerfile",
 			labels.GitContext:    ".",
 		})
-		docker := mockContainerClient.NewMockClient(t)
+		docker := mockRebuild.NewMockImageBuilder(t)
 		expectGitBuild(docker)
 
 		err := sess.build(
@@ -136,11 +137,11 @@ func TestSession_build(t *testing.T) {
 	t.Run("persists git-watch only when the source label enabled it", func(t *testing.T) {
 		t.Parallel()
 
-		sess := NewSession(gitTestClient(t))
+		sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
 		c := gitAssociatedContainer("id", "/app", "myapp:latest", map[string]string{
 			labels.GitWatch: "yes",
 		})
-		docker := mockContainerClient.NewMockClient(t)
+		docker := mockRebuild.NewMockImageBuilder(t)
 		expectGitBuild(docker)
 
 		err := sess.build(
@@ -161,20 +162,20 @@ func TestSession_build(t *testing.T) {
 	t.Run("does not pass a digest-pinned image as a build tag", func(t *testing.T) {
 		t.Parallel()
 
-		sess := NewSession(gitTestClient(t))
+		sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
 		image := "ghcr.io/org/app@sha256:" + strings.Repeat("a", 64)
 		commit := "0123456789abcdef0123456789abcdef01234567"
 		c := gitAssociatedContainer("digest", "/digest", image, nil)
 
 		var tags []string
 
-		docker := mockContainerClient.NewMockClient(t)
+		docker := mockRebuild.NewMockImageBuilder(t)
 		docker.EXPECT().
 			BuildRemoteImage(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 			Run(func(_ context.Context, _, _ string, got []string) {
 				tags = append([]string(nil), got...)
 			}).
-			Return(types.ImageID("sha256:built"), nil)
+			Return(container.ImageID("sha256:built"), nil)
 
 		err := sess.build(
 			newTestLogger(t),
@@ -195,11 +196,11 @@ func TestSession_build(t *testing.T) {
 		t.Parallel()
 
 		synctest.Test(t, func(t *testing.T) {
-			sess := NewSession(git.New(newTestLogger(t), git.Options{Timeout: 50 * time.Millisecond}))
+			sess := NewSession(git.New(newTestLogger(t), git.Options{Timeout: 50 * time.Millisecond}), dockerConfig.Docker{})
 			commit := "0123456789abcdef0123456789abcdef01234567"
 			c := gitAssociatedContainer("timeout", "/timeout", "myapp:latest", nil)
 
-			docker := mockContainerClient.NewMockClient(t)
+			docker := mockRebuild.NewMockImageBuilder(t)
 			docker.EXPECT().
 				BuildRemoteImage(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 				Run(func(ctx context.Context, _, _ string, _ []string) {
@@ -207,7 +208,7 @@ func TestSession_build(t *testing.T) {
 					assert.True(t, ok)
 					assert.Equal(t, rebuildTimeout, time.Until(deadline))
 				}).
-				Return(types.ImageID("sha256:built"), nil)
+				Return(container.ImageID("sha256:built"), nil)
 
 			err := sess.build(
 				newTestLogger(t),
@@ -226,14 +227,14 @@ func TestSession_build(t *testing.T) {
 		t.Parallel()
 
 		synctest.Test(t, func(t *testing.T) {
-			sess := NewSession(gitTestClient(t))
+			sess := NewSession(gitTestClient(t), dockerConfig.Docker{})
 			c := gitAssociatedContainer("timeout", "/timeout", "myapp:latest", nil)
 			commit := "0123456789abcdef0123456789abcdef01234567"
 
-			docker := mockContainerClient.NewMockClient(t)
+			docker := mockRebuild.NewMockImageBuilder(t)
 			docker.EXPECT().
 				BuildRemoteImage(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-				RunAndReturn(func(ctx context.Context, _, _ string, _ []string) (types.ImageID, error) {
+				RunAndReturn(func(ctx context.Context, _, _ string, _ []string) (container.ImageID, error) {
 					<-ctx.Done()
 
 					return "sha256:built", nil
@@ -251,7 +252,7 @@ func TestSession_build(t *testing.T) {
 			)
 
 			require.NoError(t, err)
-			assert.Equal(t, types.ImageID("sha256:built"), sess.built[c.ID()])
+			assert.Equal(t, container.ImageID("sha256:built"), sess.built[c.ID()])
 		})
 	})
 }

@@ -3,16 +3,21 @@ package images
 import (
 	"cmp"
 	"context"
-	"fmt"
 	"slices"
 	"strings"
 
 	"github.com/distribution/reference"
 
-	containerClient "github.com/nicholas-fedor/watchtower/internal/container/client"
+	"github.com/nicholas-fedor/watchtower/internal/container"
+	"github.com/nicholas-fedor/watchtower/internal/container/filters"
 	containerImage "github.com/nicholas-fedor/watchtower/internal/container/image"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
+
+// ContainerLister lists the containers the handler reports on.
+type ContainerLister interface {
+	// ListContainers returns the containers that pass every filter.
+	ListContainers(ctx context.Context, filter ...filters.Filter) ([]*container.Container, error)
+}
 
 // ImageStatus describes a tracked image and its current state.
 type ImageStatus struct {
@@ -58,8 +63,8 @@ func filterImages(statuses []ImageStatus, name, imageID string) []ImageStatus {
 // Returns:
 //   - []ImageStatus: Status for each tracked image, sorted by name and then image ID.
 //   - error: Non-nil if listing containers fails.
-func ListImageStatuses(ctx context.Context, client containerClient.Client, filter types.Filter) ([]ImageStatus, error) {
-	var list []types.Container
+func ListImageStatuses(ctx context.Context, client ContainerLister, filter filters.Filter) ([]ImageStatus, error) {
+	var list []*container.Container
 
 	var err error
 
@@ -70,7 +75,7 @@ func ListImageStatuses(ctx context.Context, client containerClient.Client, filte
 	}
 
 	if err != nil {
-		return nil, fmt.Errorf("failed to list containers: %w", err)
+		return nil, err //nolint:wrapcheck // The client's error already names the failed listing.
 	}
 
 	imageMap := make(map[string]*ImageStatus)
@@ -97,17 +102,12 @@ func ListImageStatuses(ctx context.Context, client containerClient.Client, filte
 			continue
 		}
 
-		status := &ImageStatus{
+		imageMap[key] = &ImageStatus{
 			Name:       imageName,
 			ImageID:    imageID,
+			Digest:     containerImage.LocalDigest(c),
 			Containers: 1,
 		}
-
-		if info := c.ImageInfo(); info != nil {
-			status.Digest = containerImage.ExtractImageDigest(info.RepoDigests, imageName)
-		}
-
-		imageMap[key] = status
 	}
 
 	statuses := make([]ImageStatus, 0, len(imageMap))

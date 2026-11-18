@@ -26,26 +26,27 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/nicholas-fedor/watchtower/internal/api/routes"
-	mockContainerClient "github.com/nicholas-fedor/watchtower/internal/container/client/mocks"
+	mockRoutes "github.com/nicholas-fedor/watchtower/internal/api/routes/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/container"
+	"github.com/nicholas-fedor/watchtower/internal/container/filters"
 	"github.com/nicholas-fedor/watchtower/internal/observability/events"
 	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
 	"github.com/nicholas-fedor/watchtower/internal/observability/metrics"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/internal/update/schedule"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
-func makeListContainersMock(t *testing.T) *mockContainerClient.MockClient {
+func makeListContainersMock(t *testing.T) *mockRoutes.MockClient {
 	t.Helper()
-	mc := mockContainerClient.NewMockClient(t)
-	mc.EXPECT().ListContainers(mock.Anything, mock.Anything).Return([]types.Container{}, nil).Maybe()
-	mc.EXPECT().ListContainers(mock.Anything).Return([]types.Container{}, nil).Maybe()
+	mc := mockRoutes.NewMockClient(t)
+	mc.EXPECT().ListContainers(mock.Anything, mock.Anything).Return([]*container.Container{}, nil).Maybe()
+	mc.EXPECT().ListContainers(mock.Anything).Return([]*container.Container{}, nil).Maybe()
 
 	return mc
 }
 
-func makeFilter(_ *testing.T) types.Filter {
-	return func(_ types.FilterableContainer) bool { return true }
+func makeFilter(_ *testing.T) filters.Filter {
+	return func(_ filters.FilterableContainer) bool { return true }
 }
 
 // withTestLogger injects a discarded logger when opts.Logger is nil.
@@ -95,7 +96,7 @@ func runServerAndShutdown(t *testing.T, opts routes.Options) {
 	case err := <-errCh:
 		assert.True(t, err == nil || errors.Is(err, context.Canceled),
 			"unexpected error: %v", err)
-		// Non-blocking: server is still running under GracefulContext; cancel it.
+		// A non-blocking server keeps running until its context is canceled.
 		cancel()
 		time.Sleep(50 * time.Millisecond)
 
@@ -138,7 +139,7 @@ func TestSetupAndStartAPI(t *testing.T) {
 				EnableUpdateAPI:             true,
 				UpdateLock:                  schedule.NewUpdateLock(),
 				RunUpdatesWithNotifications: nil,
-				FilterByImage:               func(_ []string, f types.Filter) types.Filter { return f },
+				FilterByImage:               func(_ []string, f filters.Filter) filters.Filter { return f },
 				DefaultMetrics:              func() *metrics.Metrics { return testMetrics },
 			},
 			wantErr: true,
@@ -150,7 +151,7 @@ func TestSetupAndStartAPI(t *testing.T) {
 				Token:           "test-token",
 				EnableUpdateAPI: true,
 				UpdateLock:      schedule.NewUpdateLock(),
-				RunUpdatesWithNotifications: func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
+				RunUpdatesWithNotifications: func(_ context.Context, _ filters.Filter, _ updateParams.Params) *metrics.Metric {
 					return &metrics.Metric{}
 				},
 				FilterByImage:  nil,
@@ -165,10 +166,10 @@ func TestSetupAndStartAPI(t *testing.T) {
 				Token:           "test-token",
 				EnableUpdateAPI: true,
 				UpdateLock:      schedule.NewUpdateLock(),
-				RunUpdatesWithNotifications: func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
+				RunUpdatesWithNotifications: func(_ context.Context, _ filters.Filter, _ updateParams.Params) *metrics.Metric {
 					return &metrics.Metric{}
 				},
-				FilterByImage:  func(_ []string, f types.Filter) types.Filter { return f },
+				FilterByImage:  func(_ []string, f filters.Filter) filters.Filter { return f },
 				DefaultMetrics: nil,
 			},
 			wantErr: true,
@@ -209,10 +210,10 @@ func TestSetupAndStartAPI_FullAPILifecycle(t *testing.T) {
 		RateLimit:   60,
 		Client:      makeListContainersMock(t),
 		Filter:      makeFilter(t),
-		RunUpdatesWithNotifications: func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
+		RunUpdatesWithNotifications: func(_ context.Context, _ filters.Filter, _ updateParams.Params) *metrics.Metric {
 			return &metrics.Metric{}
 		},
-		FilterByImage:       func(_ []string, f types.Filter) types.Filter { return f },
+		FilterByImage:       func(_ []string, f filters.Filter) filters.Filter { return f },
 		DefaultMetrics:      func() *metrics.Metrics { return testMetrics },
 		EventBroadcaster:    events.NewBroadcaster(),
 		UnblockHTTPAPI:      true,
@@ -291,7 +292,7 @@ func TestSetupAndStartAPI_CheckOnly(t *testing.T) {
 		RateLimit:      60,
 		Client:         makeListContainersMock(t),
 		Filter:         makeFilter(t),
-		FilterByImage:  func(_ []string, f types.Filter) types.Filter { return f },
+		FilterByImage:  func(_ []string, f filters.Filter) filters.Filter { return f },
 		DefaultMetrics: func() *metrics.Metrics { return testMetrics },
 	}
 
@@ -317,10 +318,10 @@ func TestSetupAndStartAPI_AllAPIs(t *testing.T) {
 		Client:              makeListContainersMock(t),
 		Filter:              makeFilter(t),
 		EventBroadcaster:    events.NewBroadcaster(),
-		RunUpdatesWithNotifications: func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
+		RunUpdatesWithNotifications: func(_ context.Context, _ filters.Filter, _ updateParams.Params) *metrics.Metric {
 			return &metrics.Metric{}
 		},
-		FilterByImage:  func(_ []string, f types.Filter) types.Filter { return f },
+		FilterByImage:  func(_ []string, f filters.Filter) filters.Filter { return f },
 		DefaultMetrics: func() *metrics.Metrics { return testMetrics },
 		UnblockHTTPAPI: true,
 	}
@@ -365,14 +366,14 @@ func TestRegisterUpdateRoute_UnblockHTTPAPI(t *testing.T) {
 		UpdateLock:      schedule.NewUpdateLock(),
 		UnblockHTTPAPI:  false,
 		RateLimit:       60,
-		RunUpdatesWithNotifications: func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
+		RunUpdatesWithNotifications: func(_ context.Context, _ filters.Filter, _ updateParams.Params) *metrics.Metric {
 			return &metrics.Metric{}
 		},
-		FilterByImage: func(_ []string, f types.Filter) types.Filter { return f },
+		FilterByImage: func(_ []string, f filters.Filter) filters.Filter { return f },
 		DefaultMetrics: func() *metrics.Metrics {
 			return &metrics.Metrics{}
 		},
-		WriteStartupMessage: func(_ logging.StartupParams) {
+		WriteStartupMessage: func(context.Context, logging.StartupParams) {
 			startupCalled.Add(1)
 		},
 	})
@@ -417,7 +418,7 @@ func TestSetupAndStartAPI_MissingUpdateDependencies(t *testing.T) {
 				EnableUpdateAPI:             true,
 				UpdateLock:                  schedule.NewUpdateLock(),
 				RunUpdatesWithNotifications: nil,
-				FilterByImage:               func(_ []string, f types.Filter) types.Filter { return f },
+				FilterByImage:               func(_ []string, f filters.Filter) filters.Filter { return f },
 				DefaultMetrics:              func() *metrics.Metrics { return testMetrics },
 			},
 			wantErr: "RunUpdatesWithNotifications must be provided",
@@ -428,7 +429,7 @@ func TestSetupAndStartAPI_MissingUpdateDependencies(t *testing.T) {
 				Token:           "test-token",
 				EnableUpdateAPI: true,
 				UpdateLock:      schedule.NewUpdateLock(),
-				RunUpdatesWithNotifications: func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
+				RunUpdatesWithNotifications: func(_ context.Context, _ filters.Filter, _ updateParams.Params) *metrics.Metric {
 					return &metrics.Metric{}
 				},
 				FilterByImage:  nil,
@@ -442,10 +443,10 @@ func TestSetupAndStartAPI_MissingUpdateDependencies(t *testing.T) {
 				Token:           "test-token",
 				EnableUpdateAPI: true,
 				UpdateLock:      schedule.NewUpdateLock(),
-				RunUpdatesWithNotifications: func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
+				RunUpdatesWithNotifications: func(_ context.Context, _ filters.Filter, _ updateParams.Params) *metrics.Metric {
 					return &metrics.Metric{}
 				},
-				FilterByImage:  func(_ []string, f types.Filter) types.Filter { return f },
+				FilterByImage:  func(_ []string, f filters.Filter) filters.Filter { return f },
 				DefaultMetrics: nil,
 			},
 			wantErr: "DefaultMetrics must be provided",
@@ -511,9 +512,9 @@ func TestSetupAndStartAPI_AllEndpointsEnableAll(t *testing.T) {
 		Client:           makeListContainersMock(t),
 		Filter:           makeFilter(t),
 		DefaultMetrics:   func() *metrics.Metrics { return testMetrics },
-		FilterByImage:    func(_ []string, f types.Filter) types.Filter { return f },
+		FilterByImage:    func(_ []string, f filters.Filter) filters.Filter { return f },
 		EventBroadcaster: events.NewBroadcaster(),
-		RunUpdatesWithNotifications: func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
+		RunUpdatesWithNotifications: func(_ context.Context, _ filters.Filter, _ updateParams.Params) *metrics.Metric {
 			return &metrics.Metric{}
 		},
 		UnblockHTTPAPI:      true,
@@ -600,12 +601,12 @@ func TestRunServer_BlockingUntilCancel(t *testing.T) {
 		UpdateLock:      schedule.NewUpdateLock(),
 		UnblockHTTPAPI:  false,
 		RateLimit:       60,
-		RunUpdatesWithNotifications: func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
+		RunUpdatesWithNotifications: func(_ context.Context, _ filters.Filter, _ updateParams.Params) *metrics.Metric {
 			return &metrics.Metric{}
 		},
-		FilterByImage:  func(_ []string, f types.Filter) types.Filter { return f },
+		FilterByImage:  func(_ []string, f filters.Filter) filters.Filter { return f },
 		DefaultMetrics: func() *metrics.Metrics { return testMetrics },
-		WriteStartupMessage: func(_ logging.StartupParams) {
+		WriteStartupMessage: func(context.Context, logging.StartupParams) {
 		},
 	})
 
@@ -644,10 +645,10 @@ func TestRunServer_UnblockWithUpdateAPI_NonBlocking(t *testing.T) {
 		UpdateLock:      schedule.NewUpdateLock(),
 		UnblockHTTPAPI:  true,
 		RateLimit:       60,
-		RunUpdatesWithNotifications: func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
+		RunUpdatesWithNotifications: func(_ context.Context, _ filters.Filter, _ updateParams.Params) *metrics.Metric {
 			return &metrics.Metric{}
 		},
-		FilterByImage:  func(_ []string, f types.Filter) types.Filter { return f },
+		FilterByImage:  func(_ []string, f filters.Filter) filters.Filter { return f },
 		DefaultMetrics: func() *metrics.Metrics { return testMetrics },
 	})
 
@@ -1040,11 +1041,30 @@ func requireAddrReleased(t *testing.T, addr string) {
 	}, shutdownGracePeriod+2*time.Second, 20*time.Millisecond, "the server kept listening on %s", addr)
 }
 
+// TestRunServer_CanceledBeforeBind verifies that a server whose context is
+// already canceled binds nothing and reports that it has stopped.
+func TestRunServer_CanceledBeforeBind(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	app := newApp(newTestLogger(t), 60, proxyConfig{}, corsConfig{}, true)
+	onBound := func() { t.Error("the server bound its socket after its context was canceled") }
+
+	stopped, err := runServer(ctx, newTestLogger(t), app, freeAddr(t), "", "", true, onBound, nil)
+	require.NoError(t, err)
+
+	select {
+	case <-stopped:
+	default:
+		t.Fatal("the server did not report that it stopped")
+	}
+}
+
 // TestRunServer_CancelBetweenBindAndServe verifies that a server canceled
 // after its socket is bound but before it starts serving still stops and
 // releases the socket, in blocking and non-blocking mode. Fiber runs OnListen
-// hooks in that gap, so the hook cancels there and waits until the shutdown
-// has run, which a server that is not serving yet ignores.
+// hooks in that gap. The hook cancels there and waits until the shutdown has
+// run, before the server starts serving.
 func TestRunServer_CancelBetweenBindAndServe(t *testing.T) {
 	for _, block := range []bool{true, false} {
 		t.Run(map[bool]string{true: "blocking", false: "non-blocking"}[block], func(t *testing.T) {
@@ -1092,11 +1112,141 @@ func TestRunServer_CancelBetweenBindAndServe(t *testing.T) {
 	}
 }
 
+// TestRunServer_DrainLimit verifies that a shutdown waits at most five seconds
+// for a request in flight. The server then stops with the request still
+// running, and the shutdown hooks receive context.DeadlineExceeded.
+func TestRunServer_DrainLimit(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+
+	// Release the handler even when the test fails early, so it does not stay
+	// blocked after the test ends.
+	releaseHandler := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseHandler)
+
+	app := newApp(newTestLogger(t), 60, proxyConfig{}, corsConfig{}, true)
+	app.Get("/slow", func(fiber.Ctx) error {
+		close(entered)
+		<-release
+
+		return nil
+	})
+
+	shutdownErrs := make(chan error, 1)
+
+	app.Hooks().OnPostShutdown(func(err error) error {
+		shutdownErrs <- err
+
+		return nil
+	})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	addr := freeAddr(t)
+
+	stopped, err := runServer(ctx, newTestLogger(t), app, addr, "", "", false, nil, nil)
+	require.NoError(t, err)
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+addr+"/slow", nil)
+	require.NoError(t, err)
+
+	// outcome is how the request ended.
+	type outcome struct {
+		err    error
+		status int
+	}
+
+	finished := make(chan outcome, 1)
+
+	go func() {
+		resp, doErr := http.DefaultClient.Do(req)
+		if doErr != nil {
+			finished <- outcome{err: doErr}
+
+			return
+		}
+
+		_ = resp.Body.Close()
+		finished <- outcome{status: resp.StatusCode}
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request did not reach the handler")
+	}
+
+	began := time.Now()
+
+	cancel()
+
+	select {
+	case <-stopped:
+	case <-time.After(shutdownGracePeriod + 2*time.Second):
+		t.Fatal("the server did not stop once the drain limit passed")
+	}
+
+	assert.GreaterOrEqual(t, time.Since(began), shutdownGracePeriod, "the server stopped before the drain limit")
+
+	select {
+	case shutdownErr := <-shutdownErrs:
+		require.ErrorIs(t, shutdownErr, context.DeadlineExceeded)
+	default:
+		t.Fatal("the shutdown hooks did not run before the server stopped")
+	}
+
+	// The request still finishes once its handler is released, so the
+	// handler and its log lines end before the test does.
+	releaseHandler()
+
+	select {
+	case result := <-finished:
+		require.NoError(t, result.err, "the request failed after its handler was released")
+		assert.Equal(t, http.StatusOK, result.status)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request did not finish after its handler was released")
+	}
+}
+
+// TestStartupMessageWriter verifies that only the blocking HTTP API writes the
+// startup message. Its writer receives the server's context, so a process
+// stopped between the bind and the message announces nothing.
+func TestStartupMessageWriter(t *testing.T) {
+	t.Parallel()
+
+	var (
+		called bool
+		// receivedErr is the error of the context the writer received.
+		receivedErr error
+	)
+
+	opts := routes.Options{
+		WriteStartupMessage: func(ctx context.Context, _ logging.StartupParams) {
+			called = true
+			receivedErr = ctx.Err()
+		},
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	assert.Nil(t, startupMessageWriter(ctx, opts, false), "the API in the background wrote the startup message")
+
+	write := startupMessageWriter(ctx, opts, true)
+	require.NotNil(t, write, "the blocking API has no startup message writer")
+
+	write()
+
+	require.True(t, called, "the startup message writer was not called")
+	assert.ErrorIs(t, receivedErr, context.Canceled, "the writer did not get the server's context")
+}
+
 // TestSetupAndStartAPI_StartupMessageAfterBind verifies that in blocking mode
 // the startup message is written once the API socket is bound, and not at all
 // when the socket cannot be bound.
 func TestSetupAndStartAPI_StartupMessageAfterBind(t *testing.T) {
-	blockingOpts := func(addr string, startup func(logging.StartupParams)) routes.Options {
+	blockingOpts := func(addr string, startup func(context.Context, logging.StartupParams)) routes.Options {
 		host, port, err := net.SplitHostPort(addr)
 		require.NoError(t, err)
 
@@ -1107,10 +1257,10 @@ func TestSetupAndStartAPI_StartupMessageAfterBind(t *testing.T) {
 			EnableUpdateAPI: true,
 			UpdateLock:      schedule.NewUpdateLock(),
 			RateLimit:       60,
-			RunUpdatesWithNotifications: func(context.Context, types.Filter, updateParams.Params) *metrics.Metric {
+			RunUpdatesWithNotifications: func(context.Context, filters.Filter, updateParams.Params) *metrics.Metric {
 				return &metrics.Metric{}
 			},
-			FilterByImage:       func(_ []string, f types.Filter) types.Filter { return f },
+			FilterByImage:       func(_ []string, f filters.Filter) filters.Filter { return f },
 			DefaultMetrics:      func() *metrics.Metrics { return &metrics.Metrics{} },
 			WriteStartupMessage: startup,
 		})
@@ -1120,9 +1270,11 @@ func TestSetupAndStartAPI_StartupMessageAfterBind(t *testing.T) {
 		addr := freeAddr(t)
 		bound := make(chan bool, 1)
 
-		opts := blockingOpts(addr, func(logging.StartupParams) {
+		opts := blockingOpts(addr, func(ctx context.Context, _ logging.StartupParams) {
 			// Binding the address fails while the API holds it.
-			ln, err := listenTCP(t, addr)
+			var listenConfig net.ListenConfig
+
+			ln, err := listenConfig.Listen(ctx, "tcp", addr)
 			if err == nil {
 				_ = ln.Close()
 			}
@@ -1158,7 +1310,7 @@ func TestSetupAndStartAPI_StartupMessageAfterBind(t *testing.T) {
 
 		var called atomic.Bool
 
-		opts := blockingOpts(taken.Addr().String(), func(logging.StartupParams) { called.Store(true) })
+		opts := blockingOpts(taken.Addr().String(), func(context.Context, logging.StartupParams) { called.Store(true) })
 
 		_, err = SetupAndStartAPI(t.Context(), opts)
 		require.ErrorContains(t, err, "failed to start HTTP server")
@@ -1269,7 +1421,7 @@ func TestSetupAndStartAPI_StoppedAfterDrain(t *testing.T) {
 
 	opts := fixtureOptions(t, newFixtureClient(t), newFixtureMetrics(t))
 	opts.Host, opts.Port = host, port
-	opts.RunUpdatesWithNotifications = func(context.Context, types.Filter, updateParams.Params) *metrics.Metric {
+	opts.RunUpdatesWithNotifications = func(context.Context, filters.Filter, updateParams.Params) *metrics.Metric {
 		close(entered)
 		<-release
 

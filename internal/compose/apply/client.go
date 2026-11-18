@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"os"
+	"slices"
 	"strings"
 	"sync"
 
@@ -16,15 +18,19 @@ import (
 
 	composeTypes "github.com/compose-spec/compose-go/v2/types"
 	dockerFlags "github.com/docker/cli/cli/flags"
+	dockerClient "github.com/moby/moby/client"
 
 	composeProject "github.com/nicholas-fedor/watchtower/internal/compose/project"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
+	"github.com/nicholas-fedor/watchtower/internal/container"
+	dockerConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/docker"
 )
 
 // Client applies a Compose project through docker/compose v5.
 type Client struct {
 	service api.Compose
-	mu      sync.Mutex
+	// docker holds the settings the Compose service connects with.
+	docker dockerConfig.Docker
+	mu     sync.Mutex
 }
 
 // Request is one Compose apply for a checked-out project directory.
@@ -46,19 +52,67 @@ type Container struct {
 	// Name is the container name from compose ps, used to match replicas.
 	Name string
 	// ID is the container ID that compose ps reports.
-	ID types.ContainerID
+	ID container.ContainerID
 	// ImageID is the ID of the image the container runs, from compose images,
 	// or the container's image reference when that is already an image ID.
 	// It is empty when neither is known.
-	ImageID types.ImageID
+	ImageID container.ImageID
 }
 
 // NewClient returns an applier that talks to the Docker daemon on first Apply.
 //
+// Parameters:
+//   - docker: Docker connection settings for the Compose service.
+//
 // Returns:
 //   - *Client: Lazy Compose service.
-func NewClient() *Client {
-	return &Client{}
+func NewClient(docker dockerConfig.Docker) *Client {
+	return &Client{docker: docker}
+}
+
+// ExportConnection sets the DOCKER_* connection variables to the Docker connection settings.
+//
+// The build tools Compose starts read the connection from these variables, because Compose
+// passes them only the daemon host. A certificate path also sets DOCKER_TLS, so they use TLS
+// when verification is off. A variable whose setting is empty or false is unset rather than
+// left stale, because those tools treat any value as set, even "0".
+//
+// Parameters:
+//   - settings: Docker connection settings.
+//
+// Returns:
+//   - error: Non-nil when a variable cannot be set or unset.
+func ExportConnection(settings dockerConfig.Docker) error {
+	tlsVerify := ""
+	if settings.TLSVerify {
+		tlsVerify = "1"
+	}
+
+	useTLS := ""
+	if settings.CertPath != "" {
+		useTLS = "1"
+	}
+
+	for _, variable := range []struct{ name, value string }{
+		{name: "DOCKER_HOST", value: settings.Host},
+		{name: "DOCKER_TLS", value: useTLS},
+		{name: "DOCKER_TLS_VERIFY", value: tlsVerify},
+		{name: "DOCKER_API_VERSION", value: settings.APIVersion},
+		{name: "DOCKER_CERT_PATH", value: settings.CertPath},
+	} {
+		var err error
+		if variable.value == "" {
+			err = os.Unsetenv(variable.name)
+		} else {
+			err = os.Setenv(variable.name, variable.value)
+		}
+
+		if err != nil {
+			return fmt.Errorf("%w: %s: %w", errExportEnvFailed, variable.name, err)
+		}
+	}
+
+	return nil
 }
 
 // Apply loads the project and runs compose up, or compose build when BuildOnly is set.
@@ -130,8 +184,7 @@ func (c *Client) Apply(ctx context.Context, req Request) ([]Container, error) {
 			Inherit:              true,
 		},
 		Start: api.StartOptions{
-			Project: project,
-			Wait:    true,
+			Wait: true,
 		},
 	})
 	if err != nil {
@@ -182,6 +235,9 @@ func injectLabels(project *composeTypes.Project, labels map[string]map[string]st
 
 // scopeComposeProject scopes a project to the requested services and their dependencies.
 //
+// The scoped project declares no jobs, so an apply neither registers nor checks
+// the project's jobs. Registering them stays with the user's own compose up.
+//
 // Parameters:
 //   - project: Loaded Compose project.
 //   - services: Service names to select.
@@ -203,6 +259,14 @@ func scopeComposeProject(project *composeTypes.Project, services []string) (*com
 	if err != nil {
 		return nil, fmt.Errorf("select selected compose services: %w", err)
 	}
+
+	// Compose up refuses a project with scheduled jobs when the engine's jobs
+	// extension is off, and otherwise registers them after starting services.
+	// A registered job records the directory it was declared in, so an apply
+	// from Watchtower's checkout would fail as a changed job after the services
+	// were already recreated.
+	project.Jobs = nil
+	project.DisabledJobs = nil
 
 	return project, nil
 }
@@ -272,14 +336,9 @@ func (c *Client) composeService() (api.Compose, error) {
 		return c.service, nil
 	}
 
-	dockerCLI, err := command.NewDockerCli()
+	dockerCLI, err := c.newDockerCLI()
 	if err != nil {
-		return nil, fmt.Errorf("docker cli: %w", err)
-	}
-
-	err = dockerCLI.Initialize(dockerFlags.NewClientOptions())
-	if err != nil {
-		return nil, fmt.Errorf("docker cli init: %w", err)
+		return nil, err
 	}
 
 	svc, err := compose.NewComposeService(
@@ -294,6 +353,54 @@ func (c *Client) composeService() (api.Compose, error) {
 	c.service = svc
 
 	return svc, nil
+}
+
+// newDockerCLI returns a Docker CLI that connects with the client's Docker settings.
+//
+// The Docker CLI uses an API client built from the settings, as the container client's is,
+// so both connect and trust the daemon's certificate the same way. The host takes the place
+// of DOCKER_HOST and any Docker context, and an empty host is the Docker SDK's default
+// socket.
+//
+// Returns:
+//   - *command.DockerCli: Initialized Docker CLI. It connects on first use.
+//   - error: Non-nil when the certificate files cannot be loaded, or when the Docker CLI
+//     cannot be created or initialized.
+func (c *Client) newDockerCLI() (*command.DockerCli, error) {
+	connection, err := c.docker.ConnectionOptions()
+	if err != nil {
+		return nil, fmt.Errorf("docker cli: %w", err)
+	}
+
+	apiClient, err := dockerClient.New(
+		slices.Concat(connection, []dockerClient.Opt{dockerClient.WithAPIVersion(c.docker.APIVersion)})...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("docker cli: %w", err)
+	}
+
+	// With its own API client, the Docker CLI never loads TLS files itself. Its endpoint then
+	// carries the host alone, which Compose passes to the build tools it starts, and those
+	// read the TLS settings from the environment that ExportConnection writes.
+	dockerCLI, err := command.NewDockerCli(command.WithAPIClient(apiClient))
+	if err != nil {
+		return nil, fmt.Errorf("docker cli: %w", err)
+	}
+
+	host := c.docker.Host
+	if host == "" {
+		host = dockerClient.DefaultDockerHost
+	}
+
+	options := dockerFlags.NewClientOptions()
+	options.Hosts = []string{host}
+
+	err = dockerCLI.Initialize(options)
+	if err != nil {
+		return nil, fmt.Errorf("docker cli init: %w", err)
+	}
+
+	return dockerCLI, nil
 }
 
 // listApplied returns running service containers after compose up or build.
@@ -335,7 +442,7 @@ func listApplied(
 		out = append(out, Container{
 			Service: summary.Service,
 			Name:    summary.Name,
-			ID:      types.ContainerID(summary.ID),
+			ID:      container.ContainerID(summary.ID),
 			ImageID: appliedImageID(summary, images),
 		})
 	}
@@ -350,16 +457,16 @@ func listApplied(
 //   - images: compose images keyed by container name.
 //
 // Returns:
-//   - types.ImageID: Inspected ID, a sha256: reference, or empty.
-func appliedImageID(summary api.ContainerSummary, images map[string]api.ImageSummary) types.ImageID {
+//   - container.ImageID: Inspected ID, a sha256: reference, or empty.
+func appliedImageID(summary api.ContainerSummary, images map[string]api.ImageSummary) container.ImageID {
 	if images != nil {
 		if img, ok := images[summary.Name]; ok && img.ID != "" {
-			return types.ImageID(img.ID)
+			return container.ImageID(img.ID)
 		}
 	}
 
 	if strings.HasPrefix(summary.Image, "sha256:") {
-		return types.ImageID(summary.Image)
+		return container.ImageID(summary.Image)
 	}
 
 	return ""

@@ -5,8 +5,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/nicholas-fedor/watchtower/pkg/types"
-	mockTypes "github.com/nicholas-fedor/watchtower/pkg/types/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/container"
+	"github.com/nicholas-fedor/watchtower/internal/testutil/containerfixture"
+	"github.com/nicholas-fedor/watchtower/internal/testutil/modelfixture"
 )
 
 // TestBlocked verifies why a self-update cannot replace the running Watchtower
@@ -22,7 +23,7 @@ func TestBlocked(t *testing.T) {
 		// ports is whether the current container publishes host ports. Nil
 		// leaves the current container uninspected.
 		ports     *bool
-		currentID types.ContainerID
+		currentID container.ContainerID
 		ephemeral bool
 		want      Block
 	}{
@@ -54,12 +55,13 @@ func TestBlocked(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			var current types.Container
+			var current *container.Container
 
 			if tt.ports != nil {
-				mockCurrent := mockTypes.NewMockContainer(t)
-				mockCurrent.EXPECT().HasExposedPorts().Return(*tt.ports).Maybe()
-				current = mockCurrent
+				current = modelfixture.Container()
+				if *tt.ports {
+					current = modelfixture.Container(containerfixture.WithPortBindings("8080/tcp"))
+				}
 			}
 
 			assert.Equal(t, tt.want, Blocked(current, tt.currentID, tt.ephemeral))

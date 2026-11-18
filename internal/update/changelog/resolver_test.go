@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -16,9 +15,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/nicholas-fedor/watchtower/internal/container"
+	"github.com/nicholas-fedor/watchtower/internal/registry/digest"
 	"github.com/nicholas-fedor/watchtower/internal/registry/ratelimit"
 	registryConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/registry"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
+	"github.com/nicholas-fedor/watchtower/internal/testutil/containerfixture"
+	"github.com/nicholas-fedor/watchtower/internal/testutil/httpstub"
+	"github.com/nicholas-fedor/watchtower/internal/testutil/modelfixture"
 )
 
 const testDigest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
@@ -31,7 +34,8 @@ type spyFetcher struct {
 	// mu guards calls.
 	mu sync.Mutex
 	// digests maps a tag to the digest returned for it. A missing tag yields
-	// empty with no error, which is how a registry reports an unknown tag.
+	// empty with no error, as the digest fetcher reports a tag the registry
+	// answers 404 for.
 	digests map[string]string
 	// errs maps a tag to the error returned for it.
 	errs map[string]error
@@ -42,7 +46,7 @@ type spyFetcher struct {
 func (f *spyFetcher) FetchDigestForTag(
 	_ *zerolog.Logger,
 	_ context.Context,
-	_ types.Container,
+	_ *container.Container,
 	_ string,
 	tag string,
 	_ ...string,
@@ -87,7 +91,7 @@ type transientThenOKFetcher struct {
 func (f *transientThenOKFetcher) FetchDigestForTag(
 	_ *zerolog.Logger,
 	_ context.Context,
-	_ types.Container,
+	_ *container.Container,
 	_ string,
 	tag string,
 	_ ...string,
@@ -125,7 +129,7 @@ type gatedFetcher struct {
 func (f *gatedFetcher) FetchDigestForTag(
 	_ *zerolog.Logger,
 	_ context.Context,
-	_ types.Container,
+	_ *container.Container,
 	_ string,
 	tag string,
 	_ ...string,
@@ -271,7 +275,8 @@ func TestResolveTagDoesNotCacheTransientFailure(t *testing.T) {
 }
 
 // A rate limit is a statement about the whole host, so it is remembered briefly
-// rather than costing every sibling container its own doomed request.
+// rather than costing every sibling container its own doomed request. It lapses
+// at its deadline, so the lookup made at that instant reaches the registry.
 func TestResolveTagRateLimitIsNegativelyCachedForTheTTL(t *testing.T) {
 	t.Parallel()
 
@@ -292,8 +297,13 @@ func TestResolveTagRateLimitIsNegativelyCachedForTheTTL(t *testing.T) {
 
 	assert.Equal(t, 1, fetcher.calls, "the refusal must be cached, not retried per sibling")
 
-	// Once the TTL lapses the next container gets a real attempt, which succeeds.
-	now = now.Add(rateLimitCacheTTL + time.Second)
+	now = now.Add(rateLimitCacheTTL - time.Second)
+
+	assert.Empty(t, r.ResolveTag(newTestLogger(t), ctx, testContainer(), "", "1.2.3", testDigest))
+	assert.Equal(t, 1, fetcher.calls, "the refusal must hold until the TTL lapses")
+
+	// At the deadline the next container gets a real attempt, which succeeds.
+	now = now.Add(time.Second)
 
 	assert.Equal(t, "v1.2.3", r.ResolveTag(newTestLogger(t), ctx, testContainer(), "", "1.2.3", testDigest))
 }
@@ -335,7 +345,7 @@ func TestResolveTagSkipsWhenNotWorthProbing(t *testing.T) {
 
 	tests := []struct {
 		name      string
-		container types.Container
+		container *container.Container
 		version   string
 		digest    string
 	}{
@@ -567,31 +577,33 @@ func TestResolveTagConcurrentDistinctDigests(t *testing.T) {
 
 // TestDigestFetcherUsesItsSettings verifies that a DigestFetcher makes its
 // registry requests with the settings it was built with, so a registry served
-// over plain HTTP is reachable only when the settings skip TLS.
+// over plain HTTP is reachable only when the settings skip TLS. The stub
+// answers 404 only for a HEAD of the v9.9.9 manifest and fails the test on any
+// request it has no route for, so the miss comes from that tag's request.
 func TestDigestFetcherUsesItsSettings(t *testing.T) {
 	t.Parallel()
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.URL.Path == "/v2/":
-			w.WriteHeader(http.StatusOK)
-		case r.Method == http.MethodHead && r.URL.Path == "/v2/org/app/manifests/v1.2.3":
-			w.Header().Set("Docker-Content-Digest", testDigest)
-			w.WriteHeader(http.StatusOK)
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	t.Cleanup(server.Close)
+	server := httpstub.New(t)
+	server.RouteToHandler(http.MethodGet, httpstub.Path("/v2/"), httpstub.RespondWith(http.StatusOK, "", nil))
+	server.RouteToHandler(http.MethodHead, httpstub.Path("/v2/org/app/manifests/v1.2.3"),
+		httpstub.RespondWith(http.StatusOK, "", http.Header{digest.ContentDigestHeader: {testDigest}}))
+	server.RouteToHandler(http.MethodHead, httpstub.Path("/v2/org/app/manifests/v9.9.9"),
+		httpstub.RespondWith(http.StatusNotFound, "", nil))
 
-	container := stubContainer{imageName: strings.TrimPrefix(server.URL, "http://") + "/org/app:1.2.3"}
+	c := modelfixture.ContainerWithoutImageInfo(containerfixture.WithImageName(server.Addr() + "/org/app:1.2.3"))
 
 	got, err := NewDigestFetcher(registryConfig.Registry{TLSSkip: true}, ratelimit.New()).
-		FetchDigestForTag(newTestLogger(t), t.Context(), container, "", "v1.2.3")
+		FetchDigestForTag(newTestLogger(t), t.Context(), c, "", "v1.2.3")
 	require.NoError(t, err)
 	assert.Equal(t, strings.TrimPrefix(testDigest, "sha256:"), got)
 
+	// The registry answers 404 for a tag it does not have, which is a miss.
+	got, err = NewDigestFetcher(registryConfig.Registry{TLSSkip: true}, ratelimit.New()).
+		FetchDigestForTag(newTestLogger(t), t.Context(), c, "", "v9.9.9")
+	require.NoError(t, err)
+	assert.Empty(t, got)
+
 	_, err = NewDigestFetcher(registryConfig.Registry{}, ratelimit.New()).
-		FetchDigestForTag(newTestLogger(t), t.Context(), container, "", "v1.2.3")
+		FetchDigestForTag(newTestLogger(t), t.Context(), c, "", "v1.2.3")
 	require.Error(t, err, "an HTTPS request reached the plain HTTP registry")
 }

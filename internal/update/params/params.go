@@ -4,20 +4,24 @@ import (
 	"math"
 	"time"
 
+	"github.com/nicholas-fedor/watchtower/internal/container"
+	"github.com/nicholas-fedor/watchtower/internal/container/filters"
 	"github.com/nicholas-fedor/watchtower/internal/observability/events"
+	dockerConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/docker"
 	gitConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/git"
 	registryConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/registry"
 	updateConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/update"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // Params holds the settings that one update run applies to the containers it checks.
 type Params struct {
-	Filter              types.Filter            // Container filter.
+	Filter              filters.Filter          // Container filter.
 	ComposeProjects     map[string]string       // Compose project name to directory inside Watchtower.
-	CurrentContainerID  types.ContainerID       // ID of the current container being updated.
+	CurrentContainerID  container.ContainerID   // ID of the current container being updated.
+	Scope               string                  // Scope this instance runs in, empty for no scope.
 	Git                 gitConfig.Defaults      // Credential-free Git association settings.
 	Registry            registryConfig.Registry // Settings for registry requests.
+	Docker              dockerConfig.Docker     // Docker connection settings for Compose rebuilds.
 	updateConfig.Policy                         // Settings that a container's labels can override.
 	Timeout             time.Duration           // Container stop timeout before a forced kill.
 	PullFailureDelay    time.Duration           // Delay after a failed self-update pull in run-once mode.
@@ -71,7 +75,7 @@ func (p Params) DetachedTimeout() time.Duration {
 //
 // Returns:
 //   - time.Duration: The bound for the detached calls.
-func (p Params) DetachedStopTimeout(c types.Container) time.Duration {
+func (p Params) DetachedStopTimeout(c *container.Container) time.Duration {
 	return detachedBound(max(p.Timeout, c.StopTimeout(p.Timeout)))
 }
 

@@ -702,6 +702,27 @@ func TestRejectsURLsThatShoutrrrRejects(t *testing.T) {
 			},
 			source: `check "slack" notification URL: discord:`,
 		},
+		{
+			name: "legacy Teams webhook URL that does not parse",
+			cfg: notifyConfig.Notify{
+				LegacyTypes: []string{"msteams"},
+				Legacy: notifyConfig.Legacy{
+					MSTeamsHook: "https://default.environment.api.powerplatform.com/powerautomate/automations/direct" +
+						"/workflows/secrettoken%zz/triggers/manual/paths/invoke?sig=abc",
+				},
+			},
+			source: `check "msteams" notification URL: teams: invalid webhook URL format: the URL does not parse`,
+		},
+		{
+			name: "legacy Teams retired connector URL",
+			cfg: notifyConfig.Notify{
+				LegacyTypes: []string{"msteams"},
+				Legacy: notifyConfig.Legacy{
+					MSTeamsHook: "https://example.webhook.office.com/webhookb2/secrettoken",
+				},
+			},
+			source: `check "msteams" notification URL: teams: invalid webhook URL format: not a Power Automate workflow webhook URL`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -1066,7 +1087,7 @@ func loadNotify(t *testing.T, args []string) notifyConfig.Notify {
 	settings.RegisterAll(command)
 	require.NoError(t, command.ParseFlags(args))
 
-	cfg, err := settings.Load(newTestLogger(t), command, nil)
+	cfg, _, err := settings.Load(newTestLogger(t), command, nil)
 	require.NoError(t, err)
 
 	return cfg.Notify

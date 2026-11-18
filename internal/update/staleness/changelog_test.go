@@ -21,7 +21,6 @@ import (
 	"github.com/nicholas-fedor/watchtower/internal/update/changelog"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/internal/update/state"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // newDigest is the manifest digest of the new image in these tests.
@@ -38,7 +37,7 @@ type panickingFetcher struct {
 func (f panickingFetcher) FetchDigestForTag(
 	_ *zerolog.Logger,
 	_ context.Context,
-	_ types.Container,
+	_ *container.Container,
 	_ string,
 	_ string,
 	_ ...string,
@@ -57,7 +56,7 @@ type stubFetcher struct {
 func (f *stubFetcher) FetchDigestForTag(
 	_ *zerolog.Logger,
 	_ context.Context,
-	_ types.Container,
+	_ *container.Container,
 	_ string,
 	tag string,
 	_ ...string,
@@ -104,7 +103,7 @@ func newReportContainer(t *testing.T, labels, imageLabels map[string]string) *co
 		RepoTags: []string{image},
 	})
 
-	require.Equal(t, types.ContainerID(name), c.ID())
+	require.Equal(t, container.ContainerID(name), c.ID())
 
 	return c
 }
@@ -314,7 +313,7 @@ type missFetcher struct{}
 func (f *missFetcher) FetchDigestForTag(
 	_ *zerolog.Logger,
 	_ context.Context,
-	_ types.Container,
+	_ *container.Container,
 	_ string,
 	_ string,
 	_ ...string,

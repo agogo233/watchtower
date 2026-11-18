@@ -11,7 +11,7 @@ import (
 	dockerNetwork "github.com/moby/moby/api/types/network"
 	dockerAPIVersion "github.com/moby/moby/client/pkg/versions"
 
-	"github.com/nicholas-fedor/watchtower/pkg/types"
+	"github.com/nicholas-fedor/watchtower/internal/container"
 )
 
 // Errors for network configuration operations.
@@ -33,7 +33,7 @@ var (
 // Returns:
 //   - *dockerNetwork.NetworkingConfig: Sanitized network configuration.
 func FromContainer(log *zerolog.Logger,
-	sourceContainer types.Container,
+	sourceContainer *container.Container,
 	clientVersion string,
 ) *dockerNetwork.NetworkingConfig {
 	clogVal := log.With().
@@ -142,7 +142,7 @@ func EmptyConfig() *dockerNetwork.NetworkingConfig {
 //   - error: Non-nil if sourceEndpoint is nil, nil otherwise.
 func processEndpoint(log *zerolog.Logger,
 	sourceEndpoint *dockerNetwork.EndpointSettings,
-	containerID types.ContainerID,
+	containerID container.ContainerID,
 	clientVersion string,
 	isHostNetwork bool,
 ) (*dockerNetwork.EndpointSettings, error) {
@@ -266,7 +266,7 @@ func isEngineGeneratedMAC(mac dockerNetwork.HardwareAddr, ip netip.Addr) bool {
 //   - bool: True if the container had at least one MAC and every one of them was
 //     engine-generated, and all non-nil original endpoints appear in the processed
 //     config. False otherwise.
-func onlyGeneratedMacs(sourceContainer types.Container, processedConfig *dockerNetwork.NetworkingConfig) bool {
+func onlyGeneratedMacs(sourceContainer *container.Container, processedConfig *dockerNetwork.NetworkingConfig) bool {
 	if sourceContainer == nil {
 		return false
 	}
@@ -338,10 +338,10 @@ func onlyGeneratedMacs(sourceContainer types.Container, processedConfig *dockerN
 //     networks, legacy API versions, and other expected absences of MAC addresses.
 func validateMacAddresses(log *zerolog.Logger,
 	config *dockerNetwork.NetworkingConfig,
-	containerID types.ContainerID,
+	containerID container.ContainerID,
 	clientVersion string,
 	isHostNetwork bool,
-	sourceContainer types.Container,
+	sourceContainer *container.Container,
 ) error {
 	// Initialize logger with container and API version context for consistent log messages.
 	// The name and ID fields match the other recreation logs.

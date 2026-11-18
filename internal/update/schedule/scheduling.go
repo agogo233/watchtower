@@ -12,10 +12,10 @@ import (
 	"github.com/robfig/cron/v3"
 	"github.com/rs/zerolog"
 
+	"github.com/nicholas-fedor/watchtower/internal/container/filters"
 	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
 	"github.com/nicholas-fedor/watchtower/internal/observability/metrics"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // updateWaitTimeout bounds how long shutdown waits for an in-flight update.
@@ -124,7 +124,9 @@ func recoverPanics(log *zerolog.Logger) cron.JobWrapper {
 // Because every update holds the lock, the message never opens its
 // notification batch while an update's batch is open. It waits for an update
 // that holds the lock and writes nothing when ctx is done first. The first
-// scheduled run time is read once the lock is taken, after any such wait.
+// scheduled run time is read once the lock is taken, after any such wait. The
+// writer receives ctx and writes nothing for a process that is already
+// stopping.
 //
 // Parameters:
 //   - ctx: Context that ends the wait for the lock.
@@ -150,14 +152,14 @@ func writeStartupMessage(ctx context.Context, lock *UpdateLock, scheduler *cron.
 
 	// The update at startup is skipped after a wait, so the message does not
 	// announce it.
-	updateOnStart := deps.UpdateOnStart && !waited
+	updateOnStart := deps.updatesOnStart() && !waited
 
 	// Startup holds every other field of the message. Only the scheduler's
 	// own values are set here.
 	startup := deps.Startup
 	startup.Sched = nextRun
 	startup.UpdateOnStart = &updateOnStart
-	deps.WriteStartupMessage(startup)
+	deps.WriteStartupMessage(ctx, startup)
 
 	return waited
 }
@@ -172,15 +174,17 @@ type ScheduleDeps struct {
 	// Logger is the process logger for scheduled runs. Required and must be non-nil.
 	Logger *zerolog.Logger
 	// Filter determines which containers are updated.
-	Filter types.Filter
+	Filter filters.Filter
 	// Lock ensures only one update runs at a time. Share it with every other
 	// caller that starts updates, such as the HTTP API. Nil gives the scheduler
 	// a lock of its own.
 	Lock *UpdateLock
-	// WriteStartupMessage writes the startup message with scheduling information.
-	WriteStartupMessage func(logging.StartupParams)
+	// WriteStartupMessage writes the startup message with scheduling
+	// information. It receives the scheduler's context and writes nothing once
+	// that context is done.
+	WriteStartupMessage func(context.Context, logging.StartupParams)
 	// RunUpdate performs container updates and sends notifications.
-	RunUpdate func(context.Context, types.Filter, updateParams.Params) *metrics.Metric
+	RunUpdate func(context.Context, filters.Filter, updateParams.Params) *metrics.Metric
 	// ScheduleSpec is the cron-formatted schedule string for periodic updates.
 	ScheduleSpec string
 	// Startup holds resolved values for startup messaging (no flag reads).
@@ -193,12 +197,22 @@ type ScheduleDeps struct {
 	BaseParams updateParams.Params
 	// UpdateOnStart triggers an immediate update before the scheduler starts.
 	UpdateOnStart bool
-	// SkipFirstRun skips Watchtower self-update on the first scheduled run
-	// (useful after self-update cleanup of old instances).
-	SkipFirstRun bool
-	// StartupMessageSent is true when the startup message was already sent
-	// (for example by the HTTP API in blocking mode).
-	StartupMessageSent bool
+	// ReplacedOlderInstance reports that startup cleanup removed another
+	// Watchtower instance in this process's scope. The scheduler then makes no
+	// update at startup. Its first scheduled run also skips self-updates.
+	ReplacedOlderInstance bool
+}
+
+// updatesOnStart reports whether the scheduler makes an update at startup.
+//
+// It does when update on start is set, unless the process replaced an older
+// instance. That instance is usually the one whose self-update started this
+// process, so an update has just run.
+//
+// Returns:
+//   - bool: True when the scheduler updates at startup.
+func (d ScheduleDeps) updatesOnStart() bool {
+	return d.UpdateOnStart && !d.ReplacedOlderInstance
 }
 
 // RunUpgradesOnSchedule schedules and executes periodic container updates according to the cron specification.
@@ -206,7 +220,8 @@ type ScheduleDeps struct {
 // It sets up a cron scheduler, runs updates at specified intervals, and shuts down gracefully when ctx is
 // canceled, handling concurrency with an update lock. The caller cancels ctx on shutdown signals.
 // If update-on-start is enabled, it triggers the first update immediately before starting the scheduler.
-// If SkipFirstRun is true, it skips Watchtower self-update on the first scheduled run (useful after self-update cleanup).
+// [ScheduleDeps.ReplacedOlderInstance] describes how replacing an older
+// instance changes startup and the first scheduled run.
 //
 // Parameters:
 //   - ctx: The context controlling the scheduler's lifecycle. Canceling it, for example on SIGINT or SIGTERM, shuts
@@ -259,8 +274,8 @@ func RunUpgradesOnSchedule(ctx context.Context, deps ScheduleDeps) error {
 
 		defer lock.Unlock()
 
-		// Shutdown can begin just after the lock is taken. A run started then
-		// would only be canceled and reported as a failed scan.
+		// Shutdown can begin just after the lock is taken. The tick then does
+		// nothing, as a tick that is still waiting for the lock does.
 		if ctx.Err() != nil {
 			log.Debug().Err(ctx.Err()).Msg("Update skipped: shutting down")
 
@@ -297,27 +312,17 @@ func RunUpgradesOnSchedule(ctx context.Context, deps ScheduleDeps) error {
 		}
 	}
 
-	// Wrapper function that can skip Watchtower self-update on the first run if needed
-	var scheduledUpdateFunc func()
+	// A process that replaced an older instance does not update itself again
+	// during its first scheduled run.
+	var ranOnce atomic.Bool
 
-	// If Watchtower has performed a self-cleanup, then prevent Watchtower
-	// from self-updating during the first update cycle.
-	if deps.SkipFirstRun {
-		var firstRun atomic.Uint32 // atomic flag to track if this is the first run
-
-		scheduledUpdateFunc = func() {
-			// Atomically check and set firstRun to ensure only the first execution skips self-update
-			skipWatchtowerSelfUpdate := firstRun.CompareAndSwap(0, 1)
-			if skipWatchtowerSelfUpdate {
-				log.Debug().Msg(
-					"Skipping Watchtower self-update on first scheduled run due to cleanup",
-				)
-			}
-
-			updateFunc(skipWatchtowerSelfUpdate, true)
+	scheduledUpdateFunc := func() {
+		skipWatchtowerSelfUpdate := deps.ReplacedOlderInstance && !ranOnce.Swap(true)
+		if skipWatchtowerSelfUpdate {
+			log.Debug().Msg("Skipping Watchtower self-update on first scheduled run due to cleanup")
 		}
-	} else {
-		scheduledUpdateFunc = func() { updateFunc(false, true) }
+
+		updateFunc(skipWatchtowerSelfUpdate, true)
 	}
 
 	// Add the update function to the cron schedule, handling concurrency and metrics.
@@ -332,19 +337,21 @@ func RunUpgradesOnSchedule(ctx context.Context, deps ScheduleDeps) error {
 		}
 	}
 
-	// Skip the startup message if it was already sent (for example by the HTTP
-	// API in blocking mode).
 	waitedForUpdate := false
-	if !deps.StartupMessageSent && deps.WriteStartupMessage != nil {
+	if deps.WriteStartupMessage != nil {
 		waitedForUpdate = writeStartupMessage(ctx, lock, scheduler, deps)
 	}
 
+	if deps.UpdateOnStart && !deps.updatesOnStart() {
+		log.Debug().Msg("Disabled update-on-start due to cleanup of old Watchtower containers")
+	}
+
 	// Check if update-on-start is enabled and trigger immediate update if so.
-	// Skip it when the process is already stopping, so a canceled update is not
-	// reported as a failure. The update at startup does not wait for another
-	// update. When the startup message had to wait for one, the update at
-	// startup is skipped as it is when it finds the lock taken.
-	if deps.UpdateOnStart && ctx.Err() == nil {
+	// A process that is already stopping neither runs it nor counts it as a
+	// skipped scan. The update at startup does not wait for another update.
+	// When the startup message had to wait for one, the update at startup is
+	// skipped as it is when it finds the lock taken.
+	if deps.updatesOnStart() && ctx.Err() == nil {
 		if waitedForUpdate {
 			log.Debug().Msg("Update skipped: another update was running at startup")
 			metrics.Default().RegisterSkippedScan()

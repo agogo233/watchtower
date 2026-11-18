@@ -13,14 +13,14 @@ import (
 
 	dockerContainer "github.com/moby/moby/api/types/container"
 
-	mockContainerClient "github.com/nicholas-fedor/watchtower/internal/container/client/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/container"
+	mockCleanup "github.com/nicholas-fedor/watchtower/internal/update/cleanup/mocks"
 	mockUpdate "github.com/nicholas-fedor/watchtower/internal/update/mocks"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // cleanupTestWatchtower returns a running Watchtower container with the given
 // ID, name, and image. Its image ID is the image name.
-func cleanupTestWatchtower(id, name, image string) types.Container {
+func cleanupTestWatchtower(id, name, image string) *container.Container {
 	return mockUpdate.CreateMockContainerWithConfig(
 		id,
 		"/"+name,
@@ -46,8 +46,8 @@ func imageEntries(infos []RemovedImageInfo) []string {
 }
 
 // removedImageIDs returns the image ID of each entry.
-func removedImageIDs(infos []RemovedImageInfo) []types.ImageID {
-	ids := make([]types.ImageID, 0, len(infos))
+func removedImageIDs(infos []RemovedImageInfo) []container.ImageID {
+	ids := make([]container.ImageID, 0, len(infos))
 	for _, info := range infos {
 		ids = append(ids, info.ImageID)
 	}
@@ -70,7 +70,7 @@ func TestRemoveExcessContainers_CallerListCollectsImages(t *testing.T) {
 		"watchtower-old-b", "org/watchtower:1")
 
 	// The mock fails the test on any image removal.
-	client := mockContainerClient.NewMockClient(t)
+	client := mockCleanup.NewMockClient(t)
 	client.EXPECT().StopAndRemoveContainer(mock.Anything, mock.Anything, mock.Anything).Return(nil).Times(2)
 
 	images := []RemovedImageInfo{
@@ -79,7 +79,7 @@ func TestRemoveExcessContainers_CallerListCollectsImages(t *testing.T) {
 	}
 
 	removed, err := removeExcessContainers(newTestLogger(t), t.Context(), client,
-		[]types.Container{old1, old2}, true, current, &images)
+		[]*container.Container{old1, old2}, true, current, &images)
 	require.NoError(t, err)
 	assert.Equal(t, 2, removed)
 
@@ -105,7 +105,7 @@ func TestRemoveExcessContainers_PartialFailureKeepsCallerList(t *testing.T) {
 		stuck := cleanupTestWatchtower("b000000000000000000000000000000000000000000000000000000000000000",
 			"watchtower-old-b", "org/watchtower:1")
 
-		client := mockContainerClient.NewMockClient(t)
+		client := mockCleanup.NewMockClient(t)
 		client.EXPECT().StopAndRemoveContainer(mock.Anything, stopped, mock.Anything).Return(nil).Once()
 		client.EXPECT().StopAndRemoveContainer(mock.Anything, stuck, mock.Anything).
 			Return(errors.New("daemon busy")).Times(maxRemovalAttempts)
@@ -113,7 +113,7 @@ func TestRemoveExcessContainers_PartialFailureKeepsCallerList(t *testing.T) {
 		images := []RemovedImageInfo{{ImageID: "org/app:1", ContainerName: "app"}}
 
 		removed, err := removeExcessContainers(newTestLogger(t), t.Context(), client,
-			[]types.Container{stopped, stuck}, true, current, &images)
+			[]*container.Container{stopped, stuck}, true, current, &images)
 		require.ErrorIs(t, err, errStopWatchtowerFailed)
 		assert.Equal(t, 1, removed)
 
@@ -144,11 +144,11 @@ func TestRemoveExcessContainers_CancelKeepsRemovedInstanceImages(t *testing.T) {
 		defer cancel()
 
 		// The mock fails the test on any image removal.
-		client := mockContainerClient.NewMockClient(t)
+		client := mockCleanup.NewMockClient(t)
 		client.EXPECT().StopAndRemoveContainer(mock.Anything, removedShared, mock.Anything).Return(nil).Once()
 		client.EXPECT().StopAndRemoveContainer(mock.Anything, removedOwn, mock.Anything).Return(nil).Once()
 		client.EXPECT().StopAndRemoveContainer(mock.Anything, stuck, mock.Anything).
-			RunAndReturn(func(context.Context, types.Container, time.Duration) error {
+			RunAndReturn(func(context.Context, *container.Container, time.Duration) error {
 				cancel()
 
 				return errors.New("daemon busy")
@@ -157,7 +157,7 @@ func TestRemoveExcessContainers_CancelKeepsRemovedInstanceImages(t *testing.T) {
 		images := []RemovedImageInfo{{ImageID: "org/app:1", ContainerName: "app"}}
 
 		removed, err := removeExcessContainers(newTestLogger(t), ctx, client,
-			[]types.Container{removedShared, removedOwn, stuck, pending}, true, current, &images)
+			[]*container.Container{removedShared, removedOwn, stuck, pending}, true, current, &images)
 		require.ErrorIs(t, err, context.Canceled)
 		assert.Equal(t, 2, removed)
 
@@ -182,13 +182,13 @@ func TestRemoveExcessContainers_NoCallerListRemovesImages(t *testing.T) {
 	old2 := cleanupTestWatchtower("b000000000000000000000000000000000000000000000000000000000000000",
 		"watchtower-old-b", "org/watchtower:1")
 
-	client := mockContainerClient.NewMockClient(t)
+	client := mockCleanup.NewMockClient(t)
 	client.EXPECT().StopAndRemoveContainer(mock.Anything, mock.Anything, mock.Anything).Return(nil).Times(2)
-	client.EXPECT().RemoveImageByID(mock.Anything, types.ImageID("org/watchtower:1"), mock.Anything).
+	client.EXPECT().RemoveImageByID(mock.Anything, container.ImageID("org/watchtower:1"), mock.Anything).
 		Return(nil).Once()
 
 	removed, err := removeExcessContainers(newTestLogger(t), t.Context(), client,
-		[]types.Container{old1, old2}, true, current, nil)
+		[]*container.Container{old1, old2}, true, current, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 2, removed)
 }

@@ -15,7 +15,6 @@ import (
 	"github.com/nicholas-fedor/watchtower/internal/container/provenance"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/reportfixture"
 	"github.com/nicholas-fedor/watchtower/internal/update/state"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // updatedApp returns the status of an updated "app" container running
@@ -23,12 +22,12 @@ import (
 //
 // Parameters:
 //   - t: The test that fails when the report does not list the container as updated.
+//   - meta: Git and OCI report fields for the container's status.
 //
 // Returns:
-//   - *state.ContainerStatus: Status in the updated state. Changes to it show
-//     in the report.
+//   - *state.ContainerStatus: Status in the updated state.
 //   - *state.Report: The session report that lists the status as updated.
-func updatedApp(t *testing.T) (*state.ContainerStatus, *state.Report) {
+func updatedApp(t *testing.T, meta provenance.ReportMeta) (*state.ContainerStatus, *state.Report) {
 	t.Helper()
 
 	app := container.NewContainer(nil,
@@ -41,14 +40,11 @@ func updatedApp(t *testing.T) (*state.ContainerStatus, *state.Report) {
 		&dockerImage.InspectResponse{ID: "sha256:" + strings.Repeat("b", 64)},
 	)
 
-	report := reportfixture.UpdatedReport(app, types.ImageID("sha256:"+strings.Repeat("c", 64)))
+	report := reportfixture.UpdatedReport(app, container.ImageID("sha256:"+strings.Repeat("c", 64)), meta)
 
 	require.Len(t, report.Updated(), 1)
 
-	status, ok := report.Updated()[0].(*state.ContainerStatus)
-	require.True(t, ok, "the updated container is a *state.ContainerStatus")
-
-	return status, report
+	return report.Updated()[0], report
 }
 
 // TestJSONTemplate verifies the JSON report template: its fields, ID types,
@@ -308,8 +304,7 @@ func TestJSONGitAndOCIReportFields(t *testing.T) {
 	t.Run("includes populated Git and OCI fields", func(t *testing.T) {
 		t.Parallel()
 
-		status, _ := updatedApp(t)
-		status.SetGitMetadata(provenance.ReportMeta{
+		status, _ := updatedApp(t, provenance.ReportMeta{
 			GitRepo:         "https://github.com/org/app.git",
 			GitRef:          "main",
 			Changelog:       "https://github.com/org/app/releases",
@@ -322,7 +317,7 @@ func TestJSONGitAndOCIReportFields(t *testing.T) {
 			LatestRevision:  "deadbeef",
 		})
 
-		got := marshalReports([]types.ContainerReport{status})
+		got := marshalReports([]*state.ContainerStatus{status})
 		require.Len(t, got, 1)
 		assert.Equal(t, "https://github.com/org/app.git", got[0]["gitRepo"])
 		assert.Equal(t, "main", got[0]["gitRef"])
@@ -339,8 +334,8 @@ func TestJSONGitAndOCIReportFields(t *testing.T) {
 	t.Run("omits empty Git and OCI fields", func(t *testing.T) {
 		t.Parallel()
 
-		status, _ := updatedApp(t)
-		got := marshalReports([]types.ContainerReport{status})
+		status, _ := updatedApp(t, provenance.ReportMeta{})
+		got := marshalReports([]*state.ContainerStatus{status})
 		require.Len(t, got, 1)
 		assert.NotContains(t, got[0], "gitRepo")
 		assert.NotContains(t, got[0], "changelog")
@@ -352,8 +347,7 @@ func TestJSONGitAndOCIReportFields(t *testing.T) {
 	t.Run("marshals updated reports with Git fields", func(t *testing.T) {
 		t.Parallel()
 
-		status, report := updatedApp(t)
-		status.SetGitMetadata(provenance.ReportMeta{GitRepo: "https://github.com/org/app.git", GitRef: "main"})
+		_, report := updatedApp(t, provenance.ReportMeta{GitRepo: "https://github.com/org/app.git", GitRef: "main"})
 
 		raw, err := json.Marshal(Data{
 			Title: "update", Host: "box",

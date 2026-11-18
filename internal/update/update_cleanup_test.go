@@ -11,19 +11,19 @@ import (
 
 	dockerContainer "github.com/moby/moby/api/types/container"
 
-	mockContainerClient "github.com/nicholas-fedor/watchtower/internal/container/client/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/container"
+	"github.com/nicholas-fedor/watchtower/internal/container/labels"
 	"github.com/nicholas-fedor/watchtower/internal/observability/events"
 	"github.com/nicholas-fedor/watchtower/internal/registry/ratelimit"
 	updateConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/update"
 	"github.com/nicholas-fedor/watchtower/internal/update/cleanup"
 	mockUpdate "github.com/nicholas-fedor/watchtower/internal/update/mocks"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // cleanupTestWatchtower returns a running Watchtower container with the given
 // ID, name, and image. Its image ID is the image name.
-func cleanupTestWatchtower(id, name, image string) types.Container {
+func cleanupTestWatchtower(id, name, image string) *container.Container {
 	return mockUpdate.CreateMockContainerWithConfig(
 		id,
 		"/"+name,
@@ -49,8 +49,8 @@ func imageEntries(infos []cleanup.RemovedImageInfo) []string {
 }
 
 // removedImageIDs returns the image ID of each entry.
-func removedImageIDs(infos []cleanup.RemovedImageInfo) []types.ImageID {
-	ids := make([]types.ImageID, 0, len(infos))
+func removedImageIDs(infos []cleanup.RemovedImageInfo) []container.ImageID {
+	ids := make([]container.ImageID, 0, len(infos))
 	for _, info := range infos {
 		ids = append(ids, info.ImageID)
 	}
@@ -83,7 +83,7 @@ func TestUpdateAction_Cleanup(t *testing.T) {
 			t.Run("should collect one entry per container for deferred cleanup", func(t *testing.T) {
 				t.Parallel()
 
-				client := mockUpdate.CreateMockClient(getCommonTestData(), false, false)
+				client := mockUpdate.CreateFakeClient(getCommonTestData(), false, false)
 				client.TestData.Staleness = map[string]bool{
 					"test-container-01": true,
 					"test-container-02": true,
@@ -97,7 +97,7 @@ func TestUpdateAction_Cleanup(t *testing.T) {
 				// split-by-container notifications report correctly. Image-level
 				// deduplication happens later in performImageCleanup.
 				require.Len(t, cleanupImageInfos, 3)
-				assert.Contains(t, removedImageIDs(cleanupImageInfos), types.ImageID("fake-image:latest"))
+				assert.Contains(t, removedImageIDs(cleanupImageInfos), container.ImageID("fake-image:latest"))
 				assert.Contains(t, removedContainerNames(cleanupImageInfos), "test-container-01")
 				assert.Contains(t, removedContainerNames(cleanupImageInfos), "test-container-02")
 				assert.Contains(t, removedContainerNames(cleanupImageInfos), "test-container-03")
@@ -121,7 +121,7 @@ func TestUpdateAction_Cleanup(t *testing.T) {
 						time.Now(),
 					),
 				)
-				client := mockUpdate.CreateMockClient(testData, false, false)
+				client := mockUpdate.CreateFakeClient(testData, false, false)
 				client.TestData.Staleness = map[string]bool{
 					"test-container-01":     true,
 					"test-container-02":     true,
@@ -132,8 +132,8 @@ func TestUpdateAction_Cleanup(t *testing.T) {
 
 				require.NoError(t, err)
 				require.Len(t, report.Updated(), 4)
-				assert.Contains(t, removedImageIDs(cleanupImageInfos), types.ImageID("fake-image:latest"))
-				assert.Contains(t, removedImageIDs(cleanupImageInfos), types.ImageID("unique-fake-image:latest"))
+				assert.Contains(t, removedImageIDs(cleanupImageInfos), container.ImageID("fake-image:latest"))
+				assert.Contains(t, removedImageIDs(cleanupImageInfos), container.ImageID("unique-fake-image:latest"))
 				// 3 containers for fake-image:latest + 1 container for unique-fake-image:latest
 				require.Len(t, cleanupImageInfos, 4)
 				assert.Equal(t, int32(0), client.TestData.TriedToRemoveImageCount.Load(), "RemoveImageByID should not be called during Update")
@@ -146,13 +146,13 @@ func TestUpdateAction_Cleanup(t *testing.T) {
 			t.Run("should collect only the stale container's image ID", func(t *testing.T) {
 				t.Parallel()
 
-				client := mockUpdate.CreateMockClient(getLinkedTestData(true), false, false)
+				client := mockUpdate.CreateFakeClient(getLinkedTestData(true), false, false)
 				client.TestData.Staleness["test-container-01"] = true
 				report, cleanupImageInfos, err := update(newTestLogger(t), t.Context(), client, updateParams.Params{Cleanup: true}, ratelimit.New())
 
 				require.NoError(t, err)
 				require.Len(t, report.Updated(), 1)
-				assert.Contains(t, removedImageIDs(cleanupImageInfos), types.ImageID("fake-image1:latest"))
+				assert.Contains(t, removedImageIDs(cleanupImageInfos), container.ImageID("fake-image1:latest"))
 				require.Len(t, cleanupImageInfos, 1)
 				assert.Equal(t, int32(0), client.TestData.TriedToRemoveImageCount.Load(), "RemoveImageByID should not be called during Update")
 			})
@@ -164,7 +164,7 @@ func TestUpdateAction_Cleanup(t *testing.T) {
 			t.Run("should collect one entry per container for deferred cleanup", func(t *testing.T) {
 				t.Parallel()
 
-				client := mockUpdate.CreateMockClient(getCommonTestData(), false, false)
+				client := mockUpdate.CreateFakeClient(getCommonTestData(), false, false)
 				client.TestData.Staleness = map[string]bool{
 					"test-container-01": true,
 					"test-container-02": true,
@@ -174,7 +174,7 @@ func TestUpdateAction_Cleanup(t *testing.T) {
 
 				require.NoError(t, err)
 				require.Len(t, report.Updated(), 3)
-				assert.Contains(t, removedImageIDs(cleanupImageInfos), types.ImageID("fake-image:latest"))
+				assert.Contains(t, removedImageIDs(cleanupImageInfos), container.ImageID("fake-image:latest"))
 				// Each container using the same image gets its own entry for split notifications.
 				require.Len(t, cleanupImageInfos, 3)
 				assert.Equal(t, int32(0), client.TestData.TriedToRemoveImageCount.Load(), "RemoveImageByID should not be called during Update")
@@ -188,14 +188,14 @@ func TestUpdateAction_Cleanup(t *testing.T) {
 			t.Run("should update the stale container and collect its image entry", func(t *testing.T) {
 				t.Parallel()
 
-				client := mockUpdate.CreateMockClient(getLinkedTestData(false), false, false)
+				client := mockUpdate.CreateFakeClient(getLinkedTestData(false), false, false)
 				client.TestData.Staleness["test-container-01"] = true
 				report, cleanupImageInfos, err := update(newTestLogger(t), t.Context(), client, updateParams.Params{Cleanup: true}, ratelimit.New())
 
 				require.NoError(t, err)
 				require.Len(t, report.Updated(), 1)
 				require.Len(t, report.Fresh(), 1)
-				assert.Contains(t, removedImageIDs(cleanupImageInfos), types.ImageID("fake-image1:latest"))
+				assert.Contains(t, removedImageIDs(cleanupImageInfos), container.ImageID("fake-image1:latest"))
 				require.Len(t, cleanupImageInfos, 1)
 				assert.Equal(t, int32(0), client.TestData.TriedToRemoveImageCount.Load(), "RemoveImageByID should not be called during Update")
 			})
@@ -217,11 +217,13 @@ func TestUpdate_OldInstanceImageJoinsSessionCleanup(t *testing.T) {
 		"watchtower-old-a", "org/watchtower:1")
 
 	// The mock fails the test on any image removal.
-	client := mockContainerClient.NewMockClient(t)
-	client.EXPECT().ListContainers(mock.Anything, mock.Anything).Return([]types.Container{current, old}, nil)
+	client := newMockClient(t)
+	client.EXPECT().ListContainers(mock.Anything, mock.Anything).Return([]*container.Container{current, old}, nil)
+	client.EXPECT().ListLabeledContainers(mock.Anything, labels.Watchtower).
+		Return([]*container.Container{current, old}, nil)
 	client.EXPECT().StopAndRemoveContainer(mock.Anything, old, mock.Anything).Return(nil).Once()
 	client.EXPECT().IsContainerStale(mock.Anything, mock.Anything, mock.Anything).
-		RunAndReturn(func(_ context.Context, c types.Container, _ updateConfig.Policy) (bool, types.ImageID, string, error) {
+		RunAndReturn(func(_ context.Context, c *container.Container, _ updateConfig.Policy) (bool, container.ImageID, string, error) {
 			return false, c.ImageID(), "", nil
 		}).Maybe()
 
@@ -245,26 +247,16 @@ func TestUpdate_SortFailureKeepsOldInstanceImage(t *testing.T) {
 		"watchtower-old-a", "org/watchtower:1")
 
 	// Two containers with one name make the dependency graph fail.
-	app1 := mockUpdate.CreateMockContainerWithConfig(
-		"d000000000000000000000000000000000000000000000000000000000000000",
-		"/app", "org/app:1", true, false, time.Now(),
-		&dockerContainer.Config{Image: "org/app:1", Labels: map[string]string{}},
-	)
-	app2 := mockUpdate.CreateMockContainerWithConfig(
-		"e000000000000000000000000000000000000000000000000000000000000000",
-		"/app", "org/app:1", true, false, time.Now(),
-		&dockerContainer.Config{Image: "org/app:1", Labels: map[string]string{}},
-	)
+	app1 := skipTestContainer("d000000000000000000000000000000000000000000000000000000000000000", "app", nil)
+	app2 := skipTestContainer("e000000000000000000000000000000000000000000000000000000000000000", "app", nil)
 
 	// The mock fails the test on any image removal.
-	client := mockContainerClient.NewMockClient(t)
+	client := newMockClient(t)
 	client.EXPECT().ListContainers(mock.Anything, mock.Anything).
-		Return([]types.Container{current, old, app1, app2}, nil)
+		Return([]*container.Container{current, old, app1, app2}, nil)
+	client.EXPECT().ListLabeledContainers(mock.Anything, labels.Watchtower).
+		Return([]*container.Container{current, old}, nil)
 	client.EXPECT().StopAndRemoveContainer(mock.Anything, old, mock.Anything).Return(nil).Once()
-	client.EXPECT().IsContainerStale(mock.Anything, mock.Anything, mock.Anything).
-		RunAndReturn(func(_ context.Context, c types.Container, _ updateConfig.Policy) (bool, types.ImageID, string, error) {
-			return false, c.ImageID(), "", nil
-		}).Maybe()
 
 	_, cleanup, err := update(newTestLogger(t), t.Context(), client,
 		updateParams.Params{Cleanup: true, CurrentContainerID: currentID}, ratelimit.New())
@@ -285,14 +277,16 @@ func TestRunUpdatesWithNotifications_RemovesOldInstanceImageOnce(t *testing.T) {
 	old := cleanupTestWatchtower("a000000000000000000000000000000000000000000000000000000000000000",
 		"watchtower-old-a", "org/watchtower:1")
 
-	client := mockContainerClient.NewMockClient(t)
-	client.EXPECT().ListContainers(mock.Anything, mock.Anything).Return([]types.Container{current, old}, nil)
+	client := newMockClient(t)
+	client.EXPECT().ListContainers(mock.Anything, mock.Anything).Return([]*container.Container{current, old}, nil)
+	client.EXPECT().ListLabeledContainers(mock.Anything, labels.Watchtower).
+		Return([]*container.Container{current, old}, nil)
 	client.EXPECT().StopAndRemoveContainer(mock.Anything, old, mock.Anything).Return(nil).Once()
 	client.EXPECT().IsContainerStale(mock.Anything, mock.Anything, mock.Anything).
-		RunAndReturn(func(_ context.Context, c types.Container, _ updateConfig.Policy) (bool, types.ImageID, string, error) {
+		RunAndReturn(func(_ context.Context, c *container.Container, _ updateConfig.Policy) (bool, container.ImageID, string, error) {
 			return false, c.ImageID(), "", nil
 		}).Maybe()
-	client.EXPECT().RemoveImageByID(mock.Anything, types.ImageID("org/watchtower:1"), "org/watchtower:1").
+	client.EXPECT().RemoveImageByID(mock.Anything, container.ImageID("org/watchtower:1"), "org/watchtower:1").
 		Return(nil).Once()
 
 	notifier := mockUpdate.NewMockNotifier(t)

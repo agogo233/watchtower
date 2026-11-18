@@ -14,9 +14,9 @@ import (
 	dockerNetwork "github.com/moby/moby/api/types/network"
 
 	"github.com/nicholas-fedor/watchtower/internal/container"
+	"github.com/nicholas-fedor/watchtower/internal/container/provenance"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/internal/update/state"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // containerKind is how the containers of one state are numbered and named.
@@ -84,7 +84,7 @@ func Report(states ...state.State) *state.Report {
 	// Count each state's containers so their IDs and names stay unique.
 	stateNums := make(map[state.State]int)
 	progress := state.Progress{}
-	failed := make(map[types.ContainerID]error)
+	failed := make(map[container.ContainerID]error)
 
 	for _, outcome := range states {
 		index := stateNums[outcome]
@@ -132,16 +132,18 @@ func Report(states ...state.State) *state.Report {
 //   - c: The container the session updated.
 //   - newImage: ID of the image c moved to. An ID equal to c's image makes the
 //     report list c as fresh instead.
+//   - meta: Git and OCI report fields for c's status. Empty sets none.
 //
 // Returns:
 //   - *state.Report: Report with c's status in its scanned list. The status is
 //     also in the updated list, or in the fresh list when newImage is c's image.
-func UpdatedReport(c types.Container, newImage types.ImageID) *state.Report {
+func UpdatedReport(c *container.Container, newImage container.ImageID, meta provenance.ReportMeta) *state.Report {
 	log := new(zerolog.Nop())
 	progress := state.Progress{}
 
 	progress.AddScanned(log, c, newImage, updateParams.Params{})
 	progress.MarkForUpdate(log, c.ID())
+	progress.SetReportMeta(log, c.ID(), meta)
 
 	return progress.Report(log)
 }
@@ -156,9 +158,9 @@ func UpdatedReport(c types.Container, newImage types.ImageID) *state.Report {
 //   - outcome: State the container ends the report in.
 //
 // Returns:
-//   - types.Container: Container running image mock/<name>:latest.
-//   - types.ImageID: ID of the newer image the container can move to.
-func Container(index int, outcome state.State) (types.Container, types.ImageID) {
+//   - *container.Container: Container running image mock/<name>:latest.
+//   - container.ImageID: ID of the newer image the container can move to.
+func Container(index int, outcome state.State) (*container.Container, container.ImageID) {
 	kind, ok := containerKinds[outcome]
 	if !ok {
 		panic(fmt.Sprintf("reportfixture.Container: no report ends in state %v", outcome))
@@ -195,5 +197,5 @@ func Container(index int, outcome state.State) (types.Container, types.ImageID) 
 		},
 	}
 
-	return container.NewContainer(nil, &inspect, &imageInfo), types.ImageID("d0a" + idSuffix)
+	return container.NewContainer(nil, &inspect, &imageInfo), container.ImageID("d0a" + idSuffix)
 }

@@ -13,8 +13,14 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/nicholas-fedor/watchtower/internal/container"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
+	"github.com/nicholas-fedor/watchtower/internal/container/filters"
 )
+
+// ContainerLister lists containers to match Watchtower's hostname against.
+type ContainerLister interface {
+	// ListContainers returns the containers that pass every filter.
+	ListContainers(ctx context.Context, filter ...filters.Filter) ([]*container.Container, error)
+}
 
 // Constants for container ID detection.
 const (
@@ -80,14 +86,14 @@ var (
 //   - client: Docker client interface for container operations
 //
 // Returns:
-//   - types.ContainerID: The detected container ID if successful
+//   - container.ContainerID: The detected container ID if successful
 //   - error: Non-nil if all detection methods fail, containing the last error encountered
 func GetCurrentContainerID(
 	log *zerolog.Logger,
 	ctx context.Context,
 	fsys fs.FS,
-	client Client,
-) (types.ContainerID, error) {
+	client ContainerLister,
+) (container.ContainerID, error) {
 	// Collect errors from failed detection attempts for final error reporting
 	var errs []error
 
@@ -182,9 +188,9 @@ func InContainer(fsys fs.FS) bool {
 //   - fsys: Filesystem rooted at "/" holding /proc.
 //
 // Returns:
-//   - types.ContainerID: The detected container ID.
+//   - container.ContainerID: The detected container ID.
 //   - error: Non-nil when the file cannot be read or holds no container ID.
-func GetContainerIDFromMountinfo(log *zerolog.Logger, fsys fs.FS) (types.ContainerID, error) {
+func GetContainerIDFromMountinfo(log *zerolog.Logger, fsys fs.FS) (container.ContainerID, error) {
 	file, err := fs.ReadFile(fsys, "proc/self/mountinfo")
 	if err != nil {
 		log.Debug().
@@ -213,7 +219,7 @@ func GetContainerIDFromMountinfo(log *zerolog.Logger, fsys fs.FS) (types.Contain
 }
 
 // parseContainerIDFromMountinfo parses the mountinfo string to extract container ID.
-func parseContainerIDFromMountinfo(log *zerolog.Logger, mountinfoString string) (types.ContainerID, error) {
+func parseContainerIDFromMountinfo(log *zerolog.Logger, mountinfoString string) (container.ContainerID, error) {
 	lines := strings.SplitSeq(strings.TrimSpace(mountinfoString), "\n")
 
 	for line := range lines {
@@ -251,10 +257,10 @@ func parseContainerIDFromMountinfo(log *zerolog.Logger, mountinfoString string) 
 }
 
 // extractContainerIDFromPath extracts container ID from a path containing /containers/<id>.
-func extractContainerIDFromPath(path string) types.ContainerID {
+func extractContainerIDFromPath(path string) container.ContainerID {
 	matches := containerIDPattern.FindStringSubmatch(path)
 	if len(matches) >= minMatchGroups {
-		return types.ContainerID(matches[1])
+		return container.ContainerID(matches[1])
 	}
 
 	return ""
@@ -268,9 +274,9 @@ func extractContainerIDFromPath(path string) types.ContainerID {
 //   - fsys: Filesystem rooted at "/" holding /proc.
 //
 // Returns:
-//   - types.ContainerID: The detected container ID.
+//   - container.ContainerID: The detected container ID.
 //   - error: Non-nil when the file cannot be read or holds no container ID.
-func GetContainerIDFromCgroupFile(log *zerolog.Logger, fsys fs.FS) (types.ContainerID, error) {
+func GetContainerIDFromCgroupFile(log *zerolog.Logger, fsys fs.FS) (container.ContainerID, error) {
 	filePath := fmt.Sprintf("/proc/%d/cgroup", os.Getpid())
 
 	file, err := fs.ReadFile(fsys, strings.TrimPrefix(filePath, "/"))
@@ -305,7 +311,7 @@ func GetContainerIDFromCgroupFile(log *zerolog.Logger, fsys fs.FS) (types.Contai
 // It reads the ID from a Docker path under the cgroupfs driver, /docker/<id>,
 // or from a container's systemd scope under the systemd driver,
 // docker-<id>.scope for Docker or libpod-<id>.scope for Podman.
-func parseContainerIDFromCgroupString(log *zerolog.Logger, cgroupString string) (types.ContainerID, error) {
+func parseContainerIDFromCgroupString(log *zerolog.Logger, cgroupString string) (container.ContainerID, error) {
 	var lines iter.Seq[string]
 	if strings.Contains(cgroupString, "\n") {
 		lines = strings.Lines(cgroupString)
@@ -329,7 +335,7 @@ func parseContainerIDFromCgroupString(log *zerolog.Logger, cgroupString string) 
 			Msg("Processed cgroup line for container ID")
 
 		if len(matches) >= minMatchGroups {
-			id := types.ContainerID(matches[1])
+			id := container.ContainerID(matches[1])
 			log.Debug().
 				Str("id", string(id)).
 				Msg("Extracted container ID from cgroup")
@@ -352,10 +358,10 @@ func parseContainerIDFromCgroupString(log *zerolog.Logger, cgroupString string) 
 //   - client: Docker client interface for container operations.
 //
 // Returns:
-//   - types.ContainerID: The detected container ID if a match is found.
+//   - container.ContainerID: The detected container ID if a match is found.
 //   - error: Non-nil if the HOSTNAME env var is missing, the Docker client's
-//     ListContainers call fails (wrapped and propagated), or no matching container is found.
-func GetContainerIDFromHostname(log *zerolog.Logger, ctx context.Context, client Client) (types.ContainerID, error) {
+//     ListContainers call fails, or no matching container is found.
+func GetContainerIDFromHostname(log *zerolog.Logger, ctx context.Context, client ContainerLister) (container.ContainerID, error) {
 	hostname := os.Getenv("HOSTNAME")
 	if hostname == "" {
 		return "", errContainerIDNotFound
@@ -363,13 +369,13 @@ func GetContainerIDFromHostname(log *zerolog.Logger, ctx context.Context, client
 
 	containers, err := client.ListContainers(ctx)
 	if err != nil {
-		return "", fmt.Errorf("failed to list all containers: %w", err)
+		return "", err //nolint:wrapcheck // The client's error already names the failed listing.
 	}
 
 	// Collect all containers matching the hostname.
 	var (
-		firstMatchID    types.ContainerID
-		watchtowerMatch types.ContainerID
+		firstMatchID    container.ContainerID
+		watchtowerMatch container.ContainerID
 	)
 
 	for _, c := range containers {

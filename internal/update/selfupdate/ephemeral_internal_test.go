@@ -1,13 +1,9 @@
 package selfupdate
 
 import (
-	"context"
 	"errors"
-	"math"
 	"net/netip"
-	"strconv"
 	"testing"
-	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -18,14 +14,14 @@ import (
 	dockerContainer "github.com/moby/moby/api/types/container"
 	dockerNetwork "github.com/moby/moby/api/types/network"
 
-	mockContainerClient "github.com/nicholas-fedor/watchtower/internal/container/client/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/container"
 	containerImage "github.com/nicholas-fedor/watchtower/internal/container/image"
 	mockUpdate "github.com/nicholas-fedor/watchtower/internal/update/mocks"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
+	mockSelfupdate "github.com/nicholas-fedor/watchtower/internal/update/selfupdate/mocks"
 )
 
 // handoffNewID is the ID of the replacement container the mocked client starts.
-const handoffNewID types.ContainerID = "wt-new-id"
+const handoffNewID container.ContainerID = "wt-new-id"
 
 // createEphemeralHandoffContainer builds a running Watchtower mock used by
 // orchestrateSelfUpdate handoff tests.
@@ -35,11 +31,11 @@ const handoffNewID types.ContainerID = "wt-new-id"
 //   - portBindings: Optional host port bindings. Nil yields empty bindings.
 //
 // Returns:
-//   - types.Container: Configured mock container.
+//   - *container.Container: Configured mock container.
 func createEphemeralHandoffContainer(
 	id string,
 	portBindings dockerNetwork.PortMap,
-) types.Container {
+) *container.Container {
 	if portBindings == nil {
 		portBindings = dockerNetwork.PortMap{}
 	}
@@ -91,7 +87,7 @@ type handoffCalls struct {
 //
 // Returns:
 //   - handoffCalls: The stop, rename, and start expectations.
-func expectHandoffStart(client *mockContainerClient.MockClient, old types.Container, startErr error) handoffCalls {
+func expectHandoffStart(client *mockSelfupdate.MockHandoffClient, old *container.Container, startErr error) handoffCalls {
 	client.EXPECT().GetContainer(mock.Anything, old.ID()).Return(old, nil).Once()
 
 	newID := handoffNewID
@@ -101,7 +97,7 @@ func expectHandoffStart(client *mockContainerClient.MockClient, old types.Contai
 
 	return handoffCalls{
 		stop: client.EXPECT().StopContainer(mock.Anything, old, orchestratorStopTimeout).Return(nil).Once(),
-		rename: client.EXPECT().RenameContainer(mock.Anything, old, types.WatchtowerOldPrefix+old.ID().ShortID()).
+		rename: client.EXPECT().RenameContainer(mock.Anything, old, old.OldName()).
 			Return(nil).Once(),
 		start: client.EXPECT().StartContainer(mock.Anything, old).Return(newID, startErr).Once(),
 	}
@@ -116,7 +112,7 @@ func expectHandoffStart(client *mockContainerClient.MockClient, old types.Contai
 //
 // Returns:
 //   - *mock.Call: The removal expectation.
-func expectHandoffFinish(client *mockContainerClient.MockClient, old types.Container) *mock.Call {
+func expectHandoffFinish(client *mockSelfupdate.MockHandoffClient, old *container.Container) *mock.Call {
 	client.EXPECT().GetContainer(mock.Anything, handoffNewID).
 		Return(createEphemeralHandoffContainer(string(handoffNewID), nil), nil).Once()
 
@@ -128,7 +124,7 @@ func expectHandoffFinish(client *mockContainerClient.MockClient, old types.Conta
 // Parameters:
 //   - client: Mocked container client.
 //   - old: The Watchtower container being replaced.
-func expectHandoff(client *mockContainerClient.MockClient, old types.Container) {
+func expectHandoff(client *mockSelfupdate.MockHandoffClient, old *container.Container) {
 	expectHandoffStart(client, old, nil)
 	expectHandoffFinish(client, old)
 }
@@ -146,7 +142,7 @@ func Test_orchestrateSelfUpdate(t *testing.T) {
 		t.Parallel()
 
 		old := createEphemeralHandoffContainer("wt-old-id-ok", nil)
-		client := mockContainerClient.NewMockClient(t)
+		client := mockSelfupdate.NewMockHandoffClient(t)
 		calls := expectHandoffStart(client, old, nil)
 		remove := expectHandoffFinish(client, old)
 		mock.InOrder(calls.stop, calls.rename, calls.start, remove)
@@ -169,7 +165,7 @@ func Test_orchestrateSelfUpdate(t *testing.T) {
 		)
 		require.True(t, old.HasExposedPorts())
 
-		client := mockContainerClient.NewMockClient(t)
+		client := mockSelfupdate.NewMockHandoffClient(t)
 		calls := expectHandoffStart(client, old, nil)
 		expectHandoffFinish(client, old)
 		mock.InOrder(calls.stop, calls.start)
@@ -185,14 +181,15 @@ func Test_orchestrateSelfUpdate(t *testing.T) {
 		// The old container is still running after the failed stop, so the
 		// handoff ends before any rename or create.
 		old := createEphemeralHandoffContainer("wt-old-stop-fail", nil)
-		client := mockContainerClient.NewMockClient(t)
+		stopErr := errors.New("failed to stop container: simulated stop failure")
+		client := mockSelfupdate.NewMockHandoffClient(t)
 		client.EXPECT().GetContainer(mock.Anything, old.ID()).Return(old, nil).Twice()
 		client.EXPECT().StopContainer(mock.Anything, old, orchestratorStopTimeout).
-			Return(errors.New("simulated stop failure")).Once()
+			Return(stopErr).Once()
 
 		err := orchestrateSelfUpdate(newTestLogger(t), t.Context(), client,
 			"wt-old-stop-fail", "watchtower:v2", "watchtower", "", false)
-		require.ErrorContains(t, err, "failed to stop old container")
+		require.Same(t, stopErr, err)
 	})
 
 	t.Run("restores and restarts the old container when create fails after rename", func(t *testing.T) {
@@ -201,25 +198,26 @@ func Test_orchestrateSelfUpdate(t *testing.T) {
 		// The predecessor gets its name back and is restarted, and is never
 		// removed.
 		old := createEphemeralHandoffContainer("wt-old-create-fail", nil)
-		client := mockContainerClient.NewMockClient(t)
-		calls := expectHandoffStart(client, old, errors.New("simulated create failure"))
+		client := mockSelfupdate.NewMockHandoffClient(t)
+		createErr := errors.New("failed to create container: simulated create failure")
+		calls := expectHandoffStart(client, old, createErr)
 		renameBack := client.EXPECT().RenameContainer(mock.Anything, old, "watchtower").Return(nil).Once()
 		restart := client.EXPECT().StartContainerByID(mock.Anything, old.ID()).Return(nil).Once()
 		mock.InOrder(calls.stop, calls.rename, calls.start, renameBack, restart)
 
 		err := orchestrateSelfUpdate(newTestLogger(t), t.Context(), client,
 			"wt-old-create-fail", "watchtower:v2", "watchtower", "", false)
-		require.ErrorContains(t, err, "failed to create new container")
+		require.Same(t, createErr, err)
 	})
 
 	t.Run("pins Config.Image to the new image reference before create", func(t *testing.T) {
 		t.Parallel()
 
 		old := createEphemeralHandoffContainer("wt-old-pin", nil)
-		client := mockContainerClient.NewMockClient(t)
+		client := mockSelfupdate.NewMockHandoffClient(t)
 		calls := expectHandoffStart(client, old, nil)
 		calls.start.Run(func(args mock.Arguments) {
-			created, ok := args.Get(1).(types.Container)
+			created, ok := args.Get(1).(*container.Container)
 			require.True(t, ok)
 			assert.Equal(t, "watchtower:v2", created.ImageName())
 		})
@@ -236,10 +234,10 @@ func Test_orchestrateSelfUpdate(t *testing.T) {
 		const chain = "prev-id,wt-old-chain"
 
 		old := createEphemeralHandoffContainer("wt-old-chain", nil)
-		client := mockContainerClient.NewMockClient(t)
+		client := mockSelfupdate.NewMockHandoffClient(t)
 		calls := expectHandoffStart(client, old, nil)
 		calls.start.Run(func(args mock.Arguments) {
-			created, ok := args.Get(1).(types.Container)
+			created, ok := args.Get(1).(*container.Container)
 			require.True(t, ok)
 
 			gotChain, present := created.GetContainerChain()
@@ -257,7 +255,7 @@ func Test_orchestrateSelfUpdate(t *testing.T) {
 		t.Parallel()
 
 		old := createEphemeralHandoffContainer("wt-old-cleanup", nil)
-		client := mockContainerClient.NewMockClient(t)
+		client := mockSelfupdate.NewMockHandoffClient(t)
 		expectHandoff(client, old)
 		client.EXPECT().RemoveImageByID(mock.Anything, old.ImageID(), "watchtower:v1").Return(nil).Once()
 
@@ -271,7 +269,7 @@ func Test_orchestrateSelfUpdate(t *testing.T) {
 
 		// The mock has no image removal expectation, so a removal fails the test.
 		old := createEphemeralHandoffContainer("wt-old-no-cleanup", nil)
-		client := mockContainerClient.NewMockClient(t)
+		client := mockSelfupdate.NewMockHandoffClient(t)
 		expectHandoff(client, old)
 
 		err := orchestrateSelfUpdate(newTestLogger(t), t.Context(), client,
@@ -283,7 +281,7 @@ func Test_orchestrateSelfUpdate(t *testing.T) {
 		t.Parallel()
 
 		old := createEphemeralHandoffContainer("wt-old-in-use", nil)
-		client := mockContainerClient.NewMockClient(t)
+		client := mockSelfupdate.NewMockHandoffClient(t)
 		expectHandoff(client, old)
 		client.EXPECT().RemoveImageByID(mock.Anything, old.ImageID(), "watchtower:v1").
 			Return(containerImage.ErrImageInUse).Once()
@@ -297,7 +295,7 @@ func Test_orchestrateSelfUpdate(t *testing.T) {
 		t.Parallel()
 
 		old := createEphemeralHandoffContainer("wt-old-missing-image", nil)
-		client := mockContainerClient.NewMockClient(t)
+		client := mockSelfupdate.NewMockHandoffClient(t)
 		expectHandoff(client, old)
 		client.EXPECT().RemoveImageByID(mock.Anything, old.ImageID(), "watchtower:v1").
 			Return(cerrdefs.ErrNotFound).Once()
@@ -306,67 +304,4 @@ func Test_orchestrateSelfUpdate(t *testing.T) {
 			"wt-old-missing-image", "watchtower:v2", "watchtower", "", true)
 		require.NoError(t, err)
 	})
-}
-
-// Test_cleanupFailedNewContainer verifies the bound for removing a replacement
-// that failed verification. The bound is 60 seconds. When the container the
-// replacement was created from sets a stop timeout longer than 30 seconds, the
-// stop waits that long, so the bound is that stop timeout plus 30 seconds. A
-// stop timeout too long for a duration saturates the bound instead of
-// overflowing it.
-func Test_cleanupFailedNewContainer(t *testing.T) {
-	t.Parallel()
-
-	// largestBound is the bound for a container stop timeout of the largest int.
-	// A 64-bit int of seconds is too long for a duration, so the bound
-	// saturates. A 32-bit int of seconds fits, and the bound adds 30 seconds.
-	largestBound := time.Duration(math.MaxInt64)
-	if strconv.IntSize == 32 {
-		largestBound = math.MaxInt32*time.Second + 30*time.Second
-	}
-
-	tests := []struct {
-		name        string
-		stopTimeout *int
-		want        time.Duration
-	}{
-		{name: "no container stop timeout", stopTimeout: nil, want: time.Minute},
-		{name: "shorter container stop timeout", stopTimeout: new(10), want: time.Minute},
-		{name: "longer container stop timeout", stopTimeout: new(120), want: 150 * time.Second},
-		{name: "largest container stop timeout", stopTimeout: new(math.MaxInt), want: largestBound},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			synctest.Test(t, func(t *testing.T) {
-				old := mockUpdate.CreateMockContainerWithConfig(
-					"wt-old-id",
-					"/watchtower-old-wt-old-id",
-					"watchtower:v1",
-					true,
-					false,
-					time.Now(),
-					&dockerContainer.Config{Image: "watchtower:v1", StopTimeout: tt.stopTimeout},
-				)
-				failedNew := mockUpdate.CreateMockContainer(string(handoffNewID), "/watchtower", "watchtower:v2", time.Now())
-
-				// boundCtx matches a context whose deadline is the expected bound
-				// from now. The bubble's clock stands still while code runs, so
-				// the deadline matches exactly.
-				boundCtx := mock.MatchedBy(func(ctx context.Context) bool {
-					deadline, hasDeadline := ctx.Deadline()
-
-					return hasDeadline && deadline.Equal(time.Now().Add(tt.want))
-				})
-
-				client := mockContainerClient.NewMockClient(t)
-				client.EXPECT().GetContainer(boundCtx, handoffNewID).Return(failedNew, nil).Once()
-				client.EXPECT().StopAndRemoveContainer(boundCtx, failedNew, orchestratorStopTimeout).Return(nil).Once()
-
-				cleanupFailedNewContainer(t.Context(), client, newTestLogger(t), old, handoffNewID)
-			})
-		})
-	}
 }

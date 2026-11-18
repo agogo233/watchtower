@@ -13,13 +13,14 @@ import (
 
 	dockerContainer "github.com/moby/moby/api/types/container"
 
+	"github.com/nicholas-fedor/watchtower/internal/container"
 	"github.com/nicholas-fedor/watchtower/internal/container/filters"
+	containerImage "github.com/nicholas-fedor/watchtower/internal/container/image"
 	"github.com/nicholas-fedor/watchtower/internal/registry/ratelimit"
 	"github.com/nicholas-fedor/watchtower/internal/update/cleanup"
 	mockUpdate "github.com/nicholas-fedor/watchtower/internal/update/mocks"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/internal/update/state"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // TestWatchtowerContainerHandling verifies how an update handles Watchtower's
@@ -34,9 +35,9 @@ func TestWatchtowerContainerHandling(t *testing.T) {
 		t.Run("should rename and start a new container without cleanup", func(t *testing.T) {
 			t.Parallel()
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainerWithConfig(
 							"watchtower",
 							"/watchtower",
@@ -78,9 +79,9 @@ func TestWatchtowerContainerHandling(t *testing.T) {
 		t.Run("should not collect Watchtower image cleanup during ephemeral self-update", func(t *testing.T) {
 			t.Parallel()
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainerWithConfig(
 							"watchtower",
 							"/watchtower",
@@ -120,9 +121,9 @@ func TestWatchtowerContainerHandling(t *testing.T) {
 		t.Run("should skip rename with no-restart for Watchtower", func(t *testing.T) {
 			t.Parallel()
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainerWithConfig(
 							"watchtower",
 							"/watchtower",
@@ -162,9 +163,9 @@ func TestWatchtowerContainerHandling(t *testing.T) {
 		t.Run("should stop and recreate non-Watchtower containers with no-restart", func(t *testing.T) {
 			t.Parallel()
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainerWithConfig(
 							"nginx",
 							"/nginx",
@@ -201,9 +202,9 @@ func TestWatchtowerContainerHandling(t *testing.T) {
 		t.Run("should not start a stopped container after update without revive-stopped", func(t *testing.T) {
 			t.Parallel()
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainerWithConfig(
 							"stopped-nginx",
 							"/stopped-nginx",
@@ -239,9 +240,9 @@ func TestWatchtowerContainerHandling(t *testing.T) {
 		t.Run("should start a stopped container after update with revive-stopped", func(t *testing.T) {
 			t.Parallel()
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainerWithConfig(
 							"stopped-nginx",
 							"/stopped-nginx",
@@ -278,9 +279,9 @@ func TestWatchtowerContainerHandling(t *testing.T) {
 		t.Run("should not rename Watchtower container in run-once mode", func(t *testing.T) {
 			t.Parallel()
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainerWithConfig(
 							"watchtower",
 							"/watchtower",
@@ -320,9 +321,9 @@ func TestWatchtowerContainerHandling(t *testing.T) {
 		t.Run("should accumulate container IDs in container-chain label", func(t *testing.T) {
 			t.Parallel()
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainerWithConfig(
 							"watchtower",
 							"/watchtower",
@@ -367,9 +368,9 @@ func TestWatchtowerContainerHandling(t *testing.T) {
 		t.Run("should inherit scope label during self-update container creation", func(t *testing.T) {
 			t.Parallel()
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainerWithConfig(
 							"watchtower",
 							"/watchtower",
@@ -412,9 +413,9 @@ func TestWatchtowerContainerHandling(t *testing.T) {
 		t.Run("should preserve scope during container rename operations in self-updates", func(t *testing.T) {
 			t.Parallel()
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainerWithConfig(
 							"watchtower",
 							"/watchtower",
@@ -458,9 +459,9 @@ func TestWatchtowerContainerHandling(t *testing.T) {
 		t.Run("should update Watchtower when the scope filter matches its scope label", func(t *testing.T) {
 			t.Parallel()
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainerWithConfig(
 							"watchtower",
 							"/watchtower",
@@ -502,9 +503,9 @@ func TestWatchtowerContainerHandling(t *testing.T) {
 		t.Run("should skip self-update when scope filter conflicts with container label scope", func(t *testing.T) {
 			t.Parallel()
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainerWithConfig(
 							"watchtower",
 							"/watchtower",
@@ -547,9 +548,9 @@ func TestWatchtowerContainerHandling(t *testing.T) {
 		t.Run("should keep the label scope on the new container when the filter selects that scope", func(t *testing.T) {
 			t.Parallel()
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainerWithConfig(
 							"watchtower",
 							"/watchtower",
@@ -596,9 +597,9 @@ func TestWatchtowerContainerHandling(t *testing.T) {
 			t.Run("should not accumulate chain when scope mismatches with previous container", func(t *testing.T) {
 				t.Parallel()
 
-				client := mockUpdate.CreateMockClient(
+				client := mockUpdate.CreateFakeClient(
 					&mockUpdate.TestData{
-						Containers: []types.Container{
+						Containers: []*container.Container{
 							mockUpdate.CreateMockContainerWithConfig(
 								"watchtower",
 								"/watchtower",
@@ -642,9 +643,9 @@ func TestWatchtowerContainerHandling(t *testing.T) {
 			t.Run("should extend the chain when the previous container in it has another scope", func(t *testing.T) {
 				t.Parallel()
 
-				client := mockUpdate.CreateMockClient(
+				client := mockUpdate.CreateFakeClient(
 					&mockUpdate.TestData{
-						Containers: []types.Container{
+						Containers: []*container.Container{
 							// Container in scope-a with chain reference to scope-b
 							mockUpdate.CreateMockContainerWithConfig(
 								"watchtower-a",
@@ -709,9 +710,9 @@ func TestWatchtowerContainerHandling(t *testing.T) {
 			t.Run("should extend a chain spanning several scopes when updating in the selected scope", func(t *testing.T) {
 				t.Parallel()
 
-				client := mockUpdate.CreateMockClient(
+				client := mockUpdate.CreateFakeClient(
 					&mockUpdate.TestData{
-						Containers: []types.Container{
+						Containers: []*container.Container{
 							// New container in scope-c
 							mockUpdate.CreateMockContainerWithConfig(
 								"watchtower-c",
@@ -762,9 +763,9 @@ func TestWatchtowerContainerHandling(t *testing.T) {
 			t.Run("should extend a chain that holds an ID from another scope", func(t *testing.T) {
 				t.Parallel()
 
-				client := mockUpdate.CreateMockClient(
+				client := mockUpdate.CreateFakeClient(
 					&mockUpdate.TestData{
-						Containers: []types.Container{
+						Containers: []*container.Container{
 							// Container attempting to chain across scopes
 							mockUpdate.CreateMockContainerWithConfig(
 								"watchtower-invalid",
@@ -817,9 +818,9 @@ func TestWatchtowerContainerHandling(t *testing.T) {
 		t.Run("should skip staleness check for Watchtower when SkipSelfUpdate=true", func(t *testing.T) {
 			t.Parallel()
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainerWithConfig(
 							"watchtower",
 							"/watchtower",
@@ -871,9 +872,9 @@ func TestWatchtowerContainerHandling(t *testing.T) {
 		t.Run("should not update Watchtower containers when SkipSelfUpdate=true", func(t *testing.T) {
 			t.Parallel()
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainerWithConfig(
 							"watchtower",
 							"/watchtower",
@@ -912,9 +913,9 @@ func TestWatchtowerContainerHandling(t *testing.T) {
 		t.Run("should skip the Watchtower staleness check and update when SkipSelfUpdate=true and the pull would fail", func(t *testing.T) {
 			t.Parallel()
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainerWithConfig(
 							"watchtower",
 							"/watchtower",
@@ -958,9 +959,9 @@ func TestWatchtowerContainerHandling(t *testing.T) {
 		t.Run("should still process regular containers when SkipSelfUpdate=true", func(t *testing.T) {
 			t.Parallel()
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainerWithConfig(
 							"watchtower",
 							"/watchtower",
@@ -1014,9 +1015,9 @@ func TestWatchtowerContainerHandling(t *testing.T) {
 		t.Run("should check Watchtower staleness and skip the update when the pull fails with SkipSelfUpdate=false", func(t *testing.T) {
 			t.Parallel()
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainerWithConfig(
 							"watchtower",
 							"/watchtower",
@@ -1063,19 +1064,37 @@ func TestWatchtowerContainerHandling(t *testing.T) {
 // TestSafeguardDelay verifies that a failed Watchtower self-update pull delays
 // the end of a run-once update, which is restarted at once by a restart
 // policy, while a continuous update returns at once and leaves the next
-// attempt to the schedule. The synctest clock advances by the time slept.
+// attempt to the schedule. A failed cooldown age lookup counts as a failed
+// pull. A cooldown deferral does not. The synctest clock advances by the time
+// slept.
 func TestSafeguardDelay(t *testing.T) {
 	t.Parallel()
 
 	const delay = 5 * time.Minute
 
+	pullFailure := errors.New("failed to pull image")
+
 	tests := []struct {
-		name    string
-		runOnce bool
-		want    time.Duration
+		// checkErr is the error the Watchtower image check returns.
+		checkErr error
+		name     string
+		runOnce  bool
+		want     time.Duration
 	}{
-		{name: "continuous update returns at once", runOnce: false, want: 0},
-		{name: "run-once update waits", runOnce: true, want: delay},
+		{name: "continuous update returns at once", checkErr: pullFailure, runOnce: false, want: 0},
+		{name: "run-once update waits", checkErr: pullFailure, runOnce: true, want: delay},
+		{
+			name:     "run-once update waits after a failed cooldown age lookup",
+			checkErr: &containerImage.CooldownError{Delay: "1 day", Cause: pullFailure},
+			runOnce:  true,
+			want:     delay,
+		},
+		{
+			name:     "run-once update returns at once after a cooldown deferral",
+			checkErr: &containerImage.CooldownError{Age: "2 hours", Delay: "1 day", Remaining: "22 hours"},
+			runOnce:  true,
+			want:     0,
+		},
 	}
 
 	for _, tt := range tests {
@@ -1083,9 +1102,9 @@ func TestSafeguardDelay(t *testing.T) {
 			t.Parallel()
 
 			synctest.Test(t, func(t *testing.T) {
-				client := mockUpdate.CreateMockClient(
+				client := mockUpdate.CreateFakeClient(
 					&mockUpdate.TestData{
-						Containers: []types.Container{
+						Containers: []*container.Container{
 							mockUpdate.CreateMockContainerWithConfig(
 								"watchtower",
 								"/watchtower",
@@ -1108,8 +1127,7 @@ func TestSafeguardDelay(t *testing.T) {
 					false,
 				)
 
-				// The Watchtower image pull fails.
-				client.TestData.IsContainerStaleError = errors.New("failed to pull image")
+				client.TestData.IsContainerStaleError = tt.checkErr
 
 				start := time.Now()
 
@@ -1123,8 +1141,8 @@ func TestSafeguardDelay(t *testing.T) {
 				require.NoError(t, err)
 
 				assert.Equal(t, tt.want, time.Since(start))
-				assert.Empty(t, report.Updated(), "Watchtower is not updated on pull failure")
-				assert.Empty(t, cleanupImageInfos, "no image is cleaned up on pull failure")
+				assert.Empty(t, report.Updated(), "Watchtower is not updated")
+				assert.Empty(t, cleanupImageInfos, "no image is cleaned up")
 			})
 		})
 	}
@@ -1136,10 +1154,10 @@ func TestSafeguardDelay(t *testing.T) {
 func TestPullFailureDelayContextCancellation(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
-		client := mockUpdate.CreateMockClientWithContext(
+		client := mockUpdate.CreateFakeClientWithContext(
 			ctx,
 			&mockUpdate.TestData{
-				Containers: []types.Container{
+				Containers: []*container.Container{
 					mockUpdate.CreateMockContainerWithConfig(
 						"watchtower",
 						"/watchtower",

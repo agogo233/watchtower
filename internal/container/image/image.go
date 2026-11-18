@@ -15,6 +15,7 @@ import (
 	dockerImage "github.com/moby/moby/api/types/image"
 	dockerClient "github.com/moby/moby/client"
 
+	"github.com/nicholas-fedor/watchtower/internal/container"
 	"github.com/nicholas-fedor/watchtower/internal/container/oci"
 	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
 	"github.com/nicholas-fedor/watchtower/internal/registry"
@@ -23,7 +24,6 @@ import (
 	"github.com/nicholas-fedor/watchtower/internal/registry/ratelimit"
 	registryConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/registry"
 	updateConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/update"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // Warning strategies for HEAD request failures.
@@ -55,18 +55,12 @@ var (
 	errPinnedImage = errors.New("image is pinned with sha256, skipping pull")
 	// errInspectImageFailed indicates a failure to inspect an image from the Docker daemon.
 	errInspectImageFailed = errors.New("failed to inspect image")
-	// errPullImageFailed indicates a failure to pull an image from the registry.
+	// errPullImageFailed indicates that Watchtower could not start a pull, such
+	// as when its credentials cannot be loaded or the registry's rate limit
+	// holds it back. A failure of the engine's pull is a [PullError] instead.
 	errPullImageFailed = errors.New("failed to pull image")
 	// errFailedToLoadPullOptions indicates pull options could not be resolved.
 	errFailedToLoadPullOptions = errors.New("failed to load pull options")
-	// errPullImageUnauthorized indicates that a pull failed because the registry
-	// required authentication.
-	errPullImageUnauthorized = errors.New("authentication required")
-	// errPullImageNotFound indicates that a pull failed because the registry
-	// does not have the image.
-	errPullImageNotFound = errors.New("image not found")
-	// errReadPullResponseFailed indicates a failure to read the pull response stream.
-	errReadPullResponseFailed = errors.New("failed to read pull response")
 	// errRemoveImageFailed indicates a failure to remove an image from the Docker host.
 	errRemoveImageFailed = errors.New("failed to remove image")
 )
@@ -137,6 +131,46 @@ type Client struct {
 	registrySettings registryConfig.Registry
 }
 
+// PullError reports that the container engine could not pull an image.
+//
+// Its message names the engine and gives the engine's own error, so a reader
+// can tell it apart from a failure of Watchtower's own registry requests.
+type PullError struct {
+	// Err is the error the engine returned.
+	Err error
+	// Image is the image the engine was asked to pull.
+	Image string
+	// Podman is true when the engine is Podman. The caller that knows the
+	// engine sets it.
+	Podman bool
+}
+
+// Engine names the container engine that failed the pull.
+//
+// Returns:
+//   - string: "Podman" or "Docker".
+func (e *PullError) Engine() string {
+	if e.Podman {
+		return "Podman"
+	}
+
+	return "Docker"
+}
+
+// Error returns the engine's name, the image and the engine's error.
+//
+// Returns:
+//   - string: The error message.
+func (e *PullError) Error() string {
+	return e.Engine() + " could not pull " + e.Image + ": " + e.Err.Error()
+}
+
+// Unwrap returns the engine's error.
+//
+// Returns:
+//   - error: The error the engine returned.
+func (e *PullError) Unwrap() error { return e.Err }
+
 // NewClient creates a new Client instance.
 //
 // The client shares the process-wide Docker Info cache used for registry mirrors.
@@ -167,8 +201,8 @@ func NewClient(
 // IsContainerStale determines if a container's image is outdated.
 //
 // It skips pulling if NoPull is set, otherwise pulls and compares images.
-// If the image is within the cooldown window, it returns false with
-// ErrImageCooldown, indicating the update should be deferred.
+// When a cooldown holds the update back, it returns false with a
+// [CooldownError].
 //
 // Parameters:
 //   - ctx: Context for operation control.
@@ -178,15 +212,15 @@ func NewClient(
 //
 // Returns:
 //   - bool: True if image is stale, false otherwise.
-//   - types.ImageID: Latest image ID (or current if not pulled).
+//   - container.ImageID: Latest image ID (or current if not pulled).
 //   - string: Latest registry manifest digest (empty if unavailable).
 //   - error: Non-nil if pull or inspection fails or cooldown defers the update.
 func (c Client) IsContainerStale(
 	ctx context.Context,
-	sourceContainer types.Container,
+	sourceContainer *container.Container,
 	policy updateConfig.Policy,
 	warnOnHeadFailed WarningStrategy,
-) (bool, types.ImageID, string, error) {
+) (bool, container.ImageID, string, error) {
 	clogVal := c.logger().With().
 		Str("container", sourceContainer.Name()).
 		Str("image", sourceContainer.ImageName()).
@@ -208,17 +242,27 @@ func (c Client) IsContainerStale(
 			return false, sourceContainer.ImageID(), "", err
 		}
 
-		if errors.Is(err, errPullImageNotFound) {
+		// A cooldown that could not read the image's age also holds the pull
+		// back. No pull was attempted.
+		if _, isCooldown := errors.AsType[*CooldownError](err); isCooldown {
 			clog.Debug().
 				Err(err).
+				Msg("Image age unavailable - pull skipped")
+
+			return false, sourceContainer.ImageID(), "", err
+		}
+
+		// A pull error names its engine only after the container client
+		// detects it, so this line logs the engine's own error. The container
+		// client logs the pull failures returned here.
+		pullErr, isPullError := errors.AsType[*PullError](err)
+		if isPullError && cerrdefs.IsNotFound(pullErr.Err) {
+			clog.Debug().
+				Err(pullErr.Err).
 				Msg("Image not found in any registry - treating as up-to-date")
 
 			return false, sourceContainer.ImageID(), "", nil
 		}
-
-		clog.Debug().
-			Err(err).
-			Msg("Failed to pull image")
 
 		return false, sourceContainer.ImageID(), "", err
 	}
@@ -240,14 +284,14 @@ func (c Client) IsContainerStale(
 //
 // Returns:
 //   - bool: True if an update is available, false otherwise.
-//   - types.ImageID: Latest local image ID when known (empty on remote-only mismatch).
+//   - container.ImageID: Latest local image ID when known (empty on remote-only mismatch).
 //   - string: Latest registry manifest digest (empty if unavailable).
 //   - error: Non-nil if the check fails, nil on success.
 func (c Client) CheckContainerUpdate(
 	ctx context.Context,
-	sourceContainer types.Container,
+	sourceContainer *container.Container,
 	policy updateConfig.Policy,
-) (bool, types.ImageID, string, error) {
+) (bool, container.ImageID, string, error) {
 	clogVal := c.logger().With().
 		Str("container", sourceContainer.Name()).
 		Str("image", sourceContainer.ImageName()).
@@ -310,7 +354,7 @@ func (c Client) CheckContainerUpdate(
 	}
 
 	clog.Info().
-		Str("new_id", types.ImageID(remoteDigest).ShortID()).
+		Str("new_id", container.ImageID(remoteDigest).ShortID()).
 		Str("latest_digest", remoteDigest).
 		Msg(logging.FoundNewImage)
 
@@ -327,19 +371,19 @@ func (c Client) CheckContainerUpdate(
 //
 // Returns:
 //   - bool: True if a newer image exists, false if current is latest.
-//   - types.ImageID: Latest image ID.
+//   - container.ImageID: Latest image ID.
 //   - string: Latest registry manifest digest (empty if unavailable).
 //   - error: Non-nil if inspection fails, nil on success.
 func (c Client) HasNewImage(
 	ctx context.Context,
-	sourceContainer types.Container,
-) (bool, types.ImageID, string, error) {
+	sourceContainer *container.Container,
+) (bool, container.ImageID, string, error) {
 	clogVal := c.logger().With().
 		Str("container", sourceContainer.Name()).
 		Str("image", sourceContainer.ImageName()).
 		Logger()
 	clog := &clogVal
-	currentImageID := types.ImageID(sourceContainer.ContainerInfo().Image)
+	currentImageID := container.ImageID(sourceContainer.ContainerInfo().Image)
 
 	clog.Debug().Msg("Inspecting latest image")
 
@@ -362,7 +406,7 @@ func (c Client) HasNewImage(
 	}
 
 	// Compare IDs to determine staleness.
-	newImageID := types.ImageID(newImageInfo.ID)
+	newImageID := container.ImageID(newImageInfo.ID)
 	if newImageID == currentImageID {
 		clog.Debug().Msg("No new image found")
 
@@ -444,6 +488,28 @@ func ExtractImageDigest(repoDigests []string, imageName string) string {
 	return fallback
 }
 
+// LocalDigest returns the digest of the image a container runs, as recorded
+// in the image's repo digests.
+//
+// It prefers the repo digest of the container's own image repository and
+// otherwise takes the first one, as [ExtractImageDigest] does. A container
+// whose image was not inspected, such as one whose image was removed, has no
+// local digest.
+//
+// Parameters:
+//   - c: Container whose image digest to report.
+//
+// Returns:
+//   - string: The digest (e.g., "sha256:abc..."), or "" if unavailable.
+func LocalDigest(c *container.Container) string {
+	info := c.ImageInfo()
+	if info == nil {
+		return ""
+	}
+
+	return ExtractImageDigest(info.RepoDigests, c.ImageName())
+}
+
 // PullImage fetches the latest image for a container.
 //
 // It skips pinned images, checks digests, and performs a cooldown check
@@ -460,7 +526,7 @@ func ExtractImageDigest(repoDigests []string, imageName string) string {
 //   - nil on success or skip.
 func (c Client) PullImage(
 	ctx context.Context,
-	sourceContainer types.Container,
+	sourceContainer *container.Container,
 	warnOnHeadFailed WarningStrategy,
 	policy updateConfig.Policy,
 ) error {
@@ -526,7 +592,7 @@ func (c Client) PullImage(
 //
 // Returns:
 //   - error: Non-nil if removal fails, nil on success.
-func (c Client) RemoveImageByID(ctx context.Context, imageID types.ImageID, imageName string) error {
+func (c Client) RemoveImageByID(ctx context.Context, imageID container.ImageID, imageName string) error {
 	clogVal := c.logger().With().
 		Str("image_id", imageID.ShortID()).
 		Str("image_name", imageName).
@@ -553,9 +619,9 @@ func (c Client) RemoveImageByID(ctx context.Context, imageID types.ImageID, imag
 		return fmt.Errorf("cannot verify image usage: %w", err)
 	}
 
-	for _, container := range containers.Items {
-		state := container.State
-		if container.ImageID == string(imageID) &&
+	for _, c := range containers.Items {
+		state := c.State
+		if c.ImageID == string(imageID) &&
 			(state == dockerContainer.StateRunning ||
 				state == dockerContainer.StateRestarting ||
 				state == dockerContainer.StatePaused ||
@@ -621,7 +687,7 @@ func (c Client) RemoveImageByID(ctx context.Context, imageID types.ImageID, imag
 //   - items: Response items from the image removal operation.
 //   - imageID: ID of the image that was removed.
 //   - imageName: Name of the image that was removed.
-func logImageRemovalDetails(log *zerolog.Logger, items []dockerImage.DeleteResponse, imageID types.ImageID, imageName string) {
+func logImageRemovalDetails(log *zerolog.Logger, items []dockerImage.DeleteResponse, imageID container.ImageID, imageName string) {
 	deleted := strings.Builder{}
 	untagged := strings.Builder{}
 
@@ -631,7 +697,7 @@ func logImageRemovalDetails(log *zerolog.Logger, items []dockerImage.DeleteRespo
 				deleted.WriteString(", ")
 			}
 
-			deleted.WriteString(types.ImageID(item.Deleted).ShortID())
+			deleted.WriteString(container.ImageID(item.Deleted).ShortID())
 		}
 
 		if item.Untagged != "" {
@@ -639,7 +705,7 @@ func logImageRemovalDetails(log *zerolog.Logger, items []dockerImage.DeleteRespo
 				untagged.WriteString(", ")
 			}
 
-			untagged.WriteString(types.ImageID(item.Untagged).ShortID())
+			untagged.WriteString(container.ImageID(item.Untagged).ShortID())
 		}
 	}
 
@@ -723,7 +789,7 @@ func (c Client) logger() *zerolog.Logger {
 //   - error: Non-nil when a registry rate limit should abort the pull.
 func (c Client) shouldSkipPull(
 	ctx context.Context,
-	sourceContainer types.Container,
+	sourceContainer *container.Container,
 	registryAuth string,
 	warnOnHeadFailed WarningStrategy,
 ) (bool, error) {
@@ -842,44 +908,25 @@ func (c Client) performImagePull(
 
 		response, err := c.api.ImagePull(ctx, imageName, opts)
 		if err != nil {
-			info := ratelimit.FromErrorMessage(err.Error())
+			info := ratelimit.FromError(err)
 			if info != nil {
 				c.rateLimiter.Observe(pullHost, info)
 
 				return info
 			}
 
-			// Differentiate error types for appropriate logging and handling.
-			// Auth failures and missing images return distinct sentinel errors
-			// so callers can programmatically distinguish error categories.
-			// These lines stay at debug because the update check that called
-			// the pull warns about its failure once.
-			switch {
-			case cerrdefs.IsUnauthorized(err):
-				clog.Debug().
-					Err(err).
-					Msg("Image pull failed: authentication required")
+			// The update check that called the pull reports its failure once.
+			clog.Debug().
+				Err(err).
+				Msg("Failed to initiate image pull")
 
-				return fmt.Errorf("%w: %w", errPullImageUnauthorized, err)
-			case cerrdefs.IsNotFound(err):
-				clog.Debug().
-					Err(err).
-					Msg("Image pull failed: image not found in registry")
-
-				return fmt.Errorf("%w: %w", errPullImageNotFound, err)
-			default:
-				clog.Debug().
-					Err(err).
-					Msg("Failed to initiate image pull")
-
-				return err //nolint:wrapcheck // Wrapped once with the image name after the retries.
-			}
+			return &PullError{Err: err, Image: imageName, Podman: false}
 		}
 		defer response.Close()
 
 		waitErr := response.Wait(ctx)
 		if waitErr != nil {
-			info := ratelimit.FromErrorMessage(waitErr.Error())
+			info := ratelimit.FromError(waitErr)
 			if info != nil {
 				c.rateLimiter.Observe(pullHost, info)
 				clog.Debug().
@@ -893,7 +940,7 @@ func (c Client) performImagePull(
 				Err(waitErr).
 				Msg("Failed to read image pull response")
 
-			return fmt.Errorf("%w: %w", errReadPullResponseFailed, waitErr)
+			return &PullError{Err: waitErr, Image: imageName, Podman: false}
 		}
 
 		clog.Debug().Msg("Image pull completed")
@@ -901,7 +948,12 @@ func (c Client) performImagePull(
 		return nil
 	})
 	if pullErr != nil {
-		// Each attempt's error gives only the cause. The image is named here once.
+		// The engine's failure already names the image. Each other attempt's
+		// error gives only the cause, so the image is named here once.
+		if engineErr, ok := errors.AsType[*PullError](pullErr); ok {
+			return engineErr
+		}
+
 		return fmt.Errorf("%w: %s: %w", errPullImageFailed, imageName, pullErr)
 	}
 
@@ -971,7 +1023,7 @@ func releasePullSlot(host string) {
 // Returns:
 //   - bool: True if a warning should be logged, false otherwise.
 func (c Client) warnOnHeadFailed(
-	sourceContainer types.Container,
+	sourceContainer *container.Container,
 	warnOnHeadFailed WarningStrategy,
 ) bool {
 	if warnOnHeadFailed == warnAlways {
@@ -996,13 +1048,13 @@ func (c Client) warnOnHeadFailed(
 //
 // Returns:
 //   - bool: True if image is stale, false otherwise.
-//   - types.ImageID: Latest image ID.
+//   - container.ImageID: Latest image ID.
 //   - error: Non-nil if inspection fails, nil on success.
 func (c Client) checkLocalImageStaleness(
 	ctx context.Context,
-	sourceContainer types.Container,
+	sourceContainer *container.Container,
 	clog *zerolog.Logger,
-) (bool, types.ImageID, string, error) {
+) (bool, container.ImageID, string, error) {
 	clog.Debug().Msg("Skipping image pull due to no-pull setting - checking local image only")
 	clog.Debug().
 		Str("current_image_id", string(sourceContainer.ImageID())).

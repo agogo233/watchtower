@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"slices"
 	"time"
 
 	"github.com/moby/moby/client/pkg/versions"
@@ -19,7 +18,6 @@ import (
 	composeLabels "github.com/nicholas-fedor/watchtower/internal/compose/labels"
 	"github.com/nicholas-fedor/watchtower/internal/container"
 	"github.com/nicholas-fedor/watchtower/internal/container/network"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 const (
@@ -38,72 +36,9 @@ var (
 	errInspectImageFailed = errors.New("failed to inspect image")
 	// errCreateContainerFailed indicates a failure to create a new container.
 	errCreateContainerFailed = errors.New("failed to create container")
-	// errRenameContainerFailed indicates a failure to rename an existing container.
+	// errRenameContainerFailed indicates a failure to give a created container the source container's name.
 	errRenameContainerFailed = errors.New("failed to rename container")
 )
-
-// ResolveVolumesFrom rewrites HostConfig.VolumesFrom IDs to live container names.
-//
-// Inspect stores volumes-from as the source container ID. Recreate must use a
-// name so Docker can find the replacement after the source is recreated.
-// Unresolved sources stay as stored. Mode suffixes such as :rw are preserved.
-//
-// Parameters:
-//   - ctx: Context for cancellation and timeout control.
-//   - api: Docker API client.
-//   - clog: Logger for warn and debug output.
-//   - containerInfo: Inspected container whose HostConfig.VolumesFrom is rewritten.
-func ResolveVolumesFrom(
-	ctx context.Context,
-	api dockerClient.APIClient,
-	clog *zerolog.Logger,
-	containerInfo *dockerContainer.InspectResponse,
-) {
-	if containerInfo.HostConfig == nil || len(containerInfo.HostConfig.VolumesFrom) == 0 {
-		return
-	}
-
-	rewritten := slices.Clone(containerInfo.HostConfig.VolumesFrom)
-	containerName := container.NormalizeContainerName(containerInfo.Name)
-
-	for i, spec := range rewritten {
-		name, mode := container.ParseVolumesFromSpec(spec)
-		if name == "" {
-			continue
-		}
-
-		sourceResult, err := api.ContainerInspect(
-			ctx,
-			name,
-			dockerClient.ContainerInspectOptions{},
-		)
-		if err != nil {
-			// Leave the stored ID so create fails with a clear missing-container
-			// error instead of inventing a name.
-			clog.Warn().
-				Err(err).
-				Str("container", containerName).
-				Str("volumes_from", name).
-				Msg("Unable to resolve volumes-from container")
-
-			continue
-		}
-
-		resolved := container.NormalizeContainerName(sourceResult.Container.Name)
-		if mode != "" {
-			// Keep :ro/:rw/SELinux flags from the original spec.
-			resolved = resolved + ":" + mode
-		}
-
-		rewritten[i] = resolved
-		clog.Debug().
-			Str("container", containerName).
-			Str("volumes_from", resolved).
-			Msg("Resolved volumes-from container name")
-	}
-
-	containerInfo.HostConfig.VolumesFrom = rewritten
-}
 
 // CreateTarget creates a new container based on the source container's
 // configuration but does not start it. It applies the provided network configuration,
@@ -120,18 +55,18 @@ func ResolveVolumesFrom(
 //   - isPodman: If true, indicates Podman is being used for CPU compatibility.
 //
 // Returns:
-//   - types.ContainerID: ID of the new container.
+//   - container.ContainerID: ID of the new container.
 //   - error: Non-nil if creation fails, nil on success.
 func CreateTarget(log *zerolog.Logger,
 	ctx context.Context,
 	api dockerClient.APIClient,
-	sourceContainer types.Container,
+	sourceContainer *container.Container,
 	networkConfig *dockerNetwork.NetworkingConfig,
 	clientVersion string,
 	disableMemorySwappiness bool,
 	cpuCopyMode string,
 	isPodman bool,
-) (types.ContainerID, error) {
+) (container.ContainerID, error) {
 	clogVal := log.With().
 		Str("container", sourceContainer.Name()).
 		Str("id", sourceContainer.ID().ShortID()).
@@ -197,7 +132,7 @@ func CreateTarget(log *zerolog.Logger,
 		return "", fmt.Errorf("%w: %w", errCreateContainerFailed, err)
 	}
 
-	createdContainerID := types.ContainerID(createdContainer.ID)
+	createdContainerID := container.ContainerID(createdContainer.ID)
 	clog.Debug().
 		Str("new_id", string(createdContainerID)).
 		Msg("Created container successfully")
@@ -293,7 +228,7 @@ func syncComposeImageLabel(
 	ctx context.Context,
 	api dockerClient.APIClient,
 	clog *zerolog.Logger,
-	sourceContainer types.Container,
+	sourceContainer *container.Container,
 	config *dockerContainer.Config,
 	clientVersion string,
 ) {
@@ -460,52 +395,6 @@ func attachNetworks(
 				Msg("Successfully attached additional network")
 		}
 	}
-
-	return nil
-}
-
-// RenameTarget renames an existing container to the specified target name in Watchtower.
-//
-// Parameters:
-//   - ctx: Context for cancellation and timeout control.
-//   - api: Docker API client.
-//   - targetContainer: Container to be renamed.
-//   - targetName: New name for the container.
-//
-// Returns:
-//   - error: Non-nil if rename fails, nil on success.
-func RenameTarget(log *zerolog.Logger,
-	ctx context.Context,
-	api dockerClient.APIClient,
-	targetContainer types.Container,
-	targetName string,
-) error {
-	clogVal := log.With().
-		Str("container", targetContainer.Name()).
-		Str("id", targetContainer.ID().ShortID()).
-		Str("target_name", targetName).
-		Logger()
-	clog := &clogVal
-
-	// Attempt to rename the container.
-	clog.Debug().Msg("Renaming container")
-
-	_, err := api.ContainerRename(
-		ctx,
-		string(targetContainer.ID()),
-		dockerClient.ContainerRenameOptions{
-			NewName: targetName,
-		},
-	)
-	if err != nil {
-		clog.Debug().
-			Err(err).
-			Msg("Failed to rename container")
-
-		return fmt.Errorf("%w: %w", errRenameContainerFailed, err)
-	}
-
-	clog.Debug().Msg("Renamed container successfully")
 
 	return nil
 }

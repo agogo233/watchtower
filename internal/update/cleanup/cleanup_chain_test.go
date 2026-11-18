@@ -10,9 +10,9 @@ import (
 
 	dockerContainer "github.com/moby/moby/api/types/container"
 
-	mockContainerClient "github.com/nicholas-fedor/watchtower/internal/container/client/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/container"
+	mockCleanup "github.com/nicholas-fedor/watchtower/internal/update/cleanup/mocks"
 	mockUpdate "github.com/nicholas-fedor/watchtower/internal/update/mocks"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // Container IDs used by the chain tests.
@@ -28,7 +28,7 @@ const (
 )
 
 // chainTestContainer returns a running container with the given labels.
-func chainTestContainer(id, name string, labels map[string]string) types.Container {
+func chainTestContainer(id, name string, labels map[string]string) *container.Container {
 	return mockUpdate.CreateMockContainerWithConfig(
 		id,
 		"/"+name,
@@ -43,7 +43,7 @@ func chainTestContainer(id, name string, labels map[string]string) types.Contain
 // chainTestContainers returns the current Watchtower container with the given
 // chain label, two Watchtower containers it may have replaced, and an
 // ordinary container.
-func chainTestContainers(chain string) (types.Container, []types.Container) {
+func chainTestContainers(chain string) (*container.Container, []*container.Container) {
 	current := chainTestContainer(chainCurrentID, "watchtower", map[string]string{
 		"com.centurylinklabs.watchtower":                 "true",
 		"com.centurylinklabs.watchtower.container-chain": chain,
@@ -52,12 +52,12 @@ func chainTestContainers(chain string) (types.Container, []types.Container) {
 	oldB := chainTestContainer(chainOldBID, "watchtower-b", map[string]string{"com.centurylinklabs.watchtower": "true"})
 	app := chainTestContainer(chainAppID, "app", map[string]string{})
 
-	return current, []types.Container{current, oldA, oldB, app}
+	return current, []*container.Container{current, oldA, oldB, app}
 }
 
 // containerIDs returns the ID of each container, in order.
-func containerIDs(containers []types.Container) []types.ContainerID {
-	ids := make([]types.ContainerID, 0, len(containers))
+func containerIDs(containers []*container.Container) []container.ContainerID {
+	ids := make([]container.ContainerID, 0, len(containers))
 	for _, c := range containers {
 		ids = append(ids, c.ID())
 	}
@@ -73,32 +73,32 @@ func TestGetChainedContainers(t *testing.T) {
 	tests := []struct {
 		name  string
 		chain string
-		want  []types.ContainerID
+		want  []container.ContainerID
 	}{
 		{
 			name:  "Watchtower containers in the chain",
 			chain: chainOldAID + "," + chainOldBID,
-			want:  []types.ContainerID{chainOldAID, chainOldBID},
+			want:  []container.ContainerID{chainOldAID, chainOldBID},
 		},
 		{
 			name:  "a container that is not Watchtower is never returned",
 			chain: chainOldAID + "," + chainAppID,
-			want:  []types.ContainerID{chainOldAID},
+			want:  []container.ContainerID{chainOldAID},
 		},
 		{
 			name:  "spaces around IDs",
 			chain: " " + chainOldAID + " , " + chainOldBID + " ",
-			want:  []types.ContainerID{chainOldAID, chainOldBID},
+			want:  []container.ContainerID{chainOldAID, chainOldBID},
 		},
 		{
 			name:  "empty entries",
 			chain: "," + chainOldAID + ",, ," + chainOldBID + ",",
-			want:  []types.ContainerID{chainOldAID, chainOldBID},
+			want:  []container.ContainerID{chainOldAID, chainOldBID},
 		},
 		{
 			name:  "the current container is never returned",
 			chain: chainOldAID + "," + chainCurrentID,
-			want:  []types.ContainerID{chainOldAID},
+			want:  []container.ContainerID{chainOldAID},
 		},
 	}
 
@@ -129,8 +129,8 @@ func TestRemoveExcessWatchtowerInstances_ChainKeepsOtherContainers(t *testing.T)
 	app := chainTestContainer(chainAppID, "app", map[string]string{})
 
 	// The mock fails the test on any other stop.
-	client := mockContainerClient.NewMockClient(t)
-	client.EXPECT().ListContainers(mock.Anything, mock.Anything).Return([]types.Container{current, oldA, app}, nil)
+	client := mockCleanup.NewMockClient(t)
+	client.EXPECT().ListContainers(mock.Anything, mock.Anything).RunAndReturn(listContainers(current, oldA, app))
 	client.EXPECT().StopAndRemoveContainer(mock.Anything, oldA, mock.Anything).Return(nil).Once()
 
 	removed, err := RemoveExcessWatchtowerInstances(newTestLogger(t), t.Context(), client, false, "", nil, current)
@@ -151,7 +151,7 @@ func TestGetChainedContainers_OldCurrent(t *testing.T) {
 		successorID = "f000000000000000000000000000000000000000000000000000000000000000"
 	)
 
-	watchtower := func(id, name, scope, chain string) types.Container {
+	watchtower := func(id, name, scope, chain string) *container.Container {
 		containerLabels := map[string]string{"com.centurylinklabs.watchtower": "true"}
 		if scope != "" {
 			containerLabels["com.centurylinklabs.watchtower.scope"] = scope
@@ -169,41 +169,41 @@ func TestGetChainedContainers_OldCurrent(t *testing.T) {
 
 	tests := []struct {
 		name       string
-		candidates []types.Container
-		want       []types.ContainerID
+		candidates []*container.Container
+		want       []container.ContainerID
 	}{
 		{
 			name:       "successor whose chain lists the old container",
-			candidates: []types.Container{watchtower(successorID, "watchtower", "", oldID+","+chainOldAID)},
-			want:       []types.ContainerID{oldID, chainOldAID},
+			candidates: []*container.Container{watchtower(successorID, "watchtower", "", oldID+","+chainOldAID)},
+			want:       []container.ContainerID{oldID, chainOldAID},
 		},
 		{
 			name: "chain match wins over an earlier container without a chain label",
-			candidates: []types.Container{
+			candidates: []*container.Container{
 				watchtower(chainOldBID, "watchtower-b", "", ""),
 				watchtower(successorID, "watchtower", "", oldID+","+chainOldAID),
 			},
-			want: []types.ContainerID{oldID, chainOldAID},
+			want: []container.ContainerID{oldID, chainOldAID},
 		},
 		{
 			name:       "container without a chain label",
-			candidates: []types.Container{watchtower(successorID, "watchtower", "", "")},
-			want:       []types.ContainerID{},
+			candidates: []*container.Container{watchtower(successorID, "watchtower", "", "")},
+			want:       []container.ContainerID{},
 		},
 		{
 			name:       "chain that does not list the old container",
-			candidates: []types.Container{watchtower(successorID, "watchtower", "", chainOldAID)},
-			want:       []types.ContainerID{},
+			candidates: []*container.Container{watchtower(successorID, "watchtower", "", chainOldAID)},
+			want:       []container.ContainerID{},
 		},
 		{
 			name:       "chain match in another scope",
-			candidates: []types.Container{watchtower(successorID, "watchtower", "other", oldID+","+chainOldAID)},
-			want:       []types.ContainerID{},
+			candidates: []*container.Container{watchtower(successorID, "watchtower", "other", oldID+","+chainOldAID)},
+			want:       []container.ContainerID{},
 		},
 		{
 			name:       "chain match on another old container",
-			candidates: []types.Container{watchtower(successorID, "watchtower-old-f00000000000", "", oldID+","+chainOldAID)},
-			want:       []types.ContainerID{},
+			candidates: []*container.Container{watchtower(successorID, "watchtower-old-f00000000000", "", oldID+","+chainOldAID)},
+			want:       []container.ContainerID{},
 		},
 	}
 
@@ -211,7 +211,7 @@ func TestGetChainedContainers_OldCurrent(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			all := append([]types.Container{old, oldA}, tt.candidates...)
+			all := append([]*container.Container{old, oldA}, tt.candidates...)
 
 			got := getChainedContainers(newTestLogger(t), all, old)
 

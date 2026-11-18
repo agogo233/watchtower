@@ -19,8 +19,8 @@ import (
 	dockerContainer "github.com/moby/moby/api/types/container"
 	dockerClient "github.com/moby/moby/client"
 
+	"github.com/nicholas-fedor/watchtower/internal/container"
 	"github.com/nicholas-fedor/watchtower/internal/container/labels"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 const (
@@ -118,7 +118,7 @@ func (s Snapshot) size() int64 {
 // The zero value is ready to use.
 type Pending struct {
 	// snapshots stores labeled file snapshots keyed by the source container ID.
-	snapshots map[types.ContainerID]Snapshot
+	snapshots map[container.ContainerID]Snapshot
 	// bytes is the total size of archives currently held in snapshots.
 	bytes int64
 	// mu protects snapshots and bytes.
@@ -134,14 +134,14 @@ type Pending struct {
 // Returns:
 //   - error: Non-nil if storing the snapshot would exceed maxCopyFileStoreBytes.
 func (s *Pending) Store(
-	containerID types.ContainerID,
+	containerID container.ContainerID,
 	snapshot Snapshot,
 ) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.snapshots == nil {
-		s.snapshots = make(map[types.ContainerID]Snapshot)
+		s.snapshots = make(map[container.ContainerID]Snapshot)
 	}
 
 	existing, ok := s.snapshots[containerID]
@@ -177,7 +177,7 @@ func (s *Pending) Store(
 //   - Snapshot: The removed snapshot when present.
 //   - bool: True when a snapshot was stored for containerID.
 func (s *Pending) Take(
-	containerID types.ContainerID,
+	containerID container.ContainerID,
 ) (Snapshot, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -274,7 +274,7 @@ func validateCopyFilePath(filePath string) error {
 // Returns:
 //   - []string: Validated in-container paths, or nil when the label is absent.
 //   - error: Non-nil if the label contains an invalid path.
-func copyFilePaths(c types.Container) ([]string, error) {
+func copyFilePaths(c *container.Container) ([]string, error) {
 	if c == nil {
 		return nil, nil
 	}
@@ -303,7 +303,7 @@ func copyFilePaths(c types.Container) ([]string, error) {
 //
 // Returns:
 //   - copyFileSkipReason: Reason the path must be skipped, or copyFileSkipNone.
-func copyFileSkipForPath(c types.Container, filePath string) copyFileSkipReason {
+func copyFileSkipForPath(c *container.Container, filePath string) copyFileSkipReason {
 	info := c.ContainerInfo()
 	if info == nil {
 		return copyFileSkipNone
@@ -393,7 +393,7 @@ func mostSpecificMount(info *dockerContainer.InspectResponse, filePath string) (
 //
 // Returns:
 //   - bool: True when the path must be skipped.
-func shouldSkipCopyFile(clog *zerolog.Logger, source types.Container, filePath string) bool {
+func shouldSkipCopyFile(clog *zerolog.Logger, source *container.Container, filePath string) bool {
 	switch copyFileSkipForPath(source, filePath) {
 	case copyFileSkipMountedAtPath:
 		clog.Debug().
@@ -502,7 +502,7 @@ func Capture(
 	log *zerolog.Logger,
 	ctx context.Context,
 	api dockerClient.APIClient,
-	source types.Container,
+	source *container.Container,
 ) (Snapshot, error) {
 	paths, err := copyFilePaths(source)
 	if err != nil {
@@ -793,7 +793,7 @@ func Inject(
 	ctx context.Context,
 	api dockerClient.APIClient,
 	containerID string,
-	source types.Container,
+	source *container.Container,
 	snapshot Snapshot,
 ) error {
 	if snapshot.Empty() {

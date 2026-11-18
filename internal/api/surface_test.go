@@ -17,12 +17,13 @@ import (
 
 	"github.com/nicholas-fedor/watchtower/internal/api/auth"
 	"github.com/nicholas-fedor/watchtower/internal/api/routes"
-	mockContainerClient "github.com/nicholas-fedor/watchtower/internal/container/client/mocks"
+	mockRoutes "github.com/nicholas-fedor/watchtower/internal/api/routes/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/container"
+	"github.com/nicholas-fedor/watchtower/internal/container/filters"
 	"github.com/nicholas-fedor/watchtower/internal/observability/metrics"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/golden"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/internal/update/schedule"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // probeTimeout bounds each route probe so a handler that never responds, such as
@@ -37,10 +38,10 @@ var routeParamPattern = regexp.MustCompile(`:[A-Za-z0-9_]+`)
 func newFullSurfaceApp(t *testing.T) *fiber.App {
 	t.Helper()
 
-	client := mockContainerClient.NewMockClient(t)
+	client := mockRoutes.NewMockClient(t)
 	client.EXPECT().Ping(mock.Anything).Return(nil).Maybe()
-	client.EXPECT().ListContainers(mock.Anything, mock.Anything).Return([]types.Container{}, nil).Maybe()
-	client.EXPECT().ListContainers(mock.Anything).Return([]types.Container{}, nil).Maybe()
+	client.EXPECT().ListContainers(mock.Anything, mock.Anything).Return([]*container.Container{}, nil).Maybe()
+	client.EXPECT().ListContainers(mock.Anything).Return([]*container.Container{}, nil).Maybe()
 
 	opts := withTestLogger(t, routes.Options{
 		Token:               "api-token",
@@ -61,10 +62,10 @@ func newFullSurfaceApp(t *testing.T) *fiber.App {
 		NoStartupMessage:    true,
 		Client:              client,
 		Filter:              makeFilter(t),
-		RunUpdatesWithNotifications: func(context.Context, types.Filter, updateParams.Params) *metrics.Metric {
+		RunUpdatesWithNotifications: func(context.Context, filters.Filter, updateParams.Params) *metrics.Metric {
 			return &metrics.Metric{}
 		},
-		FilterByImage:    func(_ []string, filter types.Filter) types.Filter { return filter },
+		FilterByImage:    func(_ []string, filter filters.Filter) filters.Filter { return filter },
 		DefaultMetrics:   func() *metrics.Metrics { return helperMetrics },
 		EventBroadcaster: NewEventsBroadcasterHelper(),
 	})

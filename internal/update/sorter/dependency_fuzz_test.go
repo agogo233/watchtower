@@ -10,11 +10,13 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	dockerContainer "github.com/moby/moby/api/types/container"
 
+	composeLabels "github.com/nicholas-fedor/watchtower/internal/compose/labels"
 	"github.com/nicholas-fedor/watchtower/internal/container"
-	mockSorter "github.com/nicholas-fedor/watchtower/internal/update/sorter/mocks"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // FuzzDependencySort fuzz tests the dependency sorting algorithm with random inputs.
@@ -47,7 +49,7 @@ func FuzzDependencySort(f *testing.F) {
 		// Test with both useComposeDependsOn values
 		for _, useComposeDependsOn := range []bool{true, false} {
 			ds := dependencySorter{}
-			testContainers := make([]types.Container, len(containers))
+			testContainers := make([]*container.Container, len(containers))
 			copy(testContainers, containers)
 
 			// This should not panic
@@ -103,7 +105,7 @@ func FuzzCycleDetection(f *testing.F) {
 		// Test with both useComposeDependsOn values
 		for _, useComposeDependsOn := range []bool{true, false} {
 			ds := dependencySorter{}
-			testContainers := make([]types.Container, len(containers))
+			testContainers := make([]*container.Container, len(containers))
 			copy(testContainers, containers)
 
 			// This should not panic
@@ -125,7 +127,7 @@ func FuzzCycleDetection(f *testing.F) {
 
 // parseFuzzDependencyData parses fuzz input into containers with dependencies
 // Format: "A->B,B->C" becomes containers A,B,C with A depending on B, B depending on C.
-func parseFuzzDependencyData(data []byte) []types.Container {
+func parseFuzzDependencyData(data []byte) []*container.Container {
 	if len(data) == 0 {
 		return nil
 	}
@@ -162,27 +164,14 @@ func parseFuzzDependencyData(data []byte) []types.Container {
 		}
 	}
 
-	// Create containers
-	containers := make([]types.Container, 0, len(allNodes))
-
-	i := 0
-
+	// Each node names its dependencies in a Watchtower depends-on label. Node
+	// names never contain a comma, since the input is split on commas.
+	specs := make([]deployed, 0, len(allNodes))
 	for node := range allNodes {
-		links := dependencies[node]
-		if links == nil {
-			links = []string{}
-		}
-
-		container := &mockSorter.SimpleContainer{
-			ContainerName:  node,
-			ContainerID:    types.ContainerID(fmt.Sprintf("fuzz-id-%d", i)),
-			ContainerLinks: links,
-		}
-		containers = append(containers, container)
-		i++
+		specs = append(specs, deployed{name: node, dependsOn: strings.Join(dependencies[node], ",")})
 	}
 
-	return containers
+	return deploy(specs...)
 }
 
 // FuzzSortByDependencies fuzz tests the sortByDependencies function directly with random container configurations.
@@ -264,102 +253,48 @@ func FuzzSortByDependencies(f *testing.F) {
 	})
 }
 
-// generateCollisionContainers creates containers that could have identifier collisions.
-func generateCollisionContainers(data []byte) []types.Container {
-	containers := make([]types.Container, 0, 10)
-
-	// Parse data to determine collision scenario
+// generateCollisionContainers creates containers that could have identifier
+// collisions, each with only a Compose service label.
+func generateCollisionContainers(data []byte) []*container.Container {
+	var services []string
 
 	switch {
 	case bytes.Contains(data, []byte("same-service-name")):
-		// Create multiple containers with the same service name
-		for i := range 5 {
-			container := &mockSorter.SimpleContainer{
-				ContainerName:  fmt.Sprintf("container%d", i),
-				ContainerID:    types.ContainerID(fmt.Sprintf("id-%d", i)),
-				ContainerLinks: []string{},
-			}
-			// Override ContainerInfo to include service label
-			container.ContainerInfoField = &dockerContainer.InspectResponse{
-				Name: fmt.Sprintf("/container%d", i),
-				Config: &dockerContainer.Config{
-					Labels: map[string]string{
-						"com.docker.compose.service": "shared-service",
-					},
-				},
-			}
-			containers = append(containers, container)
-		}
-
+		services = slices.Repeat([]string{"shared-service"}, 5)
 	case bytes.Contains(data, []byte("empty-service-names")):
-		// Create containers with empty service names
-		for i := range 3 {
-			container := &mockSorter.SimpleContainer{
-				ContainerName:  fmt.Sprintf("container%d", i),
-				ContainerID:    types.ContainerID(fmt.Sprintf("id-%d", i)),
-				ContainerLinks: []string{},
-			}
-			container.ContainerInfoField = &dockerContainer.InspectResponse{
-				Name: fmt.Sprintf("/container%d", i),
-				Config: &dockerContainer.Config{
-					Labels: map[string]string{
-						"com.docker.compose.service": "",
-					},
-				},
-			}
-			containers = append(containers, container)
-		}
-
+		services = slices.Repeat([]string{""}, 3)
 	case bytes.Contains(data, []byte("leading-slash-service")):
-		// Create containers with service names that have leading slashes
-		for i := range 3 {
-			container := &mockSorter.SimpleContainer{
-				ContainerName:  fmt.Sprintf("container%d", i),
-				ContainerID:    types.ContainerID(fmt.Sprintf("id-%d", i)),
-				ContainerLinks: []string{},
-			}
-			container.ContainerInfoField = &dockerContainer.InspectResponse{
-				Name: fmt.Sprintf("/container%d", i),
-				Config: &dockerContainer.Config{
-					Labels: map[string]string{
-						"com.docker.compose.service": fmt.Sprintf("/service%d", i),
-					},
-				},
-			}
-			containers = append(containers, container)
-		}
-
+		services = []string{"/service0", "/service1", "/service2"}
 	default:
-		// Create containers with service names derived from fuzz data
-		parts := bytes.Split(data, []byte(","))
-		for i, part := range parts {
-			if len(part) == 0 {
-				continue
+		// Service names derived from fuzz data. An empty part names no container.
+		for part := range bytes.SplitSeq(data, []byte(",")) {
+			if len(part) > 0 {
+				services = append(services, string(bytes.TrimSpace(part)))
 			}
-
-			serviceName := string(bytes.TrimSpace(part))
-			container := &mockSorter.SimpleContainer{
-				ContainerName:  fmt.Sprintf("container%d", i),
-				ContainerID:    types.ContainerID(fmt.Sprintf("id-%d", i)),
-				ContainerLinks: []string{},
-			}
-			container.ContainerInfoField = &dockerContainer.InspectResponse{
-				Name: fmt.Sprintf("/container%d", i),
-				Config: &dockerContainer.Config{
-					Labels: map[string]string{
-						"com.docker.compose.service": serviceName,
-					},
-				},
-			}
-			containers = append(containers, container)
 		}
 	}
 
-	return containers
+	return serviceLabelContainers(services)
+}
+
+// serviceLabelContainers builds containers named container0, container1, and
+// so on, each with a Compose service label of the matching value. The label is
+// set through labels rather than the service field, which leaves an empty
+// value unset.
+func serviceLabelContainers(services []string) []*container.Container {
+	specs := make([]deployed, len(services))
+	for i, service := range services {
+		specs[i] = deployed{
+			name:   fmt.Sprintf("container%d", i),
+			labels: map[string]string{composeLabels.ComposeServiceLabel: service},
+		}
+	}
+
+	return deploy(specs...)
 }
 
 // isRealCycle verifies that a detected cycle is actually real and not a false positive.
-func isRealCycle(containers []types.Container, circularErr circularReferenceError, useComposeDependsOn bool) bool {
+func isRealCycle(containers []*container.Container, circularErr circularReferenceError, useComposeDependsOn bool) bool {
 	cyclePath := circularErr.CyclePath
 
 	// Edge case: cycle path must have at least 3 elements for a valid cycle (A->B->A)
@@ -368,7 +303,7 @@ func isRealCycle(containers []types.Container, circularErr circularReferenceErro
 	}
 
 	// Create a map from normalized identifier to container for efficient lookup
-	containerMap := make(map[string]types.Container)
+	containerMap := make(map[string]*container.Container)
 
 	for _, c := range containers {
 		normalizedIdentifier := container.NormalizeContainerName(
@@ -388,7 +323,7 @@ func isRealCycle(containers []types.Container, circularErr circularReferenceErro
 			return false
 		}
 
-		links := fromContainer.Links(useComposeDependsOn)
+		links, _ := fromContainer.Links(useComposeDependsOn)
 		found := slices.Contains(links, toName)
 
 		if !found {
@@ -402,287 +337,113 @@ func isRealCycle(containers []types.Container, circularErr circularReferenceErro
 }
 
 // generateMalformedLabelContainers creates containers with malformed labels.
-func generateMalformedLabelContainers(data []byte) []types.Container {
-	containers := make([]types.Container, 0, 5)
-
-	// Parse data to determine malformed label scenario
-
+func generateMalformedLabelContainers(data []byte) []*container.Container {
 	switch {
 	case bytes.Contains(data, []byte("empty-labels")):
-		// Create containers with empty label maps
-		for i := range 3 {
-			container := &mockSorter.SimpleContainer{
-				ContainerName:  fmt.Sprintf("container%d", i),
-				ContainerID:    types.ContainerID(fmt.Sprintf("id-%d", i)),
-				ContainerLinks: []string{},
-			}
-			container.ContainerInfoField = &dockerContainer.InspectResponse{
-				Name: fmt.Sprintf("/container%d", i),
-				Config: &dockerContainer.Config{
-					Labels: map[string]string{},
-				},
-			}
-			containers = append(containers, container)
-		}
+		return deploy(deployed{name: "container0"}, deployed{name: "container1"}, deployed{name: "container2"})
 
 	case bytes.Contains(data, []byte("nil-labels")):
-		// Create containers with nil labels
-		for i := range 3 {
-			container := &mockSorter.SimpleContainer{
-				ContainerName:  fmt.Sprintf("container%d", i),
-				ContainerID:    types.ContainerID(fmt.Sprintf("id-%d", i)),
-				ContainerLinks: []string{},
-			}
-			container.ContainerInfoField = &dockerContainer.InspectResponse{
-				Name: fmt.Sprintf("/container%d", i),
-				Config: &dockerContainer.Config{
-					Labels: nil,
-				},
-			}
-			containers = append(containers, container)
+		containers := make([]*container.Container, 3)
+		for i := range containers {
+			name := fmt.Sprintf("container%d", i)
+			containers[i] = container.NewContainer(nil, &dockerContainer.InspectResponse{
+				ID:     dockerID(name),
+				Name:   "/" + name,
+				Config: &dockerContainer.Config{Labels: nil},
+			}, nil)
 		}
+
+		return containers
 
 	default:
-		// Create containers with service names containing the fuzz data
-		parts := bytes.Split(data, []byte(","))
-		for i, part := range parts {
-			if len(part) == 0 {
-				continue
-			}
+		// Service names containing the fuzz data, special characters included.
+		// An empty part names no container.
+		var services []string
 
-			serviceName := string(part) // Include any special characters
-			container := &mockSorter.SimpleContainer{
-				ContainerName:  fmt.Sprintf("container%d", i),
-				ContainerID:    types.ContainerID(fmt.Sprintf("id-%d", i)),
-				ContainerLinks: []string{},
+		for part := range bytes.SplitSeq(data, []byte(",")) {
+			if len(part) > 0 {
+				services = append(services, string(part))
 			}
-			container.ContainerInfoField = &dockerContainer.InspectResponse{
-				Name: fmt.Sprintf("/container%d", i),
-				Config: &dockerContainer.Config{
-					Labels: map[string]string{
-						"com.docker.compose.service": serviceName,
-					},
-				},
-			}
-			containers = append(containers, container)
 		}
-	}
 
-	return containers
+		return serviceLabelContainers(services)
+	}
 }
 
-// generateLinkNormalizationContainers creates containers with various link normalization scenarios.
-func generateLinkNormalizationContainers(data []byte) []types.Container {
-	containers := make([]types.Container, 0, 5)
-
-	// Parse data to determine link scenario
+// generateLinkNormalizationContainers creates containers with various link
+// normalization scenarios. Links come from a Watchtower depends-on label or
+// from legacy links in the host config, as Container.Links reads them.
+func generateLinkNormalizationContainers(data []byte) []*container.Container {
 	switch {
 	case bytes.Contains(data, []byte("leading-slash-links")):
-		// Create containers with links that have leading slashes
-		container := &mockSorter.SimpleContainer{
-			ContainerName:  "container1",
-			ContainerID:    types.ContainerID("id-1"),
-			ContainerLinks: []string{"/dependency1", "/dependency2"},
-		}
-		container.ContainerInfoField = &dockerContainer.InspectResponse{
-			Name: "/container1",
-			Config: &dockerContainer.Config{
-				Labels: map[string]string{},
-			},
-		}
-		containers = append(containers, container)
-
-		// Add dependency containers
-		for i := 1; i <= 2; i++ {
-			dep := &mockSorter.SimpleContainer{
-				ContainerName:  fmt.Sprintf("dependency%d", i),
-				ContainerID:    types.ContainerID(fmt.Sprintf("dep-id-%d", i)),
-				ContainerLinks: []string{},
-			}
-			dep.ContainerInfoField = &dockerContainer.InspectResponse{
-				Name: fmt.Sprintf("/dependency%d", i),
-				Config: &dockerContainer.Config{
-					Labels: map[string]string{},
-				},
-			}
-			containers = append(containers, dep)
-		}
+		return deploy(
+			deployed{name: "container1", dependsOn: "/dependency1,/dependency2"},
+			deployed{name: "dependency1"},
+			deployed{name: "dependency2"},
+		)
 
 	case bytes.Contains(data, []byte("empty-links")):
-		// Create containers with empty link entries
-		container := &mockSorter.SimpleContainer{
-			ContainerName:  "container1",
-			ContainerID:    types.ContainerID("id-1"),
-			ContainerLinks: []string{"", "dependency1", ""},
-		}
-		container.ContainerInfoField = &dockerContainer.InspectResponse{
-			Name: "/container1",
-			Config: &dockerContainer.Config{
-				Labels: map[string]string{},
-			},
-		}
-		containers = append(containers, container)
-
-		dep := &mockSorter.SimpleContainer{
-			ContainerName:  "dependency1",
-			ContainerID:    types.ContainerID("dep-id-1"),
-			ContainerLinks: []string{},
-		}
-		dep.ContainerInfoField = &dockerContainer.InspectResponse{
-			Name: "/dependency1",
-			Config: &dockerContainer.Config{
-				Labels: map[string]string{},
-			},
-		}
-		containers = append(containers, dep)
+		// A part of only spaces survives as an empty link, while an empty part
+		// is skipped.
+		return deploy(deployed{name: "container1", dependsOn: " ,dependency1, ,"}, deployed{name: "dependency1"})
 
 	case bytes.Contains(data, []byte("malformed-host-links")):
-		// Create containers with malformed host config links
-		container := &mockSorter.SimpleContainer{
-			ContainerName:  "container1",
-			ContainerID:    types.ContainerID("id-1"),
-			ContainerLinks: []string{}, // Will be set via ContainerInfoField
-		}
-		container.ContainerInfoField = &dockerContainer.InspectResponse{
-			Name: "/container1",
-			HostConfig: &dockerContainer.HostConfig{
-				Links: []string{
-					"dependency1:alias1",
-					"malformed-link",
-					":empty-name",
-					"dependency2:",
-				},
+		return deploy(
+			deployed{
+				name:  "container1",
+				links: []string{"dependency1:alias1", "malformed-link", ":empty-name", "dependency2:"},
 			},
-			Config: &dockerContainer.Config{
-				Labels: map[string]string{},
-			},
-		}
-		containers = append(containers, container)
-
-		// Add dependency containers
-		for i := 1; i <= 2; i++ {
-			dep := &mockSorter.SimpleContainer{
-				ContainerName:  fmt.Sprintf("dependency%d", i),
-				ContainerID:    types.ContainerID(fmt.Sprintf("dep-id-%d", i)),
-				ContainerLinks: []string{},
-			}
-			dep.ContainerInfoField = &dockerContainer.InspectResponse{
-				Name: fmt.Sprintf("/dependency%d", i),
-				Config: &dockerContainer.Config{
-					Labels: map[string]string{},
-				},
-			}
-			containers = append(containers, dep)
-		}
+			deployed{name: "dependency1"},
+			deployed{name: "dependency2"},
+		)
 
 	default:
-		// Create containers with links derived from fuzz data
-		parts := bytes.Split(data, []byte(","))
-		if len(parts) > 0 {
-			container := &mockSorter.SimpleContainer{
-				ContainerName:  "container1",
-				ContainerID:    types.ContainerID("id-1"),
-				ContainerLinks: make([]string, 0, len(parts)),
-			}
-
-			// Add links from fuzz data
-			for _, part := range parts {
-				if len(part) > 0 {
-					container.ContainerLinks = append(container.ContainerLinks, string(part))
-				}
-			}
-
-			container.ContainerInfoField = &dockerContainer.InspectResponse{
-				Name: "/container1",
-				Config: &dockerContainer.Config{
-					Labels: map[string]string{},
-				},
-			}
-			containers = append(containers, container)
-		}
+		// A depends-on label holding the fuzz data, comma-separated parts and all.
+		return deploy(deployed{name: "container1", dependsOn: string(data)})
 	}
-
-	return containers
 }
 
 // generateEmptyIdentifierContainers creates containers with empty or missing identifiers.
-func generateEmptyIdentifierContainers(data []byte) []types.Container {
-	containers := make([]types.Container, 0, 5)
-
-	// Parse data to determine empty identifier scenario
-
+func generateEmptyIdentifierContainers(data []byte) []*container.Container {
 	switch {
 	case bytes.Contains(data, []byte("empty-names")):
-		// Create containers with empty names
-		for i := range 3 {
-			container := &mockSorter.SimpleContainer{
-				ContainerName:  "", // Empty name
-				ContainerID:    types.ContainerID(fmt.Sprintf("id-%d", i)),
-				ContainerLinks: []string{},
-			}
-			container.ContainerInfoField = &dockerContainer.InspectResponse{
-				Name: "", // Empty name
-				Config: &dockerContainer.Config{
-					Labels: map[string]string{},
-				},
-			}
-			containers = append(containers, container)
-		}
+		// Containers with empty names and distinct IDs.
+		return deploy(deployed{id: "id-0"}, deployed{id: "id-1"}, deployed{id: "id-2"})
 
 	case bytes.Contains(data, []byte("nil-container-info")):
-		// Create containers with nil container info
-		for i := range 3 {
-			container := &mockSorter.SimpleContainer{
-				ContainerName:      fmt.Sprintf("container%d", i),
-				ContainerID:        types.ContainerID(fmt.Sprintf("id-%d", i)),
-				ContainerLinks:     []string{},
-				ContainerInfoField: nil, // Nil container info
-			}
-			containers = append(containers, container)
+		// Containers without inspect data, so without a name or an ID.
+		containers := make([]*container.Container, 3)
+		for i := range containers {
+			containers[i] = container.NewContainer(nil, nil, nil)
 		}
+
+		return containers
 
 	case bytes.Contains(data, []byte("empty-ids")):
-		// Create containers with empty IDs
-		for i := range 3 {
-			container := &mockSorter.SimpleContainer{
-				ContainerName:  fmt.Sprintf("container%d", i),
-				ContainerID:    "", // Empty ID
-				ContainerLinks: []string{},
-			}
-			container.ContainerInfoField = &dockerContainer.InspectResponse{
-				Name: fmt.Sprintf("/container%d", i),
-				Config: &dockerContainer.Config{
-					Labels: map[string]string{},
-				},
-			}
-			containers = append(containers, container)
+		// Containers with names and empty IDs.
+		containers := make([]*container.Container, 3)
+		for i := range containers {
+			containers[i] = container.NewContainer(nil, &dockerContainer.InspectResponse{
+				Name:   fmt.Sprintf("/container%d", i),
+				Config: &dockerContainer.Config{Labels: map[string]string{}},
+			}, nil)
 		}
+
+		return containers
 
 	default:
-		// Create containers with identifiers derived from fuzz data
-		parts := bytes.Split(data, []byte(","))
-		for i, part := range parts {
-			if len(part) == 0 {
-				continue
-			}
+		// Containers named by the fuzz data, with distinct IDs, so a repeated
+		// name is the only collision.
+		var specs []deployed
 
-			name := string(bytes.TrimSpace(part))
-			container := &mockSorter.SimpleContainer{
-				ContainerName:  name,
-				ContainerID:    types.ContainerID(fmt.Sprintf("id-%d", i)),
-				ContainerLinks: []string{},
+		for i, part := range bytes.Split(data, []byte(",")) {
+			if len(part) > 0 {
+				specs = append(specs, deployed{name: string(bytes.TrimSpace(part)), id: fmt.Sprintf("id-%d", i)})
 			}
-			container.ContainerInfoField = &dockerContainer.InspectResponse{
-				Name: "/" + name,
-				Config: &dockerContainer.Config{
-					Labels: map[string]string{},
-				},
-			}
-			containers = append(containers, container)
 		}
-	}
 
-	return containers
+		return deploy(specs...)
+	}
 }
 
 // FuzzIdentifierCollisions fuzz tests scenarios where container identifiers could collide,
@@ -709,7 +470,7 @@ func FuzzIdentifierCollisions(f *testing.F) {
 		// Test with both useComposeDependsOn values
 		for _, useComposeDependsOn := range []bool{true, false} {
 			ds := dependencySorter{}
-			testContainers := make([]types.Container, len(containers))
+			testContainers := make([]*container.Container, len(containers))
 			copy(testContainers, containers)
 
 			// This should not panic and should not detect false cycles
@@ -759,7 +520,7 @@ func FuzzMalformedLabels(f *testing.F) {
 		// Test with both useComposeDependsOn values
 		for _, useComposeDependsOn := range []bool{true, false} {
 			ds := dependencySorter{}
-			testContainers := make([]types.Container, len(containers))
+			testContainers := make([]*container.Container, len(containers))
 			copy(testContainers, containers)
 
 			// This should not panic
@@ -802,7 +563,7 @@ func FuzzLinkNormalization(f *testing.F) {
 		// Test with both useComposeDependsOn values
 		for _, useComposeDependsOn := range []bool{true, false} {
 			ds := dependencySorter{}
-			testContainers := make([]types.Container, len(containers))
+			testContainers := make([]*container.Container, len(containers))
 			copy(testContainers, containers)
 
 			// This should not panic
@@ -820,6 +581,68 @@ func FuzzLinkNormalization(f *testing.F) {
 			}
 		}
 	})
+}
+
+// TestGenerateLinkNormalizationContainers verifies that the link normalization
+// seeds give the sorter the links they are named for, and that those links
+// resolve to the seed's dependencies with Compose depends_on read or not. The
+// depends-on label drops leading slashes. A part of only spaces becomes an
+// empty link. A legacy link without a colon or without a name is dropped.
+//
+// The graph's edges are checked rather than the sort order, since container1
+// sorts after its dependencies even when they have no edges.
+func TestGenerateLinkNormalizationContainers(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		seed string
+		// links are the links container1 reports.
+		links []string
+		// dependencies are the containers container1 must depend on.
+		dependencies []string
+	}{
+		{
+			seed:         "leading-slash-links",
+			links:        []string{"dependency1", "dependency2"},
+			dependencies: []string{"dependency1", "dependency2"},
+		},
+		{
+			seed:         "empty-links",
+			links:        []string{"", "dependency1", ""},
+			dependencies: []string{"dependency1"},
+		},
+		{
+			seed:         "malformed-host-links",
+			links:        []string{"dependency1", "dependency2"},
+			dependencies: []string{"dependency1", "dependency2"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.seed, func(t *testing.T) {
+			t.Parallel()
+
+			containers := generateLinkNormalizationContainers([]byte(tt.seed))
+			picked := pick(containers, "container1")
+			require.Len(t, picked, 1)
+
+			for _, useComposeDependsOn := range []bool{true, false} {
+				links, _ := picked[0].Links(useComposeDependsOn)
+				assert.Equal(t, tt.links, links)
+
+				_, indegree, adjacency, _, err := buildDependencyGraph(newTestLogger(t), containers, useComposeDependsOn)
+				require.NoError(t, err)
+				assert.Equal(t, len(tt.dependencies), indegree["container1"])
+
+				for _, dependency := range tt.dependencies {
+					assert.Contains(t, adjacency[dependency], "container1")
+				}
+
+				sorted := slices.Clone(containers)
+				require.NoError(t, dependencySorter{}.Sort(newTestLogger(t), sorted, useComposeDependsOn))
+			}
+		})
+	}
 }
 
 // FuzzEmptyIdentifiers fuzz tests containers with empty or missing identifiers.
@@ -844,7 +667,7 @@ func FuzzEmptyIdentifiers(f *testing.F) {
 		// Test with both useComposeDependsOn values
 		for _, useComposeDependsOn := range []bool{true, false} {
 			ds := dependencySorter{}
-			testContainers := make([]types.Container, len(containers))
+			testContainers := make([]*container.Container, len(containers))
 			copy(testContainers, containers)
 
 			// This should not panic

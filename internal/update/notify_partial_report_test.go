@@ -11,13 +11,12 @@ import (
 
 	dockerContainer "github.com/moby/moby/api/types/container"
 
-	mockContainerClient "github.com/nicholas-fedor/watchtower/internal/container/client/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/container"
 	"github.com/nicholas-fedor/watchtower/internal/container/oci"
 	"github.com/nicholas-fedor/watchtower/internal/observability/events"
 	"github.com/nicholas-fedor/watchtower/internal/observability/metrics"
 	mockUpdate "github.com/nicholas-fedor/watchtower/internal/update/mocks"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // TestRunUpdatesWithNotifications_UpdateErrorKeepsPartialResults verifies
@@ -29,10 +28,10 @@ import (
 func TestRunUpdatesWithNotifications_UpdateErrorKeepsPartialResults(t *testing.T) {
 	t.Parallel()
 
-	const newID = types.ContainerID("e000000000000000000000000000000000000000000000000000000000000000")
+	const newID = container.ContainerID("e000000000000000000000000000000000000000000000000000000000000000")
 
 	// appContainer returns a running container that uses the given image.
-	appContainer := func(id, name, image string) types.Container {
+	appContainer := func(id, name, image string) *container.Container {
 		return mockUpdate.CreateMockContainerWithConfig(
 			id,
 			name,
@@ -50,11 +49,11 @@ func TestRunUpdatesWithNotifications_UpdateErrorKeepsPartialResults(t *testing.T
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	client := mockContainerClient.NewMockClient(t)
+	client := newMockClient(t)
 	client.EXPECT().ListContainers(mock.Anything, mock.Anything).
-		Return([]types.Container{first, second}, nil).Once()
+		Return([]*container.Container{first, second}, nil).Once()
 	client.EXPECT().IsContainerStale(mock.Anything, mock.Anything, mock.Anything).
-		Return(true, types.ImageID("sha256:new"), "", nil).Times(2)
+		Return(true, container.ImageID("sha256:new"), "", nil).Times(2)
 	client.EXPECT().GetImageAnnotations(mock.Anything, mock.Anything).Return(oci.Annotations{})
 
 	// Only one container is replaced. The session is canceled while waiting
@@ -64,16 +63,16 @@ func TestRunUpdatesWithNotifications_UpdateErrorKeepsPartialResults(t *testing.T
 	client.EXPECT().CreateContainer(mock.Anything, mock.Anything).Return(newID, nil).Once()
 	client.EXPECT().StartContainerByID(mock.Anything, newID).Return(nil).Once()
 	client.EXPECT().WaitForContainerHealthy(mock.Anything, newID, mock.Anything).
-		RunAndReturn(func(context.Context, types.ContainerID, time.Duration) error {
+		RunAndReturn(func(context.Context, container.ContainerID, time.Duration) error {
 			cancel()
 
 			return nil
 		}).Once()
 
-	var removed []types.ImageID
+	var removed []container.ImageID
 
 	client.EXPECT().RemoveImageByID(mock.Anything, mock.Anything, mock.Anything).
-		Run(func(_ context.Context, id types.ImageID, _ string) {
+		Run(func(_ context.Context, id container.ImageID, _ string) {
 			removed = append(removed, id)
 		}).
 		Return(nil)
@@ -100,7 +99,7 @@ func TestRunUpdatesWithNotifications_UpdateErrorKeepsPartialResults(t *testing.T
 	assert.Empty(t, batch.sent[0].Failed())
 
 	updated := batch.sent[0].Updated()[0]
-	assert.Equal(t, []types.ImageID{updated.CurrentImageID()}, removed,
+	assert.Equal(t, []container.ImageID{updated.CurrentImageID()}, removed,
 		"the replaced container's old image is removed")
 
 	// Events are published synchronously into the subscriber's buffer.

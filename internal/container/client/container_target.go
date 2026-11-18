@@ -9,9 +9,9 @@ import (
 
 	dockerClient "github.com/moby/moby/client"
 
+	"github.com/nicholas-fedor/watchtower/internal/container"
 	"github.com/nicholas-fedor/watchtower/internal/container/recreate"
 	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // errStartContainerFailed indicates a failure to start a newly created container.
@@ -37,8 +37,8 @@ func startTargetContainer(
 	ctx context.Context,
 	api dockerClient.APIClient,
 	clog *zerolog.Logger,
-	sourceContainer types.Container,
-	containerID types.ContainerID,
+	sourceContainer *container.Container,
+	containerID container.ContainerID,
 	reviveStopped bool,
 ) error {
 	if !sourceContainer.IsRunning() && !reviveStopped {
@@ -93,7 +93,7 @@ func cleanupFailedStartContainer(
 	parentCtx context.Context,
 	api dockerClient.APIClient,
 	clog *zerolog.Logger,
-	containerID types.ContainerID,
+	containerID container.ContainerID,
 ) {
 	cleanupCtx, cancel := context.WithTimeout(
 		context.WithoutCancel(parentCtx),

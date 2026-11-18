@@ -8,17 +8,18 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/nicholas-fedor/watchtower/internal/container"
 	"github.com/nicholas-fedor/watchtower/internal/container/filters"
 	"github.com/nicholas-fedor/watchtower/internal/git/semver"
 	"github.com/nicholas-fedor/watchtower/internal/settings/config/client"
 	"github.com/nicholas-fedor/watchtower/internal/settings/config/compatibility"
+	"github.com/nicholas-fedor/watchtower/internal/settings/config/docker"
 	"github.com/nicholas-fedor/watchtower/internal/settings/config/filter"
 	"github.com/nicholas-fedor/watchtower/internal/settings/config/git"
 	"github.com/nicholas-fedor/watchtower/internal/settings/config/lifecycle"
 	"github.com/nicholas-fedor/watchtower/internal/settings/config/mode"
 	"github.com/nicholas-fedor/watchtower/internal/settings/config/registry"
 	"github.com/nicholas-fedor/watchtower/internal/settings/config/update"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // TestUpdateParamsAssignsEveryField ensures UpdateParams sets every exported
@@ -61,6 +62,7 @@ func TestUpdateParamsAssignsEveryField(t *testing.T) {
 		Filter: filter.Filter{
 			Predicate:   filters.NoFilter,
 			Desc:        "all",
+			Scope:       "prod",
 			LabelEnable: true,
 		},
 		Git: git.Git{
@@ -85,12 +87,17 @@ func TestUpdateParamsAssignsEveryField(t *testing.T) {
 			TLSMinVersion:    "TLS1.3",
 			TLSSkip:          true,
 		},
+		Docker: docker.Docker{
+			Host:      "tcp://docker.example.com:2376",
+			TLSVerify: true,
+			CertPath:  "/certs",
+		},
 	}
 
 	ov := RunOverrides{
 		RunOnce:            true,
 		SkipSelfUpdate:     true,
-		CurrentContainerID: types.ContainerID("abc123"),
+		CurrentContainerID: container.ContainerID("abc123"),
 	}
 
 	params := cfg.UpdateParams(ov)
@@ -110,7 +117,8 @@ func TestUpdateParamsAssignsEveryField(t *testing.T) {
 	assert.Equal(t, 1000, params.LifecycleUID)
 	assert.Equal(t, 1000, params.LifecycleGID)
 	assert.True(t, params.RunOnce)
-	assert.Equal(t, types.ContainerID("abc123"), params.CurrentContainerID)
+	assert.Equal(t, container.ContainerID("abc123"), params.CurrentContainerID)
+	assert.Equal(t, "prod", params.Scope)
 	assert.True(t, params.UseComposeDependsOn)
 	assert.True(t, params.SkipSelfUpdate)
 	assert.True(t, params.EphemeralSelfUpdate)
@@ -129,6 +137,7 @@ func TestUpdateParamsAssignsEveryField(t *testing.T) {
 	assert.Equal(t, "build/docker/Dockerfile", params.Git.Dockerfile)
 	assert.Equal(t, ".", params.Git.Context)
 	assert.Equal(t, cfg.Registry, params.Registry)
+	assert.Equal(t, cfg.Docker, params.Docker)
 	assert.True(t, params.GitComposeStash)
 	assert.Equal(t, "/compose/demo", params.ComposeProjects["demo"])
 
@@ -166,7 +175,7 @@ func TestUpdateParamsRollingRestartFollowsConfig(t *testing.T) {
 func TestUpdateParamsOverrideFilter(t *testing.T) {
 	t.Parallel()
 
-	override := func(types.FilterableContainer) bool { return false }
+	override := func(filters.FilterableContainer) bool { return false }
 
 	cfg := Config{
 		Filter:        filter.Filter{Predicate: filters.NoFilter},

@@ -9,16 +9,15 @@ import (
 	"github.com/nicholas-fedor/watchtower/internal/container/oci"
 	"github.com/nicholas-fedor/watchtower/internal/container/provenance"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // Progress tracks container statuses during a session.
-type Progress map[types.ContainerID]*ContainerStatus
+type Progress map[container.ContainerID]*ContainerStatus
 
 // updateFromContainer creates a status from container data.
 //
 // Parameters:
-//   - container: Container to update from.
+//   - c: Container to update from.
 //   - newImage: Latest image ID.
 //   - state: Container state.
 //   - params: Update parameters for monitor-only check.
@@ -26,26 +25,26 @@ type Progress map[types.ContainerID]*ContainerStatus
 // Returns:
 //   - *ContainerStatus: Updated status.
 func updateFromContainer(log *zerolog.Logger,
-	container types.Container,
-	newImage types.ImageID,
+	c *container.Container,
+	newImage container.ImageID,
 	state State,
 	params updateParams.Params,
 ) *ContainerStatus {
 	update := &ContainerStatus{
-		containerID:    container.ID(),
-		oldImage:       container.ImageID(),
+		containerID:    c.ID(),
+		oldImage:       c.ImageID(),
 		newImage:       newImage,
-		containerName:  container.Name(),
-		imageName:      container.ImageName(),
+		containerName:  c.Name(),
+		imageName:      c.ImageName(),
 		containerError: nil,
 		state:          state,
-		monitorOnly:    container.IsMonitorOnly(params.Policy),
+		monitorOnly:    c.IsMonitorOnly(params.Policy),
 		newContainerID: "",
 	}
-	applyReportMeta(update, container, params)
+	applyReportMeta(update, c, params)
 	log.Debug().
-		Str("container_id", container.ID().ShortID()).
-		Str("name", container.Name()).
+		Str("container_id", c.ID().ShortID()).
+		Str("name", c.Name()).
 		Str("state", update.State()).
 		Msg("Updated container status from container")
 
@@ -55,17 +54,17 @@ func updateFromContainer(log *zerolog.Logger,
 // AddSkipped adds a container as skipped with an error.
 //
 // Parameters:
-//   - container: Container to add.
+//   - c: Container to add.
 //   - err: Skip reason error.
 //   - params: Update parameters for monitor-only check.
-func (m Progress) AddSkipped(log *zerolog.Logger, container types.Container, err error, params updateParams.Params) {
-	update := updateFromContainer(log, container, container.ImageID(), SkippedState, params)
+func (m Progress) AddSkipped(log *zerolog.Logger, c *container.Container, err error, params updateParams.Params) {
+	update := updateFromContainer(log, c, c.ImageID(), SkippedState, params)
 	update.containerError = err
 	m.Add(log, update)
 	log.Debug().
 		Err(err).
-		Str("container_id", container.ID().ShortID()).
-		Str("name", container.Name()).
+		Str("container_id", c.ID().ShortID()).
+		Str("name", c.Name()).
 		Msg("Added container as skipped")
 }
 
@@ -73,35 +72,35 @@ func (m Progress) AddSkipped(log *zerolog.Logger, container types.Container, err
 //
 // Parameters:
 //   - log: Logger for diagnostics.
-//   - container: Container to add.
+//   - c: Container to add.
 //   - err: Failure reason error.
 //   - params: Update parameters for monitor-only check.
-func (m Progress) AddFailed(log *zerolog.Logger, container types.Container, err error, params updateParams.Params) {
-	update := updateFromContainer(log, container, container.ImageID(), FailedState, params)
+func (m Progress) AddFailed(log *zerolog.Logger, c *container.Container, err error, params updateParams.Params) {
+	update := updateFromContainer(log, c, c.ImageID(), FailedState, params)
 	update.containerError = err
 	m.Add(log, update)
 	log.Debug().
 		Err(err).
-		Str("container_id", container.ID().ShortID()).
-		Str("name", container.Name()).
+		Str("container_id", c.ID().ShortID()).
+		Str("name", c.Name()).
 		Msg("Added container as failed")
 }
 
 // AddScanned adds a container as scanned with a new image.
 //
 // Parameters:
-//   - container: Container to add.
+//   - c: Container to add.
 //   - newImage: Latest image ID.
 //   - params: Update parameters for monitor-only check.
 func (m Progress) AddScanned(log *zerolog.Logger,
-	container types.Container,
-	newImage types.ImageID,
+	c *container.Container,
+	newImage container.ImageID,
 	params updateParams.Params,
 ) {
-	m.Add(log, updateFromContainer(log, container, newImage, ScannedState, params))
+	m.Add(log, updateFromContainer(log, c, newImage, ScannedState, params))
 	log.Debug().
-		Str("container_id", container.ID().ShortID()).
-		Str("name", container.Name()).
+		Str("container_id", c.ID().ShortID()).
+		Str("name", c.Name()).
 		Str("new_image", newImage.ShortID()).
 		Msg("Added container as scanned")
 }
@@ -110,7 +109,7 @@ func (m Progress) AddScanned(log *zerolog.Logger,
 //
 // Parameters:
 //   - failures: Map of container IDs to errors.
-func (m Progress) UpdateFailed(log *zerolog.Logger, failures map[types.ContainerID]error) {
+func (m Progress) UpdateFailed(log *zerolog.Logger, failures map[container.ContainerID]error) {
 	for containerID, err := range failures {
 		update, exists := m[containerID]
 		if !exists {
@@ -138,7 +137,7 @@ func (m Progress) UpdateFailed(log *zerolog.Logger, failures map[types.Container
 // Parameters:
 //   - log: Process logger.
 //   - skips: Map of container IDs to skip reasons.
-func (m Progress) UpdateSkipped(log *zerolog.Logger, skips map[types.ContainerID]error) {
+func (m Progress) UpdateSkipped(log *zerolog.Logger, skips map[container.ContainerID]error) {
 	for containerID, reason := range skips {
 		update, exists := m[containerID]
 		if !exists {
@@ -179,7 +178,7 @@ func (m Progress) UpdateSkipped(log *zerolog.Logger, skips map[types.ContainerID
 //   - params: Update parameters for the monitor-only check.
 func (m Progress) SkipUnrecorded(
 	log *zerolog.Logger,
-	containers []types.Container,
+	containers []*container.Container,
 	reason error,
 	params updateParams.Params,
 ) {
@@ -198,17 +197,13 @@ func (m Progress) SkipUnrecorded(
 //   - status: Status to update.
 //   - c: Source container.
 //   - params: Update parameters used to resolve report metadata.
-func applyReportMeta(status *ContainerStatus, c types.Container, params updateParams.Params) {
-	if status == nil {
-		return
-	}
-
-	if _, ok := c.(*container.Container); !ok {
+func applyReportMeta(status *ContainerStatus, c *container.Container, params updateParams.Params) {
+	if status == nil || c == nil {
 		return
 	}
 
 	meta := provenance.ResolveReportMeta(c, params.Git, provenance.ChangelogVars{}, oci.Annotations{})
-	status.SetGitMetadata(meta)
+	status.assignReportMeta(meta)
 }
 
 // SetLatestImage updates the latest image ID recorded for a container.
@@ -220,7 +215,7 @@ func applyReportMeta(status *ContainerStatus, c types.Container, params updatePa
 //
 // Returns:
 //   - none.
-func (m Progress) SetLatestImage(log *zerolog.Logger, containerID types.ContainerID, image types.ImageID) {
+func (m Progress) SetLatestImage(log *zerolog.Logger, containerID container.ContainerID, image container.ImageID) {
 	update, exists := m[containerID]
 	if !exists {
 		return
@@ -231,6 +226,72 @@ func (m Progress) SetLatestImage(log *zerolog.Logger, containerID types.Containe
 		Str("container_id", containerID.ShortID()).
 		Str("image", image.ShortID()).
 		Msg("Updated latest image on container status")
+}
+
+// SetNewContainerID records the ID of the container that replaced a container.
+//
+// A container the progress does not hold is skipped.
+//
+// Parameters:
+//   - log: Process logger.
+//   - containerID: ID of the replaced container.
+//   - newID: ID of the new container.
+func (m Progress) SetNewContainerID(log *zerolog.Logger, containerID, newID container.ContainerID) {
+	update, exists := m[containerID]
+	if !exists {
+		return
+	}
+
+	update.newContainerID = newID
+	log.Debug().
+		Str("container_id", containerID.ShortID()).
+		Str("new_container_id", newID.ShortID()).
+		Msg("Recorded new container ID on container status")
+}
+
+// SetReportMeta sets the Git and OCI report fields of a container's status.
+//
+// A container the progress does not hold is skipped.
+//
+// Parameters:
+//   - log: Process logger.
+//   - containerID: Container identity.
+//   - meta: Resolved report metadata.
+func (m Progress) SetReportMeta(log *zerolog.Logger, containerID container.ContainerID, meta provenance.ReportMeta) {
+	update, exists := m[containerID]
+	if !exists {
+		return
+	}
+
+	update.assignReportMeta(meta)
+	log.Debug().
+		Str("container_id", containerID.ShortID()).
+		Str("name", update.Name()).
+		Str("latest_version", meta.LatestVersion).
+		Str("changelog", meta.Changelog).
+		Msg("Applied report metadata to container status")
+}
+
+// RecordRestart records that a container was recreated as newID.
+//
+// A container whose image was not updated is marked restarted. An updated
+// container keeps its updated state. A container the progress does not hold
+// is skipped.
+//
+// Parameters:
+//   - log: Process logger.
+//   - c: The container that was recreated.
+//   - newID: ID of the new container.
+func (m Progress) RecordRestart(log *zerolog.Logger, c *container.Container, newID container.ContainerID) {
+	if _, exists := m[c.ID()]; !exists {
+		return
+	}
+
+	m.SetNewContainerID(log, c.ID(), newID)
+
+	if !c.IsStale() {
+		m.MarkRestarted(log, c.ID())
+	}
 }
 
 // SetLatestImageMeta re-resolves report metadata for a known new image and
@@ -249,10 +310,10 @@ func (m Progress) SetLatestImage(log *zerolog.Logger, containerID types.Containe
 //   - latest: OCI annotations from a newly pulled image, or empty for none.
 //
 // Returns:
-//   - container.ReportMeta: The applied metadata, or empty when nothing changed.
+//   - provenance.ReportMeta: The applied metadata, or empty when nothing changed.
 func (m Progress) SetLatestImageMeta(
 	log *zerolog.Logger,
-	c types.Container,
+	c *container.Container,
 	params updateParams.Params,
 	vars provenance.ChangelogVars,
 	latest oci.Annotations,
@@ -261,20 +322,12 @@ func (m Progress) SetLatestImageMeta(
 		return provenance.ReportMeta{}
 	}
 
-	update, exists := m[c.ID()]
-	if !exists {
+	if _, exists := m[c.ID()]; !exists {
 		return provenance.ReportMeta{}
 	}
 
 	meta := provenance.ResolveReportMeta(c, params.Git, vars, latest)
-	update.SetGitMetadata(meta)
-
-	log.Debug().
-		Str("container_id", c.ID().ShortID()).
-		Str("name", update.Name()).
-		Str("latest_version", meta.LatestVersion).
-		Str("changelog", meta.Changelog).
-		Msg("Applied latest image metadata to container status")
+	m.SetReportMeta(log, c.ID(), meta)
 
 	return meta
 }
@@ -296,7 +349,7 @@ func (m Progress) Add(log *zerolog.Logger, update *ContainerStatus) {
 //
 // Parameters:
 //   - containerID: ID of container to mark.
-func (m Progress) MarkForUpdate(log *zerolog.Logger, containerID types.ContainerID) {
+func (m Progress) MarkForUpdate(log *zerolog.Logger, containerID container.ContainerID) {
 	update, exists := m[containerID]
 	if !exists {
 		log.Debug().
@@ -317,7 +370,7 @@ func (m Progress) MarkForUpdate(log *zerolog.Logger, containerID types.Container
 //
 // Parameters:
 //   - containerID: ID of container to mark.
-func (m Progress) MarkRestarted(log *zerolog.Logger, containerID types.ContainerID) {
+func (m Progress) MarkRestarted(log *zerolog.Logger, containerID container.ContainerID) {
 	update, exists := m[containerID]
 	if !exists {
 		log.Debug().
@@ -340,10 +393,10 @@ func (m Progress) MarkRestarted(log *zerolog.Logger, containerID types.Container
 //   - containerID: Container ID.
 //   - age: Human-readable image age.
 //   - delay: Human-readable cooldown duration.
-//   - remaining: Human-readable remaining time (empty if passed).
+//   - remaining: Human-readable remaining time (empty when the image age is unavailable).
 //   - eligibleAt: Time when the container becomes eligible for update.
 func (m Progress) SetCooldownInfo(log *zerolog.Logger,
-	containerID types.ContainerID,
+	containerID container.ContainerID,
 	age,
 	delay,
 	remaining string,
@@ -358,7 +411,11 @@ func (m Progress) SetCooldownInfo(log *zerolog.Logger,
 		return
 	}
 
-	update.SetCooldownInfo(age, delay, remaining, eligibleAt)
+	update.cooldownAge = age
+	update.cooldownDelay = delay
+	update.cooldownRemaining = remaining
+	update.cooldownEligibleAt = eligibleAt
+
 	log.Debug().
 		Str("container_id", containerID.ShortID()).
 		Str("name", update.Name()).

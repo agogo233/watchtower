@@ -16,6 +16,7 @@ run:
   timeout: 5m # Maximum time allowed for linting (5 minutes)
   allow-parallel-runners: true # Allow multiple parallel golangci-lint instances running.
   allow-serial-runners: true # Allow multiple golangci-lint instances running, but serialize them around a lock.
+  relative-path-mode: gomod # Exclusion paths are relative to the go.mod of the module being checked.
 
 # Formatters Configuration
 formatters:
@@ -25,6 +26,10 @@ formatters:
     - gofumpt # Enforce a stricter format than gofmt, while being backwards compatible.
     - goimports # Manages Go import lines, adds missing imports, removes unused ones
     - golines # Checks if code is formatted, and fixes long lines.
+
+  exclusions:
+    paths:
+      - ^tools/ # Separate modules, formatted from their own directory with their own import grouping.
 
   settings:
     gci:
@@ -245,7 +250,7 @@ linters:
       # Constructors that build a new error rather than return one from another call.
       extra-ignore-sigs:
         - ratelimit.FromResponse(
-        - ratelimit.FromErrorMessage(
+        - ratelimit.FromError(
     gocyclo:
       # Functions above this complexity are reported. The functions listed under
       # exclusions are already above it and are excluded until they are split up.
@@ -310,38 +315,9 @@ linters:
       - path: "doc.go$"
         linters:
           - dupword
-      # Functions above the gocyclo threshold today. Remove an entry when its function is split up.
-      - path: "internal/update/update.go"
-        linters:
-          - gocyclo
-        text: "of func `update` is high"
-      - path: "internal/git/project/checkout.go"
-        linters:
-          - gocyclo
-        text: "of func `Checkout` is high"
-      - path: "internal/update/restart/restart.go"
-        linters:
-          - gocyclo
-        text: "of func `restartStaleContainer` is high"
-      - path: "internal/registry/digest/digest.go"
-        linters:
-          - gocyclo
-        text: "of func `handleManifestResponse` is high"
-      - path: "internal/container/filters/filters.go"
-        linters:
-          - gocyclo
-        text: "of func `BuildFilter` is high"
-      - path: "internal/registry/digest/digest.go"
-        linters:
-          - gocyclo
-        text: "of func `fetchDigest` is high"
-      - path: "internal/update/schedule/scheduling.go"
-        linters:
-          - gocyclo
-        text: "of func `RunUpgradesOnSchedule` is high"
     paths:
       - ".*/mocks/.*"
-      - ".*/internal/api/swagger/.*"
+      - "^internal/api/swagger/"
     warn-unused: true
 
 # Issues Configuration

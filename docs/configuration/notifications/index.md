@@ -23,8 +23,10 @@ Configures the notification service URL(s).
 !!! Note "Multiple Notification URLs"
     To send notifications to multiple services simultaneously, you can:
 
-    - Use comma-separated URLs: `--notification-url="discord://xxx,telegram://yyy"`
-    - Specify the flag multiple times: `--notification-url=discord://xxx --notification-url=telegram://yyy`
+    - Use comma-separated URLs: `--notification-url="DISCORD_URL,TELEGRAM_URL"`
+    - Specify the flag multiple times: `--notification-url=DISCORD_URL --notification-url=TELEGRAM_URL`
+
+    Replace *`DISCORD_URL`* and *`TELEGRAM_URL`* with the `discord://` and `telegram://` URLs of your services.
 
     See [Configuring Multiple Notification URLs](../../notifications/introduction/index.md#using_multiple_notification_services) for detailed examples.
 
@@ -311,7 +313,9 @@ Environment Variable: WATCHTOWER_NOTIFICATION_GOTIFY_URL
 
 #### Gotify Token
 
-Sets the Gotify token for notifications.
+Sets the Gotify application token for notifications.
+A client token is rejected at startup.
+Watchtower sends the token in the `X-Gotify-Key` header, which keeps it out of the server's access logs.
 
 ```text
             Argument: --notification-gotify-token
@@ -349,8 +353,8 @@ Environment Variable: WATCHTOWER_NOTIFICATION_MSTEAMS_HOOK_URL
 ```
 
 !!! Warning
-    The value of `--notification-msteams-hook` **must** be an absolute URL using the `https://` scheme (including the host).
-    Relative URLs and non-HTTPS schemes are rejected at runtime.
+    The value of the `notification-msteams-hook` configuration option **must** be a Power Automate or Azure Logic Apps workflow webhook URL. It uses `https://` and carries a `sig` signature parameter.
+    Watchtower refuses to start with any other URL, such as a retired Office 365 connector URL on `webhook.office.com`.
 
 !!! Note "This option can also reference a file, in which case the contents of the file are used."
 

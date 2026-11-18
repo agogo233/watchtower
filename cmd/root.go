@@ -6,6 +6,9 @@ import (
 	"io/fs"
 	"os"
 	"os/signal"
+	"slices"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,6 +20,7 @@ import (
 
 	"github.com/nicholas-fedor/watchtower/internal/api"
 	"github.com/nicholas-fedor/watchtower/internal/api/routes"
+	composeApply "github.com/nicholas-fedor/watchtower/internal/compose/apply"
 	"github.com/nicholas-fedor/watchtower/internal/container"
 	containerClient "github.com/nicholas-fedor/watchtower/internal/container/client"
 	"github.com/nicholas-fedor/watchtower/internal/container/filters"
@@ -28,12 +32,12 @@ import (
 	"github.com/nicholas-fedor/watchtower/internal/observability/notify"
 	"github.com/nicholas-fedor/watchtower/internal/registry/ratelimit"
 	"github.com/nicholas-fedor/watchtower/internal/settings"
+	dockerConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/docker"
 	"github.com/nicholas-fedor/watchtower/internal/update"
 	"github.com/nicholas-fedor/watchtower/internal/update/cleanup"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/internal/update/schedule"
 	"github.com/nicholas-fedor/watchtower/internal/update/selfupdate"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 const (
@@ -41,8 +45,8 @@ const (
 	// update operations.
 	//
 	// It bounds the Docker API call that sets the current Watchtower
-	// container's restart policy to "no", so a slow or unresponsive
-	// daemon cannot delay shutdown paths.
+	// container's restart policy to "no" and each step of retiring an old
+	// instance. A slow or unresponsive daemon then cannot delay shutdown paths.
 	restartPolicyTimeout = 5 * time.Second
 
 	// containerLookupTimeout is the maximum duration allowed for current
@@ -70,15 +74,16 @@ var (
 	//
 	// It is the single source of operational policy for run-once, schedule, and API paths.
 	// Values originate from CLI flags and environment variables registered in internal/settings
-	// and are resolved once at startup (and again in run when positional container names apply).
+	// and are loaded once at startup, in preRun. preRun then takes the scope from Watchtower's
+	// own scope label when no scope is set.
 	appCfg settings.Config
 
 	// client is the Docker client instance used to interact with container operations in Watchtower.
 	//
 	// It provides an interface for listing, stopping, starting, and managing containers, initialized during
-	// the preRun phase with options derived from appCfg.ClientOptions() (DOCKER_HOST, TLS, API version, and
-	// related client flags/environment variables).
-	client containerClient.Client
+	// the preRun phase with options derived from appCfg.ClientOptions(), which include the Docker
+	// connection settings.
+	client DockerClient
 
 	// rateLimiter paces every registry request, so image pulls, digest checks,
 	// image age lookups, and release tag lookups share one budget per registry
@@ -97,7 +102,7 @@ var (
 	//
 	// It is initialized once in preRun after the client is set up, and used throughout the application
 	// to avoid repeated calls to GetCurrentContainerID. If retrieval fails, it is set to an empty string.
-	currentWatchtowerContainerID types.ContainerID
+	currentWatchtowerContainerID container.ContainerID
 
 	// currentWatchtowerContainerUnknown is true when Watchtower runs in a container
 	// whose ID could not be determined. Self-updates are then disabled.
@@ -108,7 +113,7 @@ var (
 	// It is initialized in preRun by retrieving the container object using the currentWatchtowerContainerID,
 	// remains nil if retrieval fails or yields an unexpected type, and is used for operations like updating
 	// restart policy, validating restarts, and cleaning up excess instances.
-	currentWatchtowerContainer types.Container
+	currentWatchtowerContainer *container.Container
 
 	// sleepFunc is a function variable for time.Sleep, allowing it to be overridden in tests.
 	//
@@ -122,14 +127,25 @@ var (
 	// The function creates a context that is canceled when the specified signals (SIGINT, SIGTERM) are received.
 	createSignalContext = signal.NotifyContext
 
-	// newClient is a function variable for creating the Docker client, allowing it to be overridden in tests.
+	// newClient creates the Docker client, allowing it to be overridden in tests.
 	//
-	// It is initialized to container.NewClient by default. preRun calls it with the resolved client options,
-	// so tests can substitute a mock client without a Docker daemon.
-	newClient = containerClient.NewClient
+	// It creates the client with containerClient.NewClient. preRun calls it with
+	// the resolved client options, so tests can substitute a mock client without
+	// a Docker daemon.
+	newClient = func(ctx context.Context, log *zerolog.Logger, opts containerClient.ClientOptions) (DockerClient, error) {
+		dockerClient, err := containerClient.NewClient(ctx, log, opts)
+		if err != nil {
+			// Return a nil interface, which callers compare with nil, rather
+			// than one holding a nil pointer.
+			return nil, err //nolint:wrapcheck // NewClient's error already names the failed step.
+		}
+
+		return dockerClient, nil
+	}
 
 	// processFs is the filesystem holding the container marker files and the
-	// /proc files that self container ID detection reads.
+	// /proc files that self container ID detection and main process detection
+	// read.
 	//
 	// Tests replace it to control whether Watchtower appears to run in a
 	// container and which container ID it detects.
@@ -148,7 +164,7 @@ var (
 	// It is initialized inside runMain with a closure that executes update.RunUpdatesWithNotifications,
 	// allowing it to be overridden in tests to mock the update process. It takes a context, filter, and update params,
 	// and returns a metric summarizing the update session.
-	runUpdatesWithNotifications func(context.Context, types.Filter, updateParams.Params) *metrics.Metric
+	runUpdatesWithNotifications func(context.Context, filters.Filter, updateParams.Params) *metrics.Metric
 
 	// rootCmd represents the root command for the Watchtower CLI, serving as the entry point for all subcommands.
 	//
@@ -156,6 +172,22 @@ var (
 	// (PreRunE and RunE).
 	rootCmd = NewRootCommand()
 )
+
+// DockerClient is what the commands need from the Docker client. It covers what
+// the update session, the HTTP API and the self-update handoff use. It also
+// looks up Watchtower's own container.
+type DockerClient interface {
+	update.Client
+	routes.Client
+	selfupdate.HandoffClient
+
+	// GetCurrentWatchtowerContainer returns the container with the given ID
+	// without inspecting its image.
+	//
+	// A transient inspect failure is tried again, up to three attempts 2
+	// seconds apart, or until ctx ends.
+	GetCurrentWatchtowerContainer(ctx context.Context, containerID container.ContainerID) (*container.Container, error)
+}
 
 // process holds composition-root dependencies for a single CLI invocation.
 //
@@ -309,80 +341,48 @@ func (p *process) exit(cmd *cobra.Command, err error) {
 
 // preRun prepares the environment and configuration before the main command execution begins.
 //
-// It processes command-line flag aliases, configures logging based on verbosity settings,
-// expands secrets from files, maps Docker flags into the process environment, loads the
-// immutable appconfig snapshot, initializes the Docker client and notification client, and
-// handles early-exit paths (ephemeral self-update orchestrator and invalid old-container restarts).
+// It runs these steps in order:
+//  1. Loads the configuration with [settings.Load], which also sets up logging.
+//  2. Maps the Docker flags into the process environment.
+//  3. Creates the Docker client and finds Watchtower's own container.
+//  4. Ends the process for the ephemeral self-update orchestrator and for an old container
+//     restarted after a self-update replaced it.
+//  5. Sets up notifications.
+//  6. Takes the scope from Watchtower's own scope label when no scope is set. Exits when
+//     that label is needed but cannot be read.
+//  7. Warns when Watchtower cannot identify or inspect its own container.
+//  8. Warns about deprecated notification settings.
 //
 // Parameters:
 //   - cmd: The cobra.Command instance being executed, providing access to parsed flags.
-//   - _: A slice of string arguments (unused here, as container names are applied in run when
-//     reloading configuration for filtering).
+//   - args: Container names given as positional arguments, which limit the containers
+//     Watchtower monitors.
 //
 // Returns:
 //   - error: An [exitError] when Watchtower must not continue.
-func (p *process) preRun(cmd *cobra.Command, _ []string) error {
+func (p *process) preRun(cmd *cobra.Command, args []string) error {
 	// Execute reports the errors returned from here on. Flag and argument
 	// errors come earlier, so Cobra still prints them with the usage text.
 	cmd.SilenceErrors = true
 	cmd.SilenceUsage = true
 
-	flagsSet := cmd.PersistentFlags()
+	var err error
 
-	// Bridge environment values onto unset flags so aliases and logging still see them.
-	err := settings.ApplyEnvToFlags(flagsSet, settings.AllSpecs())
-	if err != nil {
-		return &exitError{err: err, msg: "Failed to apply environment configuration", code: 1}
-	}
-
-	// Apply format (and pre-alias level) before ProcessFlagAliases so its errors,
-	// such as an interval set with a schedule, use the user-selected --log-format
-	// rather than zerolog's default JSON encoding on stderr.
-	p.log, err = settings.SetupLogging(p.log, flagsSet)
-	if err != nil {
-		return &exitError{err: err, msg: "Failed to initialize logging", code: 1}
-	}
-
-	// Apply porcelain, interval→schedule, and debug/trace log-level aliases.
-	err = settings.ProcessFlagAliases(p.log, flagsSet)
-	if err != nil {
-		return &exitError{err: err, msg: "Invalid configuration", code: 1}
-	}
-
-	// Re-apply after aliases so debug/trace forced log-level values take effect.
-	p.log, err = settings.SetupLogging(p.log, flagsSet)
-	if err != nil {
-		return &exitError{err: err, msg: "Failed to initialize logging", code: 1}
-	}
-
-	// Expand secrets from files (for example notification URLs and API tokens).
-	err = settings.GetSecretsFromFiles(p.log, cmd)
-	if err != nil {
-		return &exitError{err: err, msg: "Failed to load secret from file", code: 1}
-	}
-
-	// Map Docker connection flags into the process environment for the client stack.
-	err = settings.EnvConfig(p.log, cmd)
-	if err != nil {
-		return &exitError{err: err, msg: "Failed to configure Docker environment", code: 1}
-	}
-
-	// Load without positional names. run reloads with args for the final filter.
-	appCfg, err = settings.Load(p.log, cmd, nil)
+	appCfg, p.log, err = settings.Load(p.log, cmd, args)
 	if err != nil {
 		return &exitError{err: err, msg: "Failed to load configuration", code: 1}
+	}
+
+	// The build tools that Compose rebuilds start read the Docker connection from the process
+	// environment.
+	err = composeApply.ExportConnection(appCfg.Docker)
+	if err != nil {
+		return &exitError{err: err, msg: "Failed to configure Docker environment", code: 1}
 	}
 
 	p.log.Debug().
 		Str("scheduleSpec", appCfg.Schedule.Spec).
 		Msg("Retrieved cron schedule specification from configuration")
-
-	// Log the scope if specified, aiding debugging by confirming the operational boundary.
-	if appCfg.Filter.Scope != "" {
-		p.log.Debug().
-			Str("scope", appCfg.Filter.Scope).
-			Msg("Configured operational scope")
-	}
 
 	// Initialize the Docker client from the resolved ClientOptions projection,
 	// with the rate limiter that update sessions also use for release tag lookups.
@@ -462,38 +462,18 @@ func (p *process) preRun(cmd *cobra.Command, _ []string) error {
 	currentWatchtowerContainerUnknown = currentWatchtowerContainerID == "" &&
 		containerClient.InContainer(processFs)
 
-	// Check if this is an old Watchtower container that should not run continuously.
-	// A run-once instance ends after its run, so only a continuous one exits here.
-	if !appCfg.Mode.RunOnce && container.IsSuperseded(currentWatchtowerContainer) {
-		p.stopInvalidWatchtowerRestart()
-
-		return &exitError{err: errSupersededInstance, msg: "", code: 0}
+	if !appCfg.Mode.HealthCheck && container.IsSuperseded(currentWatchtowerContainer) {
+		return p.retire()
 	}
 
-	// Set up the notification client from loaded process config (appCfg.Notify).
-	// RegisterHook attaches the notifier to p.log and updates p.log in place to the
-	// hooked logger so subsequent application logging is captured for notifications.
-	// Because a health check probe runs often, its warnings stay in the log and
-	// never reach notifications.
-	if !appCfg.Mode.HealthCheck {
-		notifier, err = notify.NewNotifier(p.log, appCfg.Notify)
-		if err != nil {
-			return &exitError{err: err, msg: "Failed to initialize notifications", code: 1}
-		}
-
-		notifier.RegisterHook(p.log)
+	err = p.setUpNotifications()
+	if err != nil {
+		return err
 	}
 
-	// Without the container's labels, a scope set only by its scope label is
-	// unknown. Running without a scope would update containers that belong to
-	// another Watchtower instance, so Watchtower exits instead. A health check
-	// runs no updates, so it continues.
-	if inspectErr != nil && appCfg.Filter.Scope == "" && !appCfg.Mode.HealthCheck {
-		// Disable restarts first, so the runtime does not start Watchtower again.
-		p.disableRestarts()
-		p.log.Error().Err(inspectErr).Msg(logging.ScopeLabelUnreadable)
-
-		return &exitError{err: inspectErr, msg: "", code: 1}
+	err = p.resolveScope(inspectErr)
+	if err != nil {
+		return err
 	}
 
 	if currentWatchtowerContainerUnknown {
@@ -508,101 +488,114 @@ func (p *process) preRun(cmd *cobra.Command, _ []string) error {
 	return nil
 }
 
-// stopInvalidWatchtowerRestart recovers any orphaned instance and sets the
-// restart policy of the current Watchtower container to "no", so the old
-// instance can exit. The invalid restart check that leads here requires a
-// current container.
-func (p *process) stopInvalidWatchtowerRestart() {
-	p.log.Info().
-		Msg("Detected invalid restart of old Watchtower container, stopping Watchtower container now")
-
-	// Attempt to recover an orphaned Watchtower container that is stuck
-	// in the created state before exiting. If recovery succeeds, the
-	// old container still exits with restart policy set to "no".
-	recoverCtx, recoverCancel := context.WithTimeout(
-		context.Background(),
-		restartPolicyTimeout,
-	)
-
-	recoveredContainer, recovered := selfupdate.TryRecoverOrphanedContainer(
-		p.log,
-		recoverCtx,
-		client,
-		currentWatchtowerContainer,
-	)
-	if recovered {
-		p.log.Info().
-			Str("container", recoveredContainer.Name()).
-			Msg("Recovered orphaned Watchtower container, exiting old instance")
+// retire retires Watchtower's container after a self-update replaced it.
+//
+// Returns:
+//   - error: An [exitError] with exit code 0.
+func (p *process) retire() error {
+	// Notifications are set up first, so the recovery is notified.
+	err := p.setUpNotifications()
+	if err != nil {
+		p.log.Debug().Err(err).Msg("Could not set up notifications for the retirement of an old Watchtower container")
 	}
 
-	recoverCancel()
-	p.disableRestarts()
+	// Startup retires before it settles the scope, so the scope is worked out
+	// here from the configuration and the old container's scope label.
+	label, _ := currentWatchtowerContainer.Scope()
+	scope := appCfg.Filter.ScopeWithLabel(label)
+
+	selfupdate.RetireOldInstance(p.log, context.Background(), client, currentWatchtowerContainer, scope, restartPolicyTimeout)
+
+	return &exitError{err: errSupersededInstance, msg: "", code: 0}
+}
+
+// setUpNotifications creates the notifier from the notification settings and
+// hooks it to the process logger, so the lines logged after it reach
+// notifications.
+//
+// A health check probe runs often, so it sets up no notifier, and its warnings
+// stay in the log.
+//
+// Returns:
+//   - error: An [exitError] when the notifier cannot be created.
+func (p *process) setUpNotifications() error {
+	if appCfg.Mode.HealthCheck {
+		return nil
+	}
+
+	var err error
+
+	notifier, err = notify.NewNotifier(p.log, appCfg.Notify)
+	if err != nil {
+		return &exitError{err: err, msg: "Failed to initialize notifications", code: 1}
+	}
+
+	notifier.RegisterHook(p.log)
+
+	return nil
+}
+
+// resolveScope settles the scope Watchtower runs in, taking it from
+// Watchtower's own scope label when the configuration sets none.
+//
+// Without its own container, Watchtower keeps the configured scope. When its
+// container could not be inspected and no scope is set, the scope label is
+// unknown. Running without a scope would update containers that belong to
+// another Watchtower instance, so Watchtower exits instead. A health check
+// runs no updates, so it continues.
+//
+// Parameters:
+//   - inspectErr: The error from inspecting Watchtower's own container. It is
+//     nil when the inspect succeeded.
+//
+// Returns:
+//   - error: An [exitError] when the scope label cannot be read or the filter
+//     cannot be built.
+func (p *process) resolveScope(inspectErr error) error {
+	if inspectErr != nil && appCfg.Filter.Scope == "" && !appCfg.Mode.HealthCheck {
+		// Disable restarts first, so the runtime does not start Watchtower again.
+		p.disableRestarts()
+		p.log.Error().Err(inspectErr).Msg(logging.ScopeLabelUnreadable)
+
+		return &exitError{err: inspectErr, msg: "", code: 1}
+	}
+
+	var label string
+	if currentWatchtowerContainer != nil {
+		label, _ = currentWatchtowerContainer.Scope()
+	}
+
+	scoped, err := appCfg.Filter.WithLabelScope(p.log, label)
+	if err != nil {
+		return &exitError{err: err, msg: "Failed to build container filter", code: 1}
+	}
+
+	appCfg.Filter = scoped
+
+	if appCfg.Filter.Scope != "" {
+		p.log.Debug().
+			Str("scope", appCfg.Filter.Scope).
+			Msg("Resolved operational scope")
+	}
+
+	return nil
 }
 
 // run executes the main Watchtower logic based on parsed command-line flags.
 //
-// It reloads process configuration with positional container names, derives the effective
-// operational scope (including scope persistence across self-updates), handles health-check
-// early exit, builds the HTTP API RunConfig from appCfg, and delegates to runMain for core
-// execution. It bridges configuration loading and the application's primary workflow.
+// It uses the configuration preRun prepared. A health check exits early. Otherwise run builds
+// the RunConfig from appCfg and hands it to runMain for core execution.
 //
 // Parameters:
-//   - command: The cobra.Command instance being executed, providing access to parsed flags.
-//   - args: A slice of container names provided as positional arguments, used for filtering.
+//   - _: The cobra.Command instance being executed, whose settings preRun already loaded.
+//   - _: Positional arguments, which preRun already loaded as container names.
 //
 // Returns:
 //   - error: An [exitError] when Watchtower cannot continue or its run failed.
-func (p *process) run(command *cobra.Command, args []string) error {
-	p.log.Debug().
-		Strs("positional_args", args).
-		Msg("Received positional arguments for container filtering")
-
-	// Reload configuration with positional names so the filter includes them.
-	loaded, err := settings.Load(p.log, command, args)
-	if err != nil {
-		return &exitError{err: err, msg: "Failed to load configuration", code: 1}
-	}
-
-	appCfg = loaded
-
-	normalizedContainerNames := append([]string(nil), appCfg.Filter.Names...)
-
-	// Prefer explicit scope, then scope derived from the container label (self-update persistence).
-	effectiveScope, scopeErr := container.GetEffectiveScope(
-		currentWatchtowerContainer,
-		appCfg.Filter.Scope,
-	)
-	if scopeErr != nil {
-		p.log.Debug().
-			Err(scopeErr).
-			Msg("Scope derivation failed, continuing with current scope")
-	} else if effectiveScope != appCfg.Filter.Scope {
-		appCfg.Filter.Scope = effectiveScope
-
-		// Rebuild the filter predicate with the effective scope.
-		predicate, desc, filterErr := filters.BuildFilter(
-			p.log,
-			appCfg.Filter.Names,
-			appCfg.Filter.DisableContainers,
-			appCfg.Filter.MonitorImageNames,
-			appCfg.Filter.SkipImageNames,
-			appCfg.Filter.EnableContainersByLabel,
-			appCfg.Filter.DisableContainersByLabel,
-			appCfg.Filter.LabelEnable,
-			appCfg.Filter.Scope,
-		)
-		if filterErr != nil {
-			return &exitError{err: filterErr, msg: "Failed to build container filter", code: 1}
-		}
-
-		appCfg.Filter.Predicate = predicate
-		appCfg.Filter.Desc = desc
-	}
-
+func (p *process) run(_ *cobra.Command, _ []string) error {
 	if appCfg.Mode.HealthCheck {
 		if isContainerMainProcess() {
-			time.Sleep(1 * time.Second)
+			sleepFunc(1 * time.Second)
 
 			return &exitError{
 				err:  nil,
@@ -614,10 +607,7 @@ func (p *process) run(command *cobra.Command, args []string) error {
 		return nil
 	}
 
-	cfg, err := appCfg.BuildRunConfig(settings.RunConfigInput{
-		Command: command,
-		Names:   normalizedContainerNames,
-	})
+	cfg, err := appCfg.BuildRunConfig()
 	if err != nil {
 		return &exitError{err: err, msg: logging.RunConfigurationFailed, code: 1}
 	}
@@ -664,7 +654,7 @@ func (p *process) runMain(cfg settings.RunConfig) error {
 	//
 	// Parameters:
 	//   - ctx: Context for cancellation and timeouts.
-	//   - filter: The types.Filter determining which containers are targeted for updates.
+	//   - filter: The filters.Filter determining which containers are targeted for updates.
 	//   - params: The updateParams.Params struct containing update configuration parameters.
 	//
 	// Returns:
@@ -687,7 +677,7 @@ func (p *process) runMain(cfg settings.RunConfig) error {
 	)
 	defer stop()
 
-	runUpdatesWithNotifications = func(ctx context.Context, filter types.Filter, params updateParams.Params) *metrics.Metric {
+	runUpdatesWithNotifications = func(ctx context.Context, filter filters.Filter, params updateParams.Params) *metrics.Metric {
 		runParams := params
 		if filter != nil {
 			runParams.Filter = filter
@@ -751,7 +741,7 @@ func (p *process) runMain(cfg settings.RunConfig) error {
 		startup.Notifier = notifier
 		startup.Version = meta.Version
 		startup.Logger = p.log
-		logging.WriteStartupMessage(startup)
+		logging.WriteStartupMessage(ctx, startup)
 
 		params := baseParams
 		params.RunOnce = true
@@ -783,9 +773,7 @@ func (p *process) runMain(cfg settings.RunConfig) error {
 			Msg("Failed to clean up old Watchtower containers, continuing anyway")
 	}
 
-	// Check for and cleanup orphaned ephemeral orchestrator containers.
-	// These may persist if the orchestrator crashed or was killed unexpectedly.
-	// With AutoRemove: true, this is a safety net for edge cases.
+	// Remove ephemeral orchestrators that a crash or failed start left behind.
 	removedOrchestratorCount, orchestratorErr := cleanup.RemoveOrphanedOrchestrators(p.log, ctx, client)
 	if orchestratorErr != nil {
 		p.log.Warn().
@@ -796,15 +784,6 @@ func (p *process) runMain(cfg settings.RunConfig) error {
 		p.log.Debug().
 			Int("removed_orchestrators", removedOrchestratorCount).
 			Msg("Cleaned up orphaned orchestrator containers")
-	}
-
-	// Track whether cleanup occurred to prevent redundant updates after self-update.
-	cleanupOccurred := totalRemovedInstances > 0
-	// Disable update-on-start if cleanup occurred to prevent redundant updates after self-update.
-	if cleanupOccurred {
-		cfg.UpdateOnStart = false
-
-		p.log.Debug().Msg("Disabled update-on-start due to cleanup of old Watchtower containers")
 	}
 
 	// Skip self-updates when the running container cannot be replaced safely.
@@ -882,7 +861,7 @@ func (p *process) runMain(cfg settings.RunConfig) error {
 			Version:                     meta.Version,
 			Startup:                     startupBase,
 			RunUpdatesWithNotifications: runUpdatesWithNotifications,
-			FilterByImage: func(images []string, base types.Filter) types.Filter {
+			FilterByImage: func(images []string, base filters.Filter) filters.Filter {
 				return filters.FilterByImage(p.log, images, base)
 			},
 			DefaultMetrics:      metrics.Default,
@@ -903,22 +882,20 @@ func (p *process) runMain(cfg settings.RunConfig) error {
 		return &exitError{err: err, msg: "", code: 1}
 	}
 
-	// Schedule and execute periodic updates, handling errors or shutdown.
-	// The startup message is skipped here if it was already sent by the HTTP API in blocking mode.
-	startupMessageSent := cfg.EnableUpdateAPI && !cfg.UnblockHTTPAPI
-
+	// Schedule and execute periodic updates, handling errors or shutdown. In
+	// API-only mode the HTTP API returns only at shutdown. The scheduler then
+	// only waits for an update the API started and announces nothing.
 	err = schedule.RunUpgradesOnSchedule(ctx, schedule.ScheduleDeps{
-		Logger:              p.log,
-		Filter:              cfg.Filter,
-		Lock:                updateLock,
-		ScheduleSpec:        appCfg.Schedule.Spec,
-		Startup:             startupBase,
-		WriteStartupMessage: logging.WriteStartupMessage,
-		RunUpdate:           runUpdatesWithNotifications,
-		UpdateOnStart:       cfg.UpdateOnStart,
-		SkipFirstRun:        cleanupOccurred,
-		StartupMessageSent:  startupMessageSent,
-		BaseParams:          sharedBase,
+		Logger:                p.log,
+		Filter:                cfg.Filter,
+		Lock:                  updateLock,
+		ScheduleSpec:          appCfg.Schedule.Spec,
+		Startup:               startupBase,
+		WriteStartupMessage:   logging.WriteStartupMessage,
+		RunUpdate:             runUpdatesWithNotifications,
+		UpdateOnStart:         cfg.UpdateOnStart,
+		ReplacedOlderInstance: totalRemovedInstances > 0,
+		BaseParams:            sharedBase,
 	})
 
 	// Stop the HTTP API and give it its shutdown grace period to finish the
@@ -999,19 +976,21 @@ func (p *process) disableRestartsBeforeExit(cmd *cobra.Command) {
 			return
 		}
 
+		var docker dockerConfig.Docker
+
 		err := p.clientErr
 		if err == nil {
-			// Startup reports the connection settings when it maps them
-			// itself, so this mapping logs nothing.
-			err = settings.EnvConfig(new(zerolog.Nop()), cmd)
+			// Startup reports the TLS warnings when it loads the settings
+			// itself, so this read logs nothing.
+			docker, err = settings.LoadDocker(new(zerolog.Nop()), cmd)
 		}
 
 		if err == nil {
-			// The client options only change how updates run. The process is
-			// exiting, so it waits only briefly for a daemon that does not
-			// answer.
+			// The other client options only change how updates run. The
+			// process is exiting, so it waits only briefly for a daemon that
+			// does not answer.
 			ctx, cancel := context.WithTimeout(context.Background(), restartPolicyTimeout)
-			client, err = newClient(ctx, p.log, containerClient.ClientOptions{})
+			client, err = newClient(ctx, p.log, containerClient.ClientOptions{Docker: docker})
 
 			cancel()
 		}
@@ -1036,18 +1015,32 @@ func (p *process) disableRestartsBeforeExit(cmd *cobra.Command) {
 // The main process is PID 1. When the container is started with an init,
 // such as docker run --init, the init runs as PID 1 and the main process is
 // its child. A command started with docker exec, such as a health check
-// probe, has parent PID 0. A host binary is never PID 1. Its parent PID is 1
-// when an init system such as systemd starts it, so the parent PID counts
-// only in a container.
+// probe, usually has parent PID 0. Some kernels, such as OpenVZ's, report
+// parent PID 1 for it although PID 1 did not start it. The parent PID
+// therefore counts only when PID 1 lists this process among its children.
+// A kernel without that list never counts it. A host binary is never PID 1.
+// Its parent PID is 1 when an init system such as systemd starts it, so the
+// parent PID counts only in a container.
 //
 // Returns:
 //   - bool: True for the main process of a container.
 func isContainerMainProcess() bool {
-	if processID() == 1 {
+	pid := processID()
+	if pid == 1 {
 		return true
 	}
 
-	return parentProcessID() == 1 && containerClient.InContainer(processFs)
+	if parentProcessID() != 1 || !containerClient.InContainer(processFs) {
+		return false
+	}
+
+	// The kernel provides this list only when built with CONFIG_PROC_CHILDREN.
+	children, err := fs.ReadFile(processFs, "proc/1/task/1/children")
+	if err != nil {
+		return false
+	}
+
+	return slices.Contains(strings.Fields(string(children)), strconv.Itoa(pid))
 }
 
 // detectCurrentContainerID detects the ID of Watchtower's own container for an

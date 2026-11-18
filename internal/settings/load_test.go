@@ -1,6 +1,7 @@
 package settings
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -10,12 +11,12 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
-	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/nicholas-fedor/watchtower/internal/git/semver"
+	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
+	"github.com/nicholas-fedor/watchtower/internal/settings/config/docker"
 	"github.com/nicholas-fedor/watchtower/internal/settings/config/git"
 	"github.com/nicholas-fedor/watchtower/internal/settings/config/registry"
 	"github.com/nicholas-fedor/watchtower/internal/settings/config/update"
@@ -32,34 +33,25 @@ func newNopLogger() *zerolog.Logger {
 	return &log
 }
 
-// bindLoad registers flags, parses args, and binds a local Viper instance.
+// parsedValues returns a reader of a command's flags parsed from args, with
+// every flag registered as in production.
 //
 // Parameters:
 //   - t: Test handle.
 //   - args: CLI arguments after the command name.
 //
 // Returns:
-//   - *viper.Viper: Bound configuration.
-//   - *pflag.FlagSet: Persistent flags after ParseFlags.
-//   - *cobra.Command: Command passed to Load.
-func bindLoad(t *testing.T, args ...string) (*viper.Viper, *pflag.FlagSet, *cobra.Command) {
+//   - *flagValues: Reader of the parsed persistent flags.
+func parsedValues(t *testing.T, args ...string) *flagValues {
 	t.Helper()
 
-	cmd := &cobra.Command{Use: "watchtower"}
-	RegisterAll(cmd)
-	require.NoError(t, cmd.ParseFlags(args))
-
-	flagSet := cmd.PersistentFlags()
-	vCfg := viper.New()
-	require.NoError(t, BindAll(vCfg, flagSet, AllSpecs()))
-
-	return vCfg, flagSet, cmd
+	return &flagValues{flags: newParsedCommand(t, args...).PersistentFlags()}
 }
 
 func TestLoad_DefaultsAndAlignment(t *testing.T) {
-	_, _, cmd := bindLoad(t)
+	cmd := newParsedCommand(t)
 
-	cfg, err := Load(newNopLogger(), cmd, []string{"/Foo", "Bar"})
+	cfg, _, err := Load(newNopLogger(), cmd, []string{"/Foo", "Bar"})
 	require.NoError(t, err)
 
 	assert.Equal(t, "unix:///var/run/docker.sock", cfg.Docker.Host)
@@ -76,18 +68,25 @@ func TestLoad_DefaultsAndAlignment(t *testing.T) {
 	assert.Equal(t, git.DefaultPolicy, cfg.Git.SemverPolicy)
 }
 
-func TestLoad_BindError(t *testing.T) {
-	cmd := &cobra.Command{Use: "watchtower"}
+// TestLoad_PreparesFlags verifies that Load prepares the flags itself, so a
+// caller that only parses them still gets the environment, the alias flags
+// and the secret files applied.
+func TestLoad_PreparesFlags(t *testing.T) {
+	tokenFile := writeSecretFile(t, "s3cret\n")
 
-	_, err := Load(newNopLogger(), cmd, nil)
-	require.Error(t, err)
-	assert.ErrorContains(t, err, "bind configuration:")
+	cfg := newLoadedCommand(t,
+		map[string]string{"WATCHTOWER_CLEANUP": "true"},
+		"--interval", "30", "--http-api-token", tokenFile)
+
+	assert.True(t, cfg.Update.Cleanup, "the environment sets an unset flag")
+	assert.Equal(t, "@every 30s", cfg.Schedule.Spec, "the interval alias sets the schedule")
+	assert.Equal(t, "s3cret", cfg.API.Token, "the secret file is read into its flag")
 }
 
 func TestLoad_APIVersionQuotesStripped(t *testing.T) {
-	_, _, cmd := bindLoad(t, "--api-version", `"1.44"`)
+	cmd := newParsedCommand(t, "--api-version", `"1.44"`)
 
-	cfg, err := Load(newNopLogger(), cmd, nil)
+	cfg, _, err := Load(newNopLogger(), cmd, nil)
 	require.NoError(t, err)
 	assert.Equal(t, "1.44", cfg.Docker.APIVersion)
 }
@@ -95,9 +94,9 @@ func TestLoad_APIVersionQuotesStripped(t *testing.T) {
 // TestLoad_CompatReachesClientOptions verifies the compatibility flags reach
 // the Docker client options through their single home in Compatibility.
 func TestLoad_CompatReachesClientOptions(t *testing.T) {
-	_, _, cmd := bindLoad(t, "--cpu-copy-mode", "full", "--disable-memory-swappiness")
+	cmd := newParsedCommand(t, "--cpu-copy-mode", "full", "--disable-memory-swappiness")
 
-	cfg, err := Load(newNopLogger(), cmd, nil)
+	cfg, _, err := Load(newNopLogger(), cmd, nil)
 	require.NoError(t, err)
 	assert.Equal(t, "full", cfg.Compatibility.CPUCopyMode)
 	assert.True(t, cfg.Compatibility.DisableMemorySwappiness)
@@ -108,16 +107,16 @@ func TestLoad_CompatReachesClientOptions(t *testing.T) {
 }
 
 func TestLoad_RollingRestartWithMonitorOnly(t *testing.T) {
-	_, _, cmd := bindLoad(t, "--rolling-restart", "--monitor-only")
+	cmd := newParsedCommand(t, "--rolling-restart", "--monitor-only")
 
-	_, err := Load(newNopLogger(), cmd, nil)
+	_, _, err := Load(newNopLogger(), cmd, nil)
 	require.ErrorIs(t, err, errRollingRestartWithMonitorOnly)
 }
 
 func TestLoad_MonitorOnlyWithNoPullSucceeds(t *testing.T) {
-	_, _, cmd := bindLoad(t, "--monitor-only", "--no-pull")
+	cmd := newParsedCommand(t, "--monitor-only", "--no-pull")
 
-	cfg, err := Load(newNopLogger(), cmd, nil)
+	cfg, _, err := Load(newNopLogger(), cmd, nil)
 	require.NoError(t, err)
 	assert.True(t, cfg.Update.MonitorOnly)
 	assert.True(t, cfg.Update.NoPull)
@@ -125,29 +124,29 @@ func TestLoad_MonitorOnlyWithNoPullSucceeds(t *testing.T) {
 
 func TestLoad_GitAndComposeErrors(t *testing.T) {
 	t.Run("invalid git-image", func(t *testing.T) {
-		_, _, cmd := bindLoad(t, "--git-image", "not-a-mapping")
-		_, err := Load(newNopLogger(), cmd, nil)
+		cmd := newParsedCommand(t, "--git-image", "not-a-mapping")
+		_, _, err := Load(newNopLogger(), cmd, nil)
 		require.ErrorIs(t, err, git.ErrInvalidGitImage)
 	})
 
 	t.Run("invalid compose-project", func(t *testing.T) {
-		_, _, cmd := bindLoad(t, "--compose-project", "nopair")
-		_, err := Load(newNopLogger(), cmd, nil)
+		cmd := newParsedCommand(t, "--compose-project", "nopair")
+		_, _, err := Load(newNopLogger(), cmd, nil)
 		require.ErrorIs(t, err, git.ErrInvalidComposeProject)
 	})
 
 	t.Run("missing ca bundle", func(t *testing.T) {
-		_, _, cmd := bindLoad(t, "--git-ca-bundle", filepath.Join(t.TempDir(), "missing.pem"))
-		_, err := Load(newNopLogger(), cmd, nil)
+		cmd := newParsedCommand(t, "--git-ca-bundle", filepath.Join(t.TempDir(), "missing.pem"))
+		_, _, err := Load(newNopLogger(), cmd, nil)
 		require.Error(t, err)
 		assert.ErrorContains(t, err, "git-ca-bundle:")
 	})
 }
 
 func TestLoad_InvalidFilterLabel(t *testing.T) {
-	_, _, cmd := bindLoad(t, "--enable-containers-by-label", "not-a-pair")
+	cmd := newParsedCommand(t, "--enable-containers-by-label", "not-a-pair")
 
-	_, err := Load(newNopLogger(), cmd, nil)
+	_, _, err := Load(newNopLogger(), cmd, nil)
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "build filter:")
 }
@@ -248,34 +247,196 @@ func TestLoad_ZeroRateLimit(t *testing.T) {
 
 func TestLoad_InvalidAndNegativeCooldown(t *testing.T) {
 	t.Run("invalid duration", func(t *testing.T) {
-		_, _, cmd := bindLoad(t, "--cooldown-delay", "not-a-duration")
-		_, err := Load(newNopLogger(), cmd, nil)
+		cmd := newParsedCommand(t, "--cooldown-delay", "not-a-duration")
+		_, _, err := Load(newNopLogger(), cmd, nil)
 		require.Error(t, err)
 		assert.ErrorContains(t, err, "cooldown-delay:")
 	})
 
 	t.Run("negative duration", func(t *testing.T) {
-		_, _, cmd := bindLoad(t, "--cooldown-delay", "-1h")
-		_, err := Load(newNopLogger(), cmd, nil)
+		cmd := newParsedCommand(t, "--cooldown-delay", "-1h")
+		_, _, err := Load(newNopLogger(), cmd, nil)
 		require.Error(t, err)
 		assert.ErrorContains(t, err, "cooldown-delay:")
 	})
 }
 
+// TestLoadDocker checks the Docker connection settings loadDocker reads from the
+// flags and the environment. An https:// host becomes tcp://. With TLS
+// verification on, a host that cannot use TLS logs a warning.
 func TestLoadDocker(t *testing.T) {
-	vCfg, _, _ := bindLoad(t, "-H", "tcp://127.0.0.1:2375", "--tlsverify", "--api-version", `"1.43"`, "--cert-path", "/certs")
+	const defaultHost = "unix:///var/run/docker.sock"
 
-	got := loadDocker(vCfg)
-	assert.Equal(t, "tcp://127.0.0.1:2375", got.Host)
-	assert.True(t, got.TLSVerify)
-	assert.Equal(t, "1.43", got.APIVersion)
-	assert.Equal(t, "/certs", got.CertPath)
+	testCases := []struct {
+		name        string
+		env         map[string]string
+		flags       []string
+		register    func(*cobra.Command)
+		want        docker.Docker
+		wantErr     string
+		wantWarning string
+	}{
+		{
+			name: "defaults",
+			want: docker.Docker{Host: defaultHost},
+		},
+		{
+			name: "flags",
+			flags: []string{
+				"-H", "tcp://127.0.0.1:2375", "--tlsverify", "--api-version", `"1.43"`, "--cert-path", "/certs",
+			},
+			want: docker.Docker{Host: "tcp://127.0.0.1:2375", TLSVerify: true, APIVersion: "1.43", CertPath: "/certs"},
+		},
+		{
+			name: "environment",
+			env: map[string]string{
+				"DOCKER_HOST":        "tcp://example.com:2376",
+				"DOCKER_TLS_VERIFY":  "1",
+				"DOCKER_API_VERSION": "1.41",
+				"DOCKER_CERT_PATH":   "/env/certs",
+			},
+			want: docker.Docker{Host: "tcp://example.com:2376", TLSVerify: true, APIVersion: "1.41", CertPath: "/env/certs"},
+		},
+		{
+			name:  "host without a scheme keeps its form",
+			flags: []string{"--host", "some-custom-docker-host", "--tlsverify", "--cert-path", "/certs"},
+			want:  docker.Docker{Host: "some-custom-docker-host", TLSVerify: true, CertPath: "/certs"},
+		},
+		{
+			name: "tcp host without tls verification keeps its scheme",
+			env:  map[string]string{"DOCKER_HOST": "tcp://example.com:2375"},
+			want: docker.Docker{Host: "tcp://example.com:2375"},
+		},
+		{
+			name: "https host with tls verification",
+			env: map[string]string{
+				"DOCKER_HOST":       "https://example.com:2376",
+				"DOCKER_TLS_VERIFY": "1",
+				"DOCKER_CERT_PATH":  "/env/certs",
+			},
+			want: docker.Docker{Host: "tcp://example.com:2376", TLSVerify: true, CertPath: "/env/certs"},
+		},
+		{
+			name: "https host without tls verification",
+			env:  map[string]string{"DOCKER_HOST": "https://example.com:2376"},
+			want: docker.Docker{Host: "tcp://example.com:2376"},
+		},
+		{
+			name: "false tls verify env var",
+			env:  map[string]string{"DOCKER_TLS_VERIFY": "0"},
+			want: docker.Docker{Host: defaultHost},
+		},
+		{
+			name:  "tlsverify flag false overrides env var",
+			env:   map[string]string{"DOCKER_TLS_VERIFY": "1"},
+			flags: []string{"--tlsverify=false"},
+			want:  docker.Docker{Host: defaultHost},
+		},
+		{
+			name: "empty flags override env vars",
+			env: map[string]string{
+				"DOCKER_HOST":        "tcp://example.com:2375",
+				"DOCKER_API_VERSION": "1.41",
+				"DOCKER_CERT_PATH":   "/env/certs",
+			},
+			flags: []string{"--host=", "--api-version=", "--cert-path="},
+			want:  docker.Docker{},
+		},
+		{
+			// The exit path reads the Docker settings after a failed Load, so
+			// other settings, such as an invalid log format, must not stop it.
+			name: "invalid log format env var is not read",
+			env:  map[string]string{"DOCKER_HOST": "tcp://socket-proxy:2375", "WATCHTOWER_LOG_FORMAT": "bogus"},
+			want: docker.Docker{Host: "tcp://socket-proxy:2375"},
+		},
+		{
+			name: "empty api version env var",
+			env:  map[string]string{"DOCKER_API_VERSION": ""},
+			want: docker.Docker{Host: defaultHost},
+		},
+		{
+			name:        "http host with tls verification warns",
+			env:         map[string]string{"DOCKER_TLS_VERIFY": "1", "DOCKER_CERT_PATH": "/env/certs"},
+			flags:       []string{"--host", "http://example.com"},
+			want:        docker.Docker{Host: "http://example.com", TLSVerify: true, CertPath: "/env/certs"},
+			wantWarning: "TLS verification is enabled but DOCKER_HOST uses insecure scheme 'http://'. Consider using 'tcp://' or disable TLS verification.",
+		},
+		{
+			name:        "unix host with tls verification warns",
+			env:         map[string]string{"DOCKER_TLS_VERIFY": "1"},
+			want:        docker.Docker{Host: defaultHost, TLSVerify: true},
+			wantWarning: "TLS verification is enabled but DOCKER_HOST uses local socket 'unix://'. TLS is not applicable for local sockets. Consider disabling TLS verification.",
+		},
+		{
+			// Without a certificate path the client builds no TLS
+			// configuration and would send plain HTTP to the daemon.
+			name:    "tls verification without a certificate path fails",
+			env:     map[string]string{"DOCKER_HOST": "tcp://example.com:2376", "DOCKER_TLS_VERIFY": "1"},
+			wantErr: "tlsverify requires cert-path for a remote Docker host",
+		},
+		{
+			name:    "https host with tls verification and no certificate path fails",
+			env:     map[string]string{"DOCKER_HOST": "https://example.com:2376", "DOCKER_TLS_VERIFY": "1"},
+			wantErr: "tlsverify requires cert-path for a remote Docker host",
+		},
+		{
+			// Startup rejects this value, so the exit path must not read it as false.
+			name:    "unparsable tls verify env var fails",
+			env:     map[string]string{"DOCKER_TLS_VERIFY": "yes"},
+			wantErr: `tlsverify: parse bool: strconv.ParseBool: parsing "yes": invalid syntax`,
+		},
+		{
+			name:     "unregistered flags fail",
+			register: func(*cobra.Command) {},
+			wantErr:  "read host:",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, key := range []string{"DOCKER_HOST", "DOCKER_TLS_VERIFY", "DOCKER_API_VERSION", "DOCKER_CERT_PATH"} {
+				t.Setenv(key, "")
+				require.NoError(t, os.Unsetenv(key))
+			}
+
+			for key, value := range tc.env {
+				t.Setenv(key, value)
+			}
+
+			cmd := new(cobra.Command)
+			if tc.register != nil {
+				tc.register(cmd)
+			} else {
+				RegisterAll(cmd)
+			}
+
+			require.NoError(t, cmd.ParseFlags(tc.flags))
+
+			var logOutput bytes.Buffer
+
+			got, err := LoadDocker(testLoggerAt(&logOutput, logging.InfoLevel), cmd)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+
+			if tc.wantWarning != "" {
+				assert.Contains(t, logOutput.String(), tc.wantWarning)
+			} else {
+				assert.Empty(t, logOutput.String())
+			}
+		})
+	}
 }
 
 func TestLoadClient(t *testing.T) {
-	vCfg, _, _ := bindLoad(t, "--include-stopped", "--include-restarting", "--revive-stopped", "--remove-volumes", "--warn-on-head-failure", "always")
+	values := parsedValues(t, "--include-stopped", "--include-restarting", "--revive-stopped", "--remove-volumes", "--warn-on-head-failure", "always")
 
-	got := loadClient(vCfg)
+	got := loadClient(values)
 	assert.True(t, got.IncludeStopped)
 	assert.True(t, got.IncludeRestarting)
 	assert.True(t, got.ReviveStopped)
@@ -284,26 +445,26 @@ func TestLoadClient(t *testing.T) {
 }
 
 func TestLoadCompat(t *testing.T) {
-	vCfg, _, _ := bindLoad(t, "--disable-memory-swappiness", "--cpu-copy-mode", "none")
+	values := parsedValues(t, "--disable-memory-swappiness", "--cpu-copy-mode", "none")
 
-	got := loadCompat(vCfg)
+	got := loadCompat(values)
 	assert.True(t, got.DisableMemorySwappiness)
 	assert.Equal(t, "none", got.CPUCopyMode)
 }
 
 func TestLoadSchedule(t *testing.T) {
-	vCfg, _, _ := bindLoad(t, "--interval", "120", "--schedule", "0 0 * * *", "--update-on-start")
+	values := parsedValues(t, "--interval", "120", "--schedule", "0 0 * * *", "--update-on-start")
 
-	got := loadSchedule(vCfg)
+	got := loadSchedule(values)
 	assert.Equal(t, 120, got.IntervalSeconds)
 	assert.Equal(t, "0 0 * * *", got.Spec)
 	assert.True(t, got.UpdateOnStart)
 }
 
 func TestLoadMode(t *testing.T) {
-	vCfg, _, _ := bindLoad(t, "--run-once", "--health-check", "--porcelain", "v1", "--self-update-orchestrator", "--no-startup-message")
+	values := parsedValues(t, "--run-once", "--health-check", "--porcelain", "v1", "--self-update-orchestrator", "--no-startup-message")
 
-	got := loadMode(vCfg)
+	got := loadMode(values)
 	assert.True(t, got.RunOnce)
 	assert.True(t, got.HealthCheck)
 	assert.Equal(t, "v1", got.Porcelain)
@@ -313,13 +474,13 @@ func TestLoadMode(t *testing.T) {
 
 func TestLoadUpdate(t *testing.T) {
 	t.Run("flags", func(t *testing.T) {
-		vCfg, flagSet, _ := bindLoad(t,
+		values := parsedValues(t,
 			"--cleanup", "--no-pull", "--no-restart", "--monitor-only", "--rolling-restart",
 			"--stop-timeout", "45s", "--cooldown-delay", "2h",
 			"--use-compose-depends-on", "--label-take-precedence", "--ephemeral-self-update",
 		)
 
-		got, err := loadUpdate(newNopLogger(), vCfg, flagSet)
+		got, err := loadUpdate(newNopLogger(), values)
 		require.NoError(t, err)
 		assert.True(t, got.Cleanup)
 		assert.True(t, got.NoPull)
@@ -334,71 +495,71 @@ func TestLoadUpdate(t *testing.T) {
 	})
 
 	t.Run("empty cooldown", func(t *testing.T) {
-		vCfg, flagSet, _ := bindLoad(t)
-		got, err := loadUpdate(newNopLogger(), vCfg, flagSet)
+		values := parsedValues(t)
+		got, err := loadUpdate(newNopLogger(), values)
 		require.NoError(t, err)
 		assert.Equal(t, time.Duration(0), got.CooldownDelay)
 	})
 
 	t.Run("subsecond timeout", func(t *testing.T) {
-		vCfg, flagSet, _ := bindLoad(t, "--stop-timeout", "500ms")
-		got, err := loadUpdate(newNopLogger(), vCfg, flagSet)
+		values := parsedValues(t, "--stop-timeout", "500ms")
+		got, err := loadUpdate(newNopLogger(), values)
 		require.NoError(t, err)
 		assert.Equal(t, 500*time.Millisecond, got.StopTimeout)
 	})
 
 	t.Run("invalid cooldown", func(t *testing.T) {
-		vCfg, flagSet, _ := bindLoad(t, "--cooldown-delay", "nope")
-		_, err := loadUpdate(newNopLogger(), vCfg, flagSet)
+		values := parsedValues(t, "--cooldown-delay", "nope")
+		_, err := loadUpdate(newNopLogger(), values)
 		require.Error(t, err)
 		assert.ErrorContains(t, err, "cooldown-delay:")
 	})
 
 	t.Run("negative cooldown", func(t *testing.T) {
 		// units.ParseDuration rejects a leading '-'.
-		vCfg, flagSet, _ := bindLoad(t, "--cooldown-delay", "-2d")
-		_, err := loadUpdate(newNopLogger(), vCfg, flagSet)
+		values := parsedValues(t, "--cooldown-delay", "-2d")
+		_, err := loadUpdate(newNopLogger(), values)
 		require.Error(t, err)
 		assert.ErrorContains(t, err, "cooldown-delay:")
 	})
 }
 
 func TestLoadLifecycle(t *testing.T) {
-	vCfg, _, _ := bindLoad(t, "--enable-lifecycle-hooks", "--lifecycle-uid", "1000", "--lifecycle-gid", "1001")
+	values := parsedValues(t, "--enable-lifecycle-hooks", "--lifecycle-uid", "1000", "--lifecycle-gid", "1001")
 
-	got := loadLifecycle(vCfg)
+	got := loadLifecycle(values)
 	assert.True(t, got.Enabled)
 	assert.Equal(t, 1000, got.UID)
 	assert.Equal(t, 1001, got.GID)
 }
 
+// TestNormalizedStringSlice verifies that normalizedStringSlice applies the
+// transform to each element of a list flag and reads an unset list as empty.
 func TestNormalizedStringSlice(t *testing.T) {
-	t.Run("lowercases values", func(t *testing.T) {
-		vCfg, flagSet, _ := bindLoad(t, "--disable-containers", "/Foo,Bar")
+	t.Parallel()
 
-		got := normalizedStringSlice(
-			vCfg, flagSet, "disable-containers",
-			[]string{"WATCHTOWER_DISABLE_CONTAINERS"},
-			strings.ToLower,
-		)
+	t.Run("lowercases values", func(t *testing.T) {
+		t.Parallel()
+
+		values := parsedValues(t, "--disable-containers", "/Foo,Bar")
+
+		got := normalizedStringSlice(values, "disable-containers", strings.ToLower)
 		assert.Equal(t, []string{"/foo", "bar"}, got)
 	})
 
 	t.Run("empty when unset", func(t *testing.T) {
-		vCfg, flagSet, _ := bindLoad(t)
+		t.Parallel()
 
-		got := normalizedStringSlice(
-			vCfg, flagSet, "disable-containers",
-			[]string{"WATCHTOWER_DISABLE_CONTAINERS"},
-			strings.ToLower,
-		)
+		values := parsedValues(t)
+
+		got := normalizedStringSlice(values, "disable-containers", strings.ToLower)
 		assert.Empty(t, got)
 	})
 }
 
 func TestLoadFilter(t *testing.T) {
 	t.Run("names and lists", func(t *testing.T) {
-		vCfg, flagSet, _ := bindLoad(t,
+		values := parsedValues(t,
 			"--label-enable",
 			"--disable-containers", "/SkipMe",
 			"--monitor-image-names", "nginx*",
@@ -408,7 +569,7 @@ func TestLoadFilter(t *testing.T) {
 			"--scope", "prod",
 		)
 
-		got, err := loadFilter(newNopLogger(), vCfg, flagSet, []string{"/App"})
+		got, err := loadFilter(newNopLogger(), values, []string{"/App"})
 		require.NoError(t, err)
 		assert.True(t, got.LabelEnable)
 		assert.Equal(t, []string{"SkipMe"}, got.DisableContainers)
@@ -423,8 +584,8 @@ func TestLoadFilter(t *testing.T) {
 	})
 
 	t.Run("invalid label pair", func(t *testing.T) {
-		vCfg, flagSet, _ := bindLoad(t, "--disable-containers-by-label", "broken")
-		_, err := loadFilter(newNopLogger(), vCfg, flagSet, nil)
+		values := parsedValues(t, "--disable-containers-by-label", "broken")
+		_, err := loadFilter(newNopLogger(), values, nil)
 		require.Error(t, err)
 		assert.ErrorContains(t, err, "build filter:")
 	})
@@ -440,13 +601,13 @@ func TestLoadRegistry(t *testing.T) {
 		t.Setenv("WATCHTOWER_COOLDOWN_PLATFORM_ARCH", "arm")
 		t.Setenv("WATCHTOWER_COOLDOWN_PLATFORM_VARIANT", "v7")
 
-		vCfg, _, _ := bindLoad(t, "--registry-tls-skip", "--registry-tls-min-version", "1.3")
+		values := parsedValues(t, "--registry-tls-skip", "--registry-tls-min-version", "1.3")
 
 		assert.Equal(t, registry.Registry{
 			CooldownPlatform: registry.Platform{OS: "windows", Architecture: "arm", Variant: "v7"},
 			TLSMinVersion:    "1.3",
 			TLSSkip:          true,
-		}, loadRegistry(vCfg))
+		}, loadRegistry(values))
 	})
 
 	t.Run("unset", func(t *testing.T) {
@@ -459,15 +620,15 @@ func TestLoadRegistry(t *testing.T) {
 			require.NoError(t, os.Unsetenv(key))
 		}
 
-		vCfg, _, _ := bindLoad(t)
+		values := parsedValues(t)
 
-		assert.Equal(t, registry.Registry{TLSMinVersion: "TLS1.2"}, loadRegistry(vCfg))
+		assert.Equal(t, registry.Registry{TLSMinVersion: "TLS1.2"}, loadRegistry(values))
 	})
 }
 
 func TestLoadAPI(t *testing.T) {
 	t.Run("all fields", func(t *testing.T) {
-		vCfg, flagSet, _ := bindLoad(t,
+		values := parsedValues(t,
 			"--http-api-endpoints", "health,update",
 			"--http-api-update", "--http-api-metrics", "--http-api-containers",
 			"--http-api-host", "127.0.0.1", "--http-api-port", "8080",
@@ -480,7 +641,7 @@ func TestLoadAPI(t *testing.T) {
 			"--http-api-check-timeout", "5s", "--http-api-update-timeout", "10s",
 		)
 
-		got := loadAPI(vCfg, flagSet)
+		got := loadAPI(values)
 		assert.Equal(t, []string{"health", "update"}, got.Endpoints)
 		assert.True(t, got.LegacyUpdate)
 		assert.True(t, got.LegacyMetrics)
@@ -506,9 +667,9 @@ func TestLoadAPI(t *testing.T) {
 	})
 
 	t.Run("unchanged flags", func(t *testing.T) {
-		vCfg, flagSet, _ := bindLoad(t)
+		values := parsedValues(t)
 
-		got := loadAPI(vCfg, flagSet)
+		got := loadAPI(values)
 		assert.False(t, got.HostChanged)
 		assert.False(t, got.PortChanged)
 		assert.False(t, got.RateLimitChanged)
@@ -521,7 +682,7 @@ func TestLoadAPI(t *testing.T) {
 }
 
 func TestLoadNotify(t *testing.T) {
-	vCfg, flagSet, _ := bindLoad(t,
+	values := parsedValues(t,
 		"--notification-url", "gotify://example/token",
 		"--notifications", "email,slack",
 		"--notifications-level", "debug",
@@ -554,7 +715,7 @@ func TestLoadNotify(t *testing.T) {
 		"--notification-gotify-tls-skip-verify",
 	)
 
-	got := loadNotify(vCfg, flagSet)
+	got := loadNotify(values)
 	assert.Equal(t, []string{"gotify://example/token"}, got.URLs)
 	assert.Equal(t, []string{"email", "slack"}, got.LegacyTypes)
 	assert.Equal(t, "debug", got.Level)
@@ -589,8 +750,8 @@ func TestLoadNotify(t *testing.T) {
 
 func TestLoadLogging(t *testing.T) {
 	t.Run("explicit format", func(t *testing.T) {
-		vCfg, flagSet, _ := bindLoad(t, "--log-format", "json", "--log-level", "debug", "--debug", "--trace", "--no-color")
-		got := loadLogging(vCfg, flagSet)
+		values := parsedValues(t, "--log-format", "json", "--log-level", "debug", "--debug", "--trace", "--no-color")
+		got := loadLogging(values)
 		assert.Equal(t, "json", got.Format)
 		assert.Equal(t, "debug", got.Level)
 		assert.True(t, got.Debug)
@@ -599,13 +760,11 @@ func TestLoadLogging(t *testing.T) {
 	})
 
 	t.Run("empty format becomes auto", func(t *testing.T) {
-		vCfg := viper.New()
-		vCfg.Set("log-format", "")
-		vCfg.Set("log-level", "warn")
-		got := loadLogging(vCfg, pflag.NewFlagSet("empty", pflag.ContinueOnError))
+		values := parsedValues(t, "--log-format=", "--log-level", "warn")
+		got := loadLogging(values)
 		assert.Equal(t, "auto", got.Format)
 		assert.Equal(t, "warn", got.Level)
-		assert.False(t, got.NoColor, "a missing no-color flag must not enable no-color")
+		assert.False(t, got.NoColor)
 	})
 }
 
@@ -642,7 +801,7 @@ func TestLoadGit(t *testing.T) {
 		bundle := filepath.Join(dir, "ca.pem")
 		require.NoError(t, os.WriteFile(bundle, []byte("pem"), 0o600))
 
-		vCfg, flagSet, _ := bindLoad(t,
+		values := parsedValues(t,
 			"--git-enable",
 			"--git-image", "myapp:latest=https://github.com/org/app.git#main@minor",
 			"--git-timeout", "45s",
@@ -659,7 +818,7 @@ func TestLoadGit(t *testing.T) {
 			"--compose-project", "web=/srv/web",
 		)
 
-		got, err := loadGit(vCfg, flagSet)
+		got, err := loadGit(values)
 		require.NoError(t, err)
 		assert.True(t, got.Enable)
 		assert.Equal(t, git.DefaultRef, got.DefaultRef)
@@ -680,8 +839,8 @@ func TestLoadGit(t *testing.T) {
 	})
 
 	t.Run("defaults", func(t *testing.T) {
-		vCfg, flagSet, _ := bindLoad(t)
-		got, err := loadGit(vCfg, flagSet)
+		values := parsedValues(t)
+		got, err := loadGit(values)
 		require.NoError(t, err)
 		assert.False(t, got.Enable)
 		assert.Equal(t, git.DefaultRef, got.DefaultRef)
@@ -692,22 +851,22 @@ func TestLoadGit(t *testing.T) {
 	})
 
 	t.Run("invalid image", func(t *testing.T) {
-		vCfg, flagSet, _ := bindLoad(t, "--git-image", "nope")
-		_, err := loadGit(vCfg, flagSet)
+		values := parsedValues(t, "--git-image", "nope")
+		_, err := loadGit(values)
 		require.ErrorIs(t, err, git.ErrInvalidGitImage)
 		assert.ErrorContains(t, err, "git-image:")
 	})
 
 	t.Run("invalid compose project", func(t *testing.T) {
-		vCfg, flagSet, _ := bindLoad(t, "--compose-project", "nopair")
-		_, err := loadGit(vCfg, flagSet)
+		values := parsedValues(t, "--compose-project", "nopair")
+		_, err := loadGit(values)
 		require.ErrorIs(t, err, git.ErrInvalidComposeProject)
 		assert.ErrorContains(t, err, "compose-project:")
 	})
 
 	t.Run("missing ca bundle", func(t *testing.T) {
-		vCfg, flagSet, _ := bindLoad(t, "--git-ca-bundle", filepath.Join(t.TempDir(), "missing.pem"))
-		_, err := loadGit(vCfg, flagSet)
+		values := parsedValues(t, "--git-ca-bundle", filepath.Join(t.TempDir(), "missing.pem"))
+		_, err := loadGit(values)
 		require.Error(t, err)
 		assert.ErrorContains(t, err, "git-ca-bundle:")
 	})
@@ -760,19 +919,85 @@ func TestValidate(t *testing.T) {
 	})
 }
 
-func TestFlagChanged(t *testing.T) {
-	t.Run("missing flag", func(t *testing.T) {
-		flagSet := pflag.NewFlagSet("test", pflag.ContinueOnError)
-		assert.False(t, flagChanged(flagSet, "http-api-host"))
-	})
+// Test_flagValues_reads verifies that flagValues reads each kind of setting
+// from the prepared flags, which hold the command-line value or, for a flag
+// the command line left unset, the environment value.
+func Test_flagValues_reads(t *testing.T) {
+	t.Setenv("WATCHTOWER_CLEANUP", "true")
+	t.Setenv("WATCHTOWER_SCOPE", "env-scope")
+	t.Setenv("WATCHTOWER_HTTP_API_CHECK_TIMEOUT", "7s")
+	t.Setenv("WATCHTOWER_DISABLE_CONTAINERS", "db")
+	t.Setenv("WATCHTOWER_POLL_INTERVAL", "010")
 
-	t.Run("unchanged", func(t *testing.T) {
-		_, flagSet, _ := bindLoad(t)
-		assert.False(t, flagChanged(flagSet, "http-api-host"))
-	})
+	cmd := newTestCommand()
+	parseWithEnv(t, cmd, "--scope", "cli-scope", "--disable-containers", "web")
 
-	t.Run("changed", func(t *testing.T) {
-		_, flagSet, _ := bindLoad(t, "--http-api-host", "127.0.0.1")
-		assert.True(t, flagChanged(flagSet, "http-api-host"))
-	})
+	values := &flagValues{flags: cmd.PersistentFlags()}
+
+	assert.True(t, values.Bool("cleanup"), "the environment fills an unset flag")
+	assert.Equal(t, "cli-scope", values.String("scope"), "the command line wins")
+	assert.Equal(t, 7*time.Second, values.Duration("http-api-check-timeout"))
+	assert.Equal(t, []string{"web"}, values.Strings("disable-containers"))
+	assert.Equal(t, 10, values.Int("interval"), "an environment integer is decimal")
+	require.NoError(t, values.err)
+}
+
+// Test_flagValues_Strings_emptyWhenUnset verifies that an unset list reads as
+// an empty list rather than nil.
+func Test_flagValues_Strings_emptyWhenUnset(t *testing.T) {
+	t.Parallel()
+
+	values := parsedValues(t)
+
+	got := values.Strings("notification-url")
+	require.NotNil(t, got)
+	assert.Empty(t, got)
+}
+
+// Test_flagValues_Strings_returnsCopy verifies that changing the returned list
+// leaves the flag's own value alone, since callers normalize the elements in
+// place.
+func Test_flagValues_Strings_returnsCopy(t *testing.T) {
+	t.Parallel()
+
+	values := parsedValues(t, "--disable-containers", "web")
+
+	list := values.Strings("disable-containers")
+	list[0] = "changed"
+
+	assert.Equal(t, []string{"web"}, values.Strings("disable-containers"))
+}
+
+// Test_flagValues_failedRead verifies that reading a flag that is not
+// registered, or not registered with the expected type, returns the zero value
+// and keeps the first failure, so Load can report a misspelled setting name.
+func Test_flagValues_failedRead(t *testing.T) {
+	t.Parallel()
+
+	values := parsedValues(t)
+
+	assert.Empty(t, values.String("not-registered"))
+	assert.False(t, values.Bool("scope"), "scope is a string flag")
+	assert.Zero(t, values.Duration("cleanup"))
+	assert.Zero(t, values.Int("scope"))
+	assert.Equal(t, []string{}, values.Strings("scope"))
+
+	require.Error(t, values.err)
+	assert.ErrorContains(t, values.err, "read not-registered:")
+}
+
+// Test_flagValues_Strings_failedRead verifies which error a list read keeps
+// for a flag that is missing or is not a list.
+func Test_flagValues_Strings_failedRead(t *testing.T) {
+	t.Parallel()
+
+	flagSet := newParsedCommand(t).PersistentFlags()
+
+	missing := &flagValues{flags: flagSet}
+	assert.Equal(t, []string{}, missing.Strings("not-registered"))
+	require.ErrorIs(t, missing.err, errFlagNotRegistered)
+
+	notAList := &flagValues{flags: flagSet}
+	assert.Equal(t, []string{}, notAList.Strings("scope"))
+	require.ErrorIs(t, notAList.err, errUnsupportedFlagKind)
 }

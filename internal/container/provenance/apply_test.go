@@ -1,10 +1,13 @@
 package provenance
 
 import (
+	"maps"
+	"slices"
 	"testing"
 
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/nicholas-fedor/watchtower/internal/container/labels"
 	"github.com/nicholas-fedor/watchtower/internal/git/semver"
@@ -197,10 +200,10 @@ func TestGitWrappers(t *testing.T) {
 		t.Run("is a no-op for a nil container or empty repo", func(t *testing.T) {
 			t.Parallel()
 
-			ApplyGitAssociation(nil, Association{Repo: "https://github.com/org/app.git"}, true)
+			ApplyGitAssociation(nil, Association{Repo: "https://github.com/org/app.git"})
 
 			c := modelfixture.Container()
-			ApplyGitAssociation(c, Association{}, true)
+			ApplyGitAssociation(c, Association{})
 			assert.NotContains(t, c.ContainerInfo().Config.Labels, labels.GitRepo)
 		})
 
@@ -209,13 +212,14 @@ func TestGitWrappers(t *testing.T) {
 
 			c := modelfixture.Container()
 			ApplyGitAssociation(c, Association{
-				Repo:       "https://github.com/org/app.git",
-				Ref:        "main",
-				Policy:     semver.PolicyPatch,
-				Host:       "https://git.example.com:3000",
-				Dockerfile: "build/docker/Dockerfile",
-				Context:    ".",
-			}, true)
+				Repo:         "https://github.com/org/app.git",
+				Ref:          "main",
+				Policy:       semver.PolicyPatch,
+				Host:         "https://git.example.com:3000",
+				Dockerfile:   "build/docker/Dockerfile",
+				Context:      ".",
+				persistWatch: true,
+			})
 
 			assert.Equal(t, map[string]string{
 				labels.GitRepo:         "https://github.com/org/app.git",
@@ -232,7 +236,7 @@ func TestGitWrappers(t *testing.T) {
 			t.Parallel()
 
 			c := modelfixture.Container()
-			ApplyGitAssociation(c, Association{Repo: "../repos/app", Ref: "main"}, true)
+			ApplyGitAssociation(c, Association{Repo: "../repos/app", Ref: "main"})
 
 			repo, ok := c.GetLabel(labels.GitRepo)
 			assert.True(t, ok)
@@ -243,27 +247,27 @@ func TestGitWrappers(t *testing.T) {
 			t.Parallel()
 
 			sshContainer := modelfixture.Container()
-			ApplyGitAssociation(sshContainer, Association{Repo: "ssh://git@git.example.com/org/app.git"}, true)
+			ApplyGitAssociation(sshContainer, Association{Repo: "ssh://git@git.example.com/org/app.git"})
 			sshRepo, ok := sshContainer.GetLabel(labels.GitRepo)
 			assert.True(t, ok)
 			assert.Equal(t, "ssh://git@git.example.com/org/app.git", sshRepo)
 
 			pathContainer := modelfixture.Container()
-			ApplyGitAssociation(pathContainer, Association{Repo: "/srv/repos/app?release=1"}, true)
+			ApplyGitAssociation(pathContainer, Association{Repo: "/srv/repos/app?release=1"})
 			pathRepo, ok := pathContainer.GetLabel(labels.GitRepo)
 			assert.True(t, ok)
 			assert.Equal(t, "/srv/repos/app?release=1", pathRepo)
 		})
 
-		t.Run("redacts credentials and query tokens before persisting labels", func(t *testing.T) {
+		t.Run("redacts credentials before persisting labels", func(t *testing.T) {
 			t.Parallel()
 
 			c := modelfixture.Container()
 			ApplyGitAssociation(c, Association{
 				Repo: "https://user:secret@github.com/org/app.git?access_token=query#main",
-				Host: "https://git.example.com:3000?token=host-secret",
+				Host: "https://user:host-secret@git.example.com:3000",
 				Ref:  "main",
-			}, true)
+			})
 
 			repo, ok := c.GetLabel(labels.GitRepo)
 			assert.True(t, ok)
@@ -282,7 +286,7 @@ func TestGitWrappers(t *testing.T) {
 			c := modelfixture.Container(containerfixture.WithLabels(map[string]string{
 				labels.GitRepo: "https://user:secret@github.com/org/app.git",
 			}))
-			ApplyGitAssociation(c, Association{Repo: "://invalid"}, true)
+			ApplyGitAssociation(c, Association{Repo: "://invalid"})
 
 			_, ok := c.GetLabel(labels.GitRepo)
 			assert.False(t, ok)
@@ -302,24 +306,118 @@ func TestGitWrappers(t *testing.T) {
 				PolicyFromDefault:     true,
 				DockerfileFromDefault: true,
 				ContextFromDefault:    true,
-			}, false)
+			})
 
 			assert.Equal(t, map[string]string{
 				labels.GitRepo: "https://github.com/org/app.git",
 			}, c.ContainerInfo().Config.Labels)
 		})
 
-		t.Run("omits empty optional fields and does not force watch", func(t *testing.T) {
+		t.Run("omits empty optional fields and removes stale labels", func(t *testing.T) {
 			t.Parallel()
 
-			c := modelfixture.Container()
-			c.SetLabel(labels.GitRef, "old")
-			c.SetLabel(labels.GitWatch, "true")
-			ApplyGitAssociation(c, Association{Repo: "https://github.com/org/app.git"}, false)
+			c := modelfixture.Container(containerfixture.WithLabels(map[string]string{
+				labels.GitRepo:         "https://github.com/org/old.git",
+				labels.GitRef:          "old",
+				labels.GitSemverPolicy: semver.PolicyMajor,
+				labels.GitHost:         "https://old.example.com",
+				labels.GitDockerfile:   "old/Dockerfile",
+				labels.GitContext:      "old",
+			}))
+			ApplyGitAssociation(c, Association{Repo: "https://github.com/org/app.git"})
 
 			assert.Equal(t, map[string]string{
 				labels.GitRepo: "https://github.com/org/app.git",
 			}, c.ContainerInfo().Config.Labels)
 		})
+
+		// The source container's own git-watch label decides whether the
+		// replacement carries git-watch=true. Only an enabling value persists,
+		// so the git-enable configuration option keeps applying otherwise.
+		t.Run("persists only an enabling git-watch label", func(t *testing.T) {
+			t.Parallel()
+
+			tests := []struct {
+				name      string
+				watch     string
+				present   bool
+				wantWatch bool
+			}{
+				{name: "absent"},
+				{name: "true", watch: "true", present: true, wantWatch: true},
+				{name: "yes", watch: " YES ", present: true, wantWatch: true},
+				{name: "false", watch: "false", present: true},
+				{name: "unknown", watch: "maybe", present: true},
+				{name: "blank", watch: " ", present: true},
+			}
+
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					t.Parallel()
+
+					sourceLabels := map[string]string{labels.GitRepo: "https://github.com/org/app.git"}
+					if tt.present {
+						sourceLabels[labels.GitWatch] = tt.watch
+					}
+
+					c := modelfixture.Container(containerfixture.WithLabels(sourceLabels))
+					assoc, ok := ResolveAssociation(c, gitConfig.Defaults{})
+					require.True(t, ok)
+					ApplyGitAssociation(c, assoc)
+
+					watch, ok := c.GetLabel(labels.GitWatch)
+					assert.Equal(t, tt.wantWatch, ok)
+
+					if tt.wantWatch {
+						assert.Equal(t, "true", watch)
+					}
+				})
+			}
+		})
+	})
+}
+
+// TestAssociation_Labels covers the cases where no association is written and
+// checks that ApplyGitAssociation clears every label Labels can write. The
+// ApplyGitAssociation cases cover each label's value.
+func TestAssociation_Labels(t *testing.T) {
+	t.Parallel()
+
+	t.Run("returns nil without a repository", func(t *testing.T) {
+		t.Parallel()
+
+		assert.Nil(t, Association{Ref: "main"}.Labels())
+	})
+
+	t.Run("returns nil when the repository cannot be redacted", func(t *testing.T) {
+		t.Parallel()
+
+		assert.Nil(t, Association{Repo: "://invalid", Ref: "main"}.Labels())
+	})
+
+	t.Run("omits a host that is not an API origin", func(t *testing.T) {
+		t.Parallel()
+
+		got := Association{Repo: "https://github.com/org/app.git", Host: "git.example.com=gitea"}.Labels()
+		assert.NotContains(t, got, labels.GitHost)
+	})
+
+	// ApplyGitAssociation clears a fixed list of labels before writing. A label
+	// Labels writes that the list leaves out would survive from the previous
+	// association.
+	t.Run("writes only labels that ApplyGitAssociation clears", func(t *testing.T) {
+		t.Parallel()
+
+		got := Association{
+			Repo:         "https://github.com/org/app.git",
+			Ref:          "main",
+			Policy:       semver.PolicyPatch,
+			Host:         "https://git.example.com",
+			Dockerfile:   "Dockerfile",
+			Context:      ".",
+			persistWatch: true,
+		}.Labels()
+
+		assert.ElementsMatch(t, associationLabelKeys, slices.Collect(maps.Keys(got)))
 	})
 }

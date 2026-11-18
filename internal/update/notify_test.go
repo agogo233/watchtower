@@ -16,9 +16,10 @@ import (
 
 	dockerContainer "github.com/moby/moby/api/types/container"
 
-	mockContainerClient "github.com/nicholas-fedor/watchtower/internal/container/client/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/container"
 	"github.com/nicholas-fedor/watchtower/internal/container/filters"
 	"github.com/nicholas-fedor/watchtower/internal/container/labels"
+	"github.com/nicholas-fedor/watchtower/internal/container/provenance"
 	"github.com/nicholas-fedor/watchtower/internal/observability/events"
 	"github.com/nicholas-fedor/watchtower/internal/observability/metrics"
 	"github.com/nicholas-fedor/watchtower/internal/observability/notify/format"
@@ -31,7 +32,6 @@ import (
 	mockUpdate "github.com/nicholas-fedor/watchtower/internal/update/mocks"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/internal/update/state"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // defaultTestUpdateParams returns a complete [updateParams.Params] snapshot for tests.
@@ -41,7 +41,7 @@ import (
 //
 // Returns:
 //   - updateParams.Params: The default policy for tests that set none of their own.
-func defaultTestUpdateParams(filter types.Filter) updateParams.Params {
+func defaultTestUpdateParams(filter filters.Filter) updateParams.Params {
 	return updateParams.Params{
 		Filter:       filter,
 		Timeout:      time.Minute,
@@ -61,7 +61,7 @@ func TestRunUpdatesWithNotifications_ScanCompletedCounts(t *testing.T) {
 
 	// cycleMember returns a stale container that depends on the next member
 	// of a three-container cycle. The session skips every member.
-	cycleMember := func(name, dependsOn string) types.Container {
+	cycleMember := func(name, dependsOn string) *container.Container {
 		return mockUpdate.CreateMockContainerWithConfig(
 			name,
 			"/"+name,
@@ -76,9 +76,9 @@ func TestRunUpdatesWithNotifications_ScanCompletedCounts(t *testing.T) {
 		)
 	}
 
-	client := mockUpdate.CreateMockClient(
+	client := mockUpdate.CreateFakeClient(
 		&mockUpdate.TestData{
-			Containers: []types.Container{
+			Containers: []*container.Container{
 				cycleMember("cycle-a", "cycle-b"),
 				cycleMember("cycle-b", "cycle-c"),
 				cycleMember("cycle-c", "cycle-a"),
@@ -130,6 +130,52 @@ func TestRunUpdatesWithNotifications_ScanCompletedCounts(t *testing.T) {
 	}, received[1].Data)
 }
 
+// TestRunUpdatesWithNotifications_StoppingProcessMakesNoUpdate verifies that a
+// session started after the process was told to stop does nothing and returns
+// no metric, so it is not reported as a failed scan. The client and notifier
+// mocks fail on any call.
+func TestRunUpdatesWithNotifications_StoppingProcessMakesNoUpdate(t *testing.T) {
+	t.Parallel()
+
+	broadcaster := events.NewBroadcaster()
+	published, _ := broadcaster.SubscribeWithDone()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	metric := RunUpdatesWithNotifications(ctx, RunUpdatesWithNotificationsParams{
+		Logger:           newTestLogger(t),
+		Client:           newMockClient(t),
+		Notifier:         mockUpdate.NewMockNotifier(t),
+		EventBroadcaster: broadcaster,
+		Update:           defaultTestUpdateParams(filters.NoFilter),
+	})
+
+	assert.Nil(t, metric, "a stopping process returned a scan metric")
+	assert.Empty(t, published, "a stopping process published a scan event")
+}
+
+// TestRunUpdatesWithNotifications_PassedDeadlineStillRuns verifies that a
+// session whose deadline has already passed still runs and reports its scan.
+// Only a stopped process cancels its context. A deadline that passes first,
+// such as an HTTP API request that waited for the update lock longer than its
+// timeout, is a failure the caller should see.
+func TestRunUpdatesWithNotifications_PassedDeadlineStillRuns(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	metric := RunUpdatesWithNotifications(ctx, RunUpdatesWithNotificationsParams{
+		Logger: newTestLogger(t),
+		Client: mockUpdate.CreateFakeClient(&mockUpdate.TestData{}, false, false),
+		Update: defaultTestUpdateParams(filters.NoFilter),
+	})
+
+	require.NotNil(t, metric, "a session past its deadline returned no scan metric")
+	assert.True(t, metric.ScanFailed, "a session past its deadline did not report a failed scan")
+}
+
 // TestRunUpdatesWithNotifications_PanicEndsSession verifies that a panic during
 // an update session ends it as an update error does. The panic is logged at
 // error without notify=no, so the notification hook takes it. The session's
@@ -142,9 +188,9 @@ func TestRunUpdatesWithNotifications_PanicEndsSession(t *testing.T) {
 
 	log, output := logcapture.New(zerolog.DebugLevel)
 
-	client := mockContainerClient.NewMockClient(t)
+	client := newMockClient(t)
 	client.EXPECT().ListContainers(mock.Anything, mock.Anything).
-		RunAndReturn(func(context.Context, ...types.Filter) ([]types.Container, error) {
+		RunAndReturn(func(context.Context, ...filters.Filter) ([]*container.Container, error) {
 			panic("boom")
 		}).Once()
 
@@ -259,9 +305,9 @@ func TestRunUpdates(t *testing.T) {
 			t.Run("should not start notification batching", func(t *testing.T) {
 				t.Parallel()
 
-				client := mockUpdate.CreateMockClient(
+				client := mockUpdate.CreateFakeClient(
 					&mockUpdate.TestData{
-						Containers: []types.Container{
+						Containers: []*container.Container{
 							mockUpdate.CreateMockContainer(
 								"test-container",
 								"test-container",
@@ -297,9 +343,9 @@ func TestRunUpdates(t *testing.T) {
 			t.Run("should handle notification split by container", func(t *testing.T) {
 				t.Parallel()
 
-				client := mockUpdate.CreateMockClient(
+				client := mockUpdate.CreateFakeClient(
 					&mockUpdate.TestData{
-						Containers: []types.Container{
+						Containers: []*container.Container{
 							mockUpdate.CreateMockContainerWithConfig(
 								"test-container",
 								"test-container",
@@ -342,9 +388,9 @@ func TestRunUpdates(t *testing.T) {
 			t.Run("should return zero metric when container list is empty", func(t *testing.T) {
 				t.Parallel()
 
-				client := mockUpdate.CreateMockClient(
+				client := mockUpdate.CreateFakeClient(
 					&mockUpdate.TestData{
-						Containers: []types.Container{},
+						Containers: []*container.Container{},
 						Staleness:  map[string]bool{},
 					},
 					false,
@@ -402,9 +448,9 @@ func TestRunUpdates(t *testing.T) {
 					watchtowerConfig,
 				)
 
-				client := mockUpdate.CreateMockClient(
+				client := mockUpdate.CreateFakeClient(
 					&mockUpdate.TestData{
-						Containers: []types.Container{container1, container2},
+						Containers: []*container.Container{container1, container2},
 						Staleness: map[string]bool{
 							"watchtower-1": true,
 							"watchtower-2": true,
@@ -415,7 +461,7 @@ func TestRunUpdates(t *testing.T) {
 				)
 
 				update := defaultTestUpdateParams(filters.NoFilter)
-				update.CurrentContainerID = types.ContainerID("container1-id")
+				update.CurrentContainerID = container.ContainerID("container1-id")
 
 				params := RunUpdatesWithNotificationsParams{
 					Logger:                       newTestLogger(t),
@@ -443,9 +489,9 @@ func TestRunUpdates(t *testing.T) {
 		t.Run("should execute update and return results", func(t *testing.T) {
 			t.Parallel()
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainer(
 							"test-container",
 							"test-container",
@@ -593,7 +639,7 @@ func TestRunUpdates(t *testing.T) {
 			t.Parallel()
 
 			unnamed := modelfixture.Container(containerfixture.WithName(""))
-			session := reportfixture.UpdatedReport(unnamed, "new_image_id")
+			session := reportfixture.UpdatedReport(unnamed, "new_image_id", provenance.ReportMeta{})
 			require.Len(t, session.Updated(), 1)
 
 			var batch sessionBatch
@@ -630,7 +676,7 @@ func TestRunUpdates(t *testing.T) {
 		t.Run("should return empty slice when cleanup is disabled", func(t *testing.T) {
 			t.Parallel()
 
-			client := mockUpdate.CreateMockClient(&mockUpdate.TestData{}, false, false)
+			client := mockUpdate.CreateFakeClient(&mockUpdate.TestData{}, false, false)
 			cleanedImages := performImageCleanup(newTestLogger(t), t.Context(), client, false, []cleanup.RemovedImageInfo{}, time.Minute)
 			assert.Empty(t, cleanedImages)
 		})
@@ -638,12 +684,12 @@ func TestRunUpdates(t *testing.T) {
 		t.Run("should perform cleanup when cleanup is enabled", func(t *testing.T) {
 			t.Parallel()
 
-			client := mockUpdate.CreateMockClient(&mockUpdate.TestData{}, false, false)
+			client := mockUpdate.CreateFakeClient(&mockUpdate.TestData{}, false, false)
 			cleanedImages := performImageCleanup(newTestLogger(t), t.Context(), client, true, []cleanup.RemovedImageInfo{
 				{
 					ContainerName: "test-container",
 					ImageName:     "test-image:v1.0",
-					ImageID:       types.ImageID("sha256:123"),
+					ImageID:       container.ImageID("sha256:123"),
 				},
 			}, time.Minute)
 			// The function should return the cleaned images when cleanup is enabled
@@ -654,7 +700,7 @@ func TestRunUpdates(t *testing.T) {
 		t.Run("should return a valid slice when cleanup input is empty", func(t *testing.T) {
 			t.Parallel()
 
-			client := mockUpdate.CreateMockClient(&mockUpdate.TestData{}, false, false)
+			client := mockUpdate.CreateFakeClient(&mockUpdate.TestData{}, false, false)
 			cleanedImages := performImageCleanup(newTestLogger(t), t.Context(), client, true, []cleanup.RemovedImageInfo{}, time.Minute)
 			// Should return a valid slice even with empty input
 			require.NotNil(t, cleanedImages)
@@ -663,7 +709,7 @@ func TestRunUpdates(t *testing.T) {
 		t.Run("should still remove images when the parent context is already canceled", func(t *testing.T) {
 			t.Parallel()
 
-			client := mockUpdate.CreateMockClient(&mockUpdate.TestData{}, false, false)
+			client := mockUpdate.CreateFakeClient(&mockUpdate.TestData{}, false, false)
 			ctx, cancel := context.WithCancel(t.Context())
 			cancel()
 
@@ -671,7 +717,7 @@ func TestRunUpdates(t *testing.T) {
 				{
 					ContainerName: "test-container",
 					ImageName:     "test-image:v1.0",
-					ImageID:       types.ImageID("sha256:123"),
+					ImageID:       container.ImageID("sha256:123"),
 				},
 			}, time.Minute)
 			require.Len(t, cleanedImages, 1)
@@ -773,8 +819,8 @@ func TestRunUpdates(t *testing.T) {
 			)
 
 			// Create separate container lists for each client
-			containersA := []types.Container{scopeAContainer}
-			containersB := []types.Container{scopeBContainer}
+			containersA := []*container.Container{scopeAContainer}
+			containersB := []*container.Container{scopeBContainer}
 
 			// Create separate test data for each client
 			testDataA := &mockUpdate.TestData{
@@ -791,9 +837,9 @@ func TestRunUpdates(t *testing.T) {
 				},
 			}
 
-			// Create mock clients for each scope
-			clientA := mockUpdate.CreateMockClient(testDataA, false, false)
-			clientB := mockUpdate.CreateMockClient(testDataB, false, false)
+			// Create a fake client for each scope
+			clientA := mockUpdate.CreateFakeClient(testDataA, false, false)
+			clientB := mockUpdate.CreateFakeClient(testDataB, false, false)
 
 			// Results channel to collect metrics from concurrent operations
 			results := make(chan *metrics.Metric, 2)
@@ -895,7 +941,7 @@ func TestRunUpdates(t *testing.T) {
 				},
 			)
 
-			allContainers := []types.Container{scope1Container, scope2Container}
+			allContainers := []*container.Container{scope1Container, scope2Container}
 
 			// Create separate test data for each client to track operations independently
 			testData1 := &mockUpdate.TestData{
@@ -914,8 +960,8 @@ func TestRunUpdates(t *testing.T) {
 				},
 			}
 
-			client1 := mockUpdate.CreateMockClient(testData1, false, false)
-			client2 := mockUpdate.CreateMockClient(testData2, false, false)
+			client1 := mockUpdate.CreateFakeClient(testData1, false, false)
+			client2 := mockUpdate.CreateFakeClient(testData2, false, false)
 
 			var wg sync.WaitGroup
 
@@ -999,7 +1045,7 @@ func TestRunUpdates(t *testing.T) {
 				},
 			)
 
-			allContainers := []types.Container{scopeAWatchtower, scopeBWatchtower}
+			allContainers := []*container.Container{scopeAWatchtower, scopeBWatchtower}
 
 			// Create separate test data for each client to track cleanup independently
 			testDataA := &mockUpdate.TestData{
@@ -1018,8 +1064,8 @@ func TestRunUpdates(t *testing.T) {
 				},
 			}
 
-			clientA := mockUpdate.CreateMockClient(testDataA, false, false)
-			clientB := mockUpdate.CreateMockClient(testDataB, false, false)
+			clientA := mockUpdate.CreateFakeClient(testDataA, false, false)
+			clientB := mockUpdate.CreateFakeClient(testDataB, false, false)
 
 			var wg sync.WaitGroup
 
@@ -1126,7 +1172,7 @@ func TestRunUpdates(t *testing.T) {
 				},
 			)
 
-			allContainers := []types.Container{appContainer, watchtowerProd, watchtowerDev}
+			allContainers := []*container.Container{appContainer, watchtowerProd, watchtowerDev}
 
 			testDataProd := &mockUpdate.TestData{
 				Containers: allContainers,
@@ -1146,8 +1192,8 @@ func TestRunUpdates(t *testing.T) {
 				},
 			}
 
-			clientProd := mockUpdate.CreateMockClient(testDataProd, false, false)
-			clientDev := mockUpdate.CreateMockClient(testDataDev, false, false)
+			clientProd := mockUpdate.CreateFakeClient(testDataProd, false, false)
+			clientDev := mockUpdate.CreateFakeClient(testDataDev, false, false)
 
 			results := make(chan map[string]int, 2)
 
@@ -1263,7 +1309,7 @@ func TestRunUpdates(t *testing.T) {
 					},
 				)
 
-				allContainers := []types.Container{scopeAContainer1, scopeAContainer2}
+				allContainers := []*container.Container{scopeAContainer1, scopeAContainer2}
 
 				// Set up mock to fail updates
 				testData := &mockUpdate.TestData{
@@ -1275,7 +1321,7 @@ func TestRunUpdates(t *testing.T) {
 					StopContainerFailCount: 2, // Fail both containers
 				}
 
-				client := mockUpdate.CreateMockClient(testData, false, false)
+				client := mockUpdate.CreateFakeClient(testData, false, false)
 
 				params := RunUpdatesWithNotificationsParams{
 					Logger:                       newTestLogger(t),
@@ -1332,7 +1378,7 @@ func TestRunUpdates(t *testing.T) {
 					},
 				)
 
-				allContainers := []types.Container{scopeAContainer, scopeBContainer}
+				allContainers := []*container.Container{scopeAContainer, scopeBContainer}
 
 				// Different test data for different scopes
 				testDataA := &mockUpdate.TestData{
@@ -1342,8 +1388,8 @@ func TestRunUpdates(t *testing.T) {
 						"cleanup-app-b": false,
 					},
 					RemoveImageError: errors.New("cleanup failed in scope-a"),
-					FailedImageIDs: []types.ImageID{
-						types.ImageID("app:v1"),
+					FailedImageIDs: []container.ImageID{
+						container.ImageID("app:v1"),
 					}, // Fail cleanup for scope-a
 				}
 
@@ -1353,8 +1399,8 @@ func TestRunUpdates(t *testing.T) {
 					// scope-b cleanup succeeds
 				}
 
-				clientA := mockUpdate.CreateMockClient(testDataA, false, false)
-				clientB := mockUpdate.CreateMockClient(testDataB, false, false)
+				clientA := mockUpdate.CreateFakeClient(testDataA, false, false)
+				clientB := mockUpdate.CreateFakeClient(testDataB, false, false)
 
 				// Run scope-a operation (cleanup should fail)
 				updateA := defaultTestUpdateParams(
@@ -1459,7 +1505,7 @@ func TestRunUpdates(t *testing.T) {
 					},
 				)
 
-				allContainers := []types.Container{containerX, containerY}
+				allContainers := []*container.Container{containerX, containerY}
 
 				// scope-x has update errors, scope-y succeeds
 				testDataX := &mockUpdate.TestData{
@@ -1475,8 +1521,8 @@ func TestRunUpdates(t *testing.T) {
 					// scope-y succeeds
 				}
 
-				clientX := mockUpdate.CreateMockClient(testDataX, false, false)
-				clientY := mockUpdate.CreateMockClient(testDataY, false, false)
+				clientX := mockUpdate.CreateFakeClient(testDataX, false, false)
+				clientY := mockUpdate.CreateFakeClient(testDataY, false, false)
 
 				// Run concurrent operations
 				var wg sync.WaitGroup
@@ -1601,21 +1647,32 @@ func TestSendSplitNotifications_CooldownSkipped(t *testing.T) {
 		t.Run(fmt.Sprintf("notification report %t", notificationReport), func(t *testing.T) {
 			t.Parallel()
 
-			session := reportfixture.Report(
-				state.UpdatedState,
-				state.RestartedState,
-				state.SkippedState,
-				state.SkippedState,
-			)
-			cooldown := session.Skipped()[0]
+			log := newTestLogger(t)
+			progress := state.Progress{}
 
-			status, ok := cooldown.(*state.ContainerStatus)
-			require.True(t, ok)
-			status.SetCooldownInfo("1 hour", "24 hours", "23 hours", time.Now().Add(23*time.Hour))
+			updated, newImage := reportfixture.Container(0, state.UpdatedState)
+			progress.AddScanned(log, updated, newImage, updateParams.Params{})
+			progress.MarkForUpdate(log, updated.ID())
+
+			restarted, _ := reportfixture.Container(0, state.RestartedState)
+			progress.AddScanned(log, restarted, restarted.ImageID(), updateParams.Params{})
+			progress.MarkRestarted(log, restarted.ID())
+
+			// One skipped container waits out its update cooldown. The other
+			// was skipped for another reason.
+			inCooldown, _ := reportfixture.Container(0, state.SkippedState)
+			progress.AddSkipped(log, inCooldown, errors.New("in cooldown"), updateParams.Params{})
+			progress.SetCooldownInfo(log, inCooldown.ID(), "1 hour", "24 hours", "23 hours", time.Now().Add(23*time.Hour))
+
+			otherSkipped, _ := reportfixture.Container(1, state.SkippedState)
+			progress.AddSkipped(log, otherSkipped, errors.New("skipped"), updateParams.Params{})
+
+			session := progress.Report(log)
+			cooldown := progress[inCooldown.ID()]
 
 			var batch sessionBatch
 
-			sendSplitNotifications(newTestLogger(t), batch.record, notificationReport, session)
+			sendSplitNotifications(log, batch.record, notificationReport, session)
 
 			// One notification each for the updated, restarted and cooldown containers.
 			require.Len(t, batch.sent, 3)
@@ -1640,9 +1697,9 @@ func TestSendSplitNotifications_OwnNotification(t *testing.T) {
 
 	tests := []struct {
 		// focusOf returns the session category that holds the container.
-		focusOf func(*state.Report) []types.ContainerReport
+		focusOf func(*state.Report) []*state.ContainerStatus
 		// want returns the lines the rendered notification must contain.
-		want func(focus types.ContainerReport) []string
+		want func(focus *state.ContainerStatus) []string
 		name string
 		// states are the session's containers. Each one gets a notification.
 		states []state.State
@@ -1654,7 +1711,7 @@ func TestSendSplitNotifications_OwnNotification(t *testing.T) {
 			states:  []state.State{state.StaleState},
 			focusOf: (*state.Report).Stale,
 			index:   0,
-			want: func(focus types.ContainerReport) []string {
+			want: func(focus *state.ContainerStatus) []string {
 				return []string{"0 Updated", "- " + focus.Name() + " (" + focus.ImageName() + "): Stale"}
 			},
 		},
@@ -1663,7 +1720,7 @@ func TestSendSplitNotifications_OwnNotification(t *testing.T) {
 			states:  []state.State{state.UpdatedState, state.FailedState},
 			focusOf: (*state.Report).Failed,
 			index:   1,
-			want: func(focus types.ContainerReport) []string {
+			want: func(focus *state.ContainerStatus) []string {
 				return []string{
 					"0 Updated",
 					"1 Failed",

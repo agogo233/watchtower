@@ -38,6 +38,13 @@ const (
 	StartingAPIServer = "Starting HTTP API server"
 	// APIServerEnabled is logged once the HTTP API server is set up.
 	APIServerEnabled = "HTTP API server is enabled"
+	// OrphanRecovered is logged when an old Watchtower instance starts the
+	// replacement that an interrupted self-update left in the created state.
+	OrphanRecovered = "Recovered orphaned Watchtower container"
+	// OrphanStartFailed is logged when an old Watchtower instance cannot start
+	// the replacement that an interrupted self-update left in the created
+	// state.
+	OrphanStartFailed = "Could not start orphaned Watchtower container"
 )
 
 // Update session messages. Watchtower logs them while it checks and updates
@@ -50,6 +57,9 @@ const (
 	// UpdateCheckFailed is logged when Watchtower cannot check a container
 	// for a newer image or Git revision.
 	UpdateCheckFailed = "Could not check container for updates"
+	// ImagePullFailed is logged when the container engine cannot pull a
+	// container's image. Its error is the engine's own.
+	ImagePullFailed = "Could not pull image"
 	// ConfigNotRecreatable is logged when a stale container is skipped
 	// because its configuration cannot be recreated.
 	ConfigNotRecreatable = "Could not update container. Its configuration cannot be recreated"
@@ -119,6 +129,12 @@ const (
 	// StartedLinkedContainer is logged after Watchtower starts a container
 	// that restarts with one it updates.
 	StartedLinkedContainer = "Started linked container"
+	// EphemeralSelfUpdateStarting is logged when the short-lived orchestrator
+	// of an ephemeral self-update has started.
+	EphemeralSelfUpdateStarting = "Starting Watchtower ephemeral self-update"
+	// OrchestratorCleanupFailed is logged when the orchestrator of an
+	// ephemeral self-update could not be started and could not be removed.
+	OrchestratorCleanupFailed = "Failed to clean up ephemeral orchestrator after start failure"
 	// InvalidPreCheckTimeout is logged when a pre-check timeout label is not
 	// a valid timeout.
 	InvalidPreCheckTimeout = "Invalid pre-check timeout value, using default"

@@ -34,6 +34,8 @@ Run once mode: Watchtower self-update skipped
 Only checking containers in scope: production
 Starting HTTP API server at https://0.0.0.0:8080
 HTTP API server is available at https://0.0.0.0:8080
+Recovered orphaned Watchtower container: watchtower (f00f00f00f00)
+Could not start orphaned Watchtower container: watchtower (f00f00f00f00): failed to start container f00f00f00f00: context deadline exceeded
 Update failed for app (org/app:latest): failed to pull image: org/app:latest: registry rate limited: retry-after 347.256µs allowed 44000 per 1m0s
 Update failed for app (org/app:latest): pre-update command failed: exit code 1
 Ignored depends-on missing-db for app: no container has that name
@@ -53,7 +55,10 @@ Invalid pre-check timeout "1.5" for app. Using the default of 1 minute
 Invalid post-check timeout "-5" for app. Using the default of 1 minute
 Update panicked: runtime error: invalid memory address or nil pointer dereference
 Update execution failed: failed to list containers: context deadline exceeded
-Could not check app for updates: failed to pull image: org/app:latest: unauthorized: authentication required
+Could not check app for updates: failed to inspect image: org/app:latest: Error response from daemon: No such image: org/app:latest
+Docker could not pull org/app:latest for app: Get "https://registry.example.com/v2/org/app/manifests/latest": net/http: timeout awaiting response headers
+Starting Watchtower ephemeral self-update
+Could not remove ephemeral orchestrator 0dd0dd000000 after it failed to start: Error response from daemon: removal of container 0dd0dd000000 is already in progress
 Could not update app: no image info available
 Unrecognized message with fields | alpha=one beta=2 
 Unrecognized message without fields

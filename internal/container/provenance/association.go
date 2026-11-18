@@ -7,14 +7,28 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"github.com/nicholas-fedor/watchtower/internal/container"
 	"github.com/nicholas-fedor/watchtower/internal/container/labels"
+	"github.com/nicholas-fedor/watchtower/internal/container/redact"
 	"github.com/nicholas-fedor/watchtower/internal/git/semver"
 	gitConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/git"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // DefaultDockerfile is used when no Dockerfile path is configured.
 const DefaultDockerfile = "Dockerfile"
+
+// associationLabelKeys lists every label [Association.Labels] can write. A
+// recreated container drops them all before the new set is written. A label
+// the new association leaves out does not survive from the old one.
+var associationLabelKeys = []string{
+	labels.GitRepo,
+	labels.GitRef,
+	labels.GitSemverPolicy,
+	labels.GitHost,
+	labels.GitDockerfile,
+	labels.GitContext,
+	labels.GitWatch,
+}
 
 // Association is a Git monitor association from labels or image mapping.
 type Association struct {
@@ -30,7 +44,7 @@ type Association struct {
 	invalidPolicy string
 
 	// RefFromDefault is true when Ref came from the process default, not a
-	// label or image mapping. ApplyGitAssociation does not persist those values.
+	// label or image mapping. [Association.Labels] does not persist those values.
 	RefFromDefault bool
 	// PolicyFromDefault is true when Policy came from the process default.
 	PolicyFromDefault bool
@@ -38,6 +52,11 @@ type Association struct {
 	DockerfileFromDefault bool
 	// ContextFromDefault is true when Context came from the process default.
 	ContextFromDefault bool
+
+	// persistWatch is true when the container's own git-watch label turned the
+	// watcher on. A watcher turned on only by the git-enable configuration
+	// option leaves it false.
+	persistWatch bool
 }
 
 // Validate reports an invalid git-semver-policy or git-host label.
@@ -63,6 +82,57 @@ func (a Association) Validate() error {
 	return nil
 }
 
+// Labels returns the Git association labels a rebuilt replacement carries.
+//
+// They keep a git-image mapping working after the image is renamed to
+// name:git-<sha>. The repository is written without credentials, and the host
+// as its API origin. Ref, policy, Dockerfile, and context labels are written
+// only when a label or image mapping supplied them. Later changes to the
+// process-wide defaults still apply to the replacement. git-watch=true is
+// written only when the container's own git-watch label enabled the watcher.
+// Otherwise the git-enable configuration option keeps deciding.
+//
+// Returns:
+//   - map[string]string: Labels to write, or nil when the repository is empty
+//     or cannot be written without credentials.
+func (a Association) Labels() map[string]string {
+	repo := redact.GitURL(a.Repo)
+	if repo == "" {
+		return nil
+	}
+
+	out := map[string]string{labels.GitRepo: repo}
+
+	if a.Ref != "" && !a.RefFromDefault {
+		out[labels.GitRef] = a.Ref
+	}
+
+	if a.Policy != "" && !a.PolicyFromDefault {
+		out[labels.GitSemverPolicy] = a.Policy
+	}
+
+	// A host that is not an API origin fails Validate, and no rebuild runs for
+	// it. An empty or invalid host is left off rather than written unchecked.
+	origin, err := ParseAPIOrigin(a.Host)
+	if err == nil {
+		out[labels.GitHost] = origin.String()
+	}
+
+	if a.Dockerfile != "" && !a.DockerfileFromDefault {
+		out[labels.GitDockerfile] = a.Dockerfile
+	}
+
+	if a.Context != "" && !a.ContextFromDefault {
+		out[labels.GitContext] = a.Context
+	}
+
+	if a.persistWatch {
+		out[labels.GitWatch] = "true"
+	}
+
+	return out
+}
+
 // ResolveAssociation returns the monitor association for a container.
 //
 // Highest wins: Watchtower labels, then an exact ImageName() mapping.
@@ -77,7 +147,7 @@ func (a Association) Validate() error {
 //     Dockerfile and Context are empty when unset. Callers default to Dockerfile
 //     and the repository root.
 //   - bool: True when a git-repo label or image mapping is present.
-func ResolveAssociation(c types.Container, defaults gitConfig.Defaults) (Association, bool) {
+func ResolveAssociation(c *container.Container, defaults gitConfig.Defaults) (Association, bool) {
 	if c == nil {
 		return Association{}, false
 	}
@@ -89,6 +159,8 @@ func ResolveAssociation(c types.Container, defaults gitConfig.Defaults) (Associa
 	if labelPolicy == "" {
 		invalidPolicy = rawPolicy
 	}
+
+	persistWatch, _ := watchLabel(c)
 
 	// Container labels win over --git-image mappings.
 	if repo := label(c, labels.GitRepo); repo != "" {
@@ -109,6 +181,7 @@ func ResolveAssociation(c types.Container, defaults gitConfig.Defaults) (Associa
 			PolicyFromDefault:     policyDefault,
 			DockerfileFromDefault: dockerfileDefault,
 			ContextFromDefault:    contextDefault,
+			persistWatch:          persistWatch,
 		}, true
 	}
 
@@ -134,6 +207,7 @@ func ResolveAssociation(c types.Container, defaults gitConfig.Defaults) (Associa
 		PolicyFromDefault:     policyDefault,
 		DockerfileFromDefault: dockerfileDefault,
 		ContextFromDefault:    contextDefault,
+		persistWatch:          persistWatch,
 	}, true
 }
 
@@ -172,7 +246,7 @@ func sourced(primary, secondary, fallback string) (string, bool) {
 //
 // Returns:
 //   - bool: True when Git staleness checks and rebuilds apply.
-func ShouldMonitor(log *zerolog.Logger, c types.Container, defaults gitConfig.Defaults) bool {
+func ShouldMonitor(log *zerolog.Logger, c *container.Container, defaults gitConfig.Defaults) bool {
 	if c == nil || c.IsWatchtower() {
 		return false
 	}
@@ -195,34 +269,6 @@ func ShouldMonitor(log *zerolog.Logger, c types.Container, defaults gitConfig.De
 	return associated && watch
 }
 
-// PersistWatch reports whether git-watch should be written onto a replacement.
-//
-// Only an explicit enabling label is persisted. Process-wide --git-enable
-// must keep applying when the label is absent.
-//
-// Parameters:
-//   - c: Container to inspect.
-//
-// Returns:
-//   - bool: True when the source had an explicit on value for git-watch.
-func PersistWatch(c types.Container) bool {
-	if c == nil {
-		return false
-	}
-
-	val, ok := c.GetLabel(labels.GitWatch)
-	if !ok {
-		return false
-	}
-
-	switch strings.ToLower(strings.TrimSpace(val)) {
-	case "1", "t", "true", "yes":
-		return true
-	default:
-		return false
-	}
-}
-
 // label returns the trimmed container label value for key.
 //
 // Parameters:
@@ -231,7 +277,7 @@ func PersistWatch(c types.Container) bool {
 //
 // Returns:
 //   - string: Trimmed value, or empty when the label is missing.
-func label(c types.Container, key string) string {
+func label(c *container.Container, key string) string {
 	if c == nil {
 		return ""
 	}
@@ -251,7 +297,7 @@ func label(c types.Container, key string) string {
 //
 // Returns:
 //   - string: Ref label value, or empty.
-func refLabel(c types.Container) string {
+func refLabel(c *container.Container) string {
 	return cmp.Or(label(c, labels.GitRef), label(c, labels.GitBranch))
 }
 
@@ -279,20 +325,38 @@ func imageMapping(imageName string, images map[string]gitConfig.Image) gitConfig
 //
 // Returns:
 //   - bool: True when the watcher should run, ignoring association.
-func isWatch(c types.Container, defaults gitConfig.Defaults) bool {
-	val, ok := c.GetLabel(labels.GitWatch)
-	if !ok || strings.TrimSpace(val) == "" {
-		return defaults.Enable
+func isWatch(c *container.Container, defaults gitConfig.Defaults) bool {
+	if enabled, set := watchLabel(c); set {
+		return enabled
 	}
 
-	// Match Docker's loose boolean parsing used elsewhere on Watchtower labels.
-	switch strings.ToLower(strings.TrimSpace(val)) {
+	return defaults.Enable
+}
+
+// watchLabel reads the git-watch label.
+//
+// Enabling values are 1, t, true and yes. Disabling values are 0, f, false
+// and no. Case and surrounding spaces are ignored. A missing, blank or
+// unrecognized value counts as unset.
+//
+// Parameters:
+//   - c: Container to inspect.
+//
+// Returns:
+//   - enabled: True when the label turns the watcher on.
+//   - set: True when the label holds an enabling or disabling value.
+//
+//nolint:nonamedreturns // Same-type returns need names.
+func watchLabel(c *container.Container) (enabled, set bool) {
+	val := label(c, labels.GitWatch)
+
+	switch strings.ToLower(val) {
 	case "1", "t", "true", "yes":
-		return true
+		return true, true
 	case "0", "f", "false", "no":
-		return false
+		return false, true
 	default:
-		return defaults.Enable
+		return false, false
 	}
 }
 

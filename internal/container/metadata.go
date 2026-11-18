@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -15,7 +16,6 @@ import (
 	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
 	updateConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/update"
 	"github.com/nicholas-fedor/watchtower/internal/settings/units"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // hookTimeoutMessages holds the log messages for reading one lifecycle hook's
@@ -36,8 +36,6 @@ const defaultHookTimeout = 1
 
 // Errors for label and scope operations.
 var (
-	// errCurrentContainerNotCached indicates the current container is not cached for scope derivation.
-	errCurrentContainerNotCached = errors.New("current container not cached for scope derivation")
 	// errLabelNotFound indicates a requested label is not present in the container's metadata.
 	errLabelNotFound = errors.New("label not found")
 	// errInvalidHookTimeout indicates a lifecycle hook timeout label is not a
@@ -489,42 +487,6 @@ func (c *Container) NormalizedScope() string {
 	return labels.NormalizeScope(scope)
 }
 
-// GetEffectiveScope determines the effective operational scope by prioritizing explicit scope
-// over scope derived from the container's label. This is crucial for self-update scenarios where
-// a new Watchtower instance needs to inherit the same scope as the instance being replaced
-// to maintain proper isolation and prevent cross-scope interference during the update process.
-//
-// Parameters:
-//   - container: The current Watchtower container.
-//   - currentScope: The explicit scope value (takes priority if non-empty).
-//
-// Returns:
-//   - string: The effective scope.
-//   - error: Non-nil if derivation fails.
-func GetEffectiveScope(container types.Container, currentScope string) (string, error) {
-	// Skip derivation if scope is already explicitly set.
-	if currentScope != "" {
-		return currentScope, nil
-	}
-
-	// Container not available.
-	if container == nil {
-		return "", fmt.Errorf("%w", errCurrentContainerNotCached)
-	}
-
-	// Extract the scope label from the container.
-	derivedScope, ok := container.Scope()
-	if ok && derivedScope != "" {
-		nopLog().Debug().
-			Str("derived_scope", derivedScope).
-			Msg("Derived operational scope from current container's scope label")
-
-		return derivedScope, nil
-	}
-
-	return currentScope, nil
-}
-
 // GetContainerChain returns the container chain label value.
 //
 // Returns:
@@ -532,6 +494,43 @@ func GetEffectiveScope(container types.Container, currentScope string) (string, 
 //   - bool: True if the label is present, false otherwise.
 func (c *Container) GetContainerChain() (string, bool) {
 	return c.getLabelValue(labels.ContainerChain)
+}
+
+// ChainIDs returns the IDs in the container's chain label, which name the
+// Watchtower instances a self-update replaced with this container.
+//
+// Each ID is trimmed of surrounding whitespace, and empty entries are left out.
+//
+// Returns:
+//   - []ContainerID: The replaced instances, oldest first, or nil without a chain.
+func (c *Container) ChainIDs() []ContainerID {
+	chain, _ := c.GetContainerChain()
+
+	var ids []ContainerID
+
+	for id := range strings.SplitSeq(chain, ",") {
+		if id = strings.TrimSpace(id); id != "" {
+			ids = append(ids, ContainerID(id))
+		}
+	}
+
+	return ids
+}
+
+// SuccessorChain returns the container chain label value for a container that
+// replaces this one in a self-update.
+//
+// The value is this container's chain followed by its own ID.
+//
+// Returns:
+//   - string: The comma-separated IDs of the instances the successor replaces.
+func (c *Container) SuccessorChain() string {
+	chain, _ := c.GetContainerChain()
+	if chain == "" {
+		return string(c.ID())
+	}
+
+	return chain + "," + string(c.ID())
 }
 
 // IsWatchtower identifies if this is the Watchtower container.
@@ -545,6 +544,20 @@ func (c *Container) IsWatchtower() bool {
 	}
 
 	return containsWatchtowerLabel(info.Config.Labels)
+}
+
+// IsEphemeralOrchestrator reports whether the container is the ephemeral
+// orchestrator of a self-update.
+//
+// Returns:
+//   - bool: True when the ephemeral orchestrator label is "true".
+func (c *Container) IsEphemeralOrchestrator() bool {
+	info := c.ContainerInfo()
+	if info == nil || info.Config == nil {
+		return false
+	}
+
+	return info.Config.Labels[labels.EphemeralOrchestrator] == "true"
 }
 
 // StopSignal returns the custom stop signal from labels or HostConfig.
@@ -882,74 +895,46 @@ func (c *Container) DeleteLabel(key string) {
 	})
 }
 
-// IsWatchtowerParent checks if the current container ID exists in the comma-separated container-chain label values.
-//
-// It handles edge cases like empty chain or invalid IDs by returning false appropriately.
-// The chain values are trimmed of whitespace before comparison.
-//
-// Parameters:
-//   - currentID: The container ID to check for in the chain.
-//   - chain: Comma-separated string of container IDs from the container-chain label.
-//
-// Returns:
-//   - bool: True if currentID is found in the chain, false otherwise.
-func IsWatchtowerParent(currentID types.ContainerID, chain string) bool {
-	if currentID == "" || chain == "" {
-		return false
-	}
-
-	ids := strings.SplitSeq(chain, ",")
-	for id := range ids {
-		if strings.TrimSpace(id) == string(currentID) {
-			return true
-		}
-	}
-
-	return false
-}
-
 // IsSuperseded reports whether a container is a Watchtower instance that a
-// self-update has replaced. That is the case for a predecessor renamed with
-// the "watchtower-old-" prefix, and for a container whose chain label lists it
-// as the parent of a newer instance.
+// self-update has replaced, which renames it with the "watchtower-old-"
+// prefix.
 //
 // Parameters:
 //   - container: The running Watchtower container, or nil when it was not inspected.
 //
 // Returns:
 //   - bool: True when the container has been replaced, false otherwise or for nil.
-func IsSuperseded(container types.Container) bool {
-	if container == nil {
-		return false
-	}
-
-	if IsOldContainer(container.Name()) {
-		return true
-	}
-
-	chain, present := container.GetContainerChain()
-
-	return present && IsWatchtowerParent(container.ID(), chain)
+func IsSuperseded(container *Container) bool {
+	// A self-update writes the container chain label only into the
+	// replacement's configuration, and Docker cannot change a container's
+	// labels afterwards. So a container's own chain never lists its own ID.
+	// The name is the only mark a replaced instance carries.
+	return container != nil && IsOldContainer(container.Name())
 }
 
 // IsOrphanedReplacement reports whether a container counts as a replacement
 // that an interrupted self-update left in the created state.
 //
-// Any Watchtower container in the created state and in the current container's
-// scope counts, unless it is the current container or a renamed predecessor.
-// One scope runs one Watchtower instance, so such a container is never a separate
-// instance to keep.
+// Any Watchtower container in the created state counts when it is in the given
+// scope or its chain label names the current container, unless it is the
+// current container or a renamed predecessor. One scope runs one Watchtower
+// instance, so such a container is never a separate instance to keep. A
+// replacement of the current container counts whatever its scope label, since
+// the configured scope can differ from that label. An empty scope is the scope
+// "none".
 //
 // Parameters:
 //   - candidate: The container to check.
-//   - current: The running Watchtower container.
+//   - currentID: ID of the running Watchtower container.
+//   - scope: Scope the replacement must be in.
 //
 // Returns:
 //   - bool: True when the candidate is an orphaned replacement.
-func IsOrphanedReplacement(candidate, current types.Container) bool {
+func IsOrphanedReplacement(candidate *Container, currentID ContainerID, scope string) bool {
 	return candidate.IsWatchtower() &&
-		candidate.ID() != current.ID() &&
+		candidate.ID() != currentID &&
 		!IsOldContainer(candidate.Name()) &&
 		candidate.IsCreated() &&
-		candidate.NormalizedScope() == current.NormalizedScope()
+		(candidate.NormalizedScope() == labels.NormalizeScope(scope) ||
+			slices.Contains(candidate.ChainIDs(), currentID))
 }

@@ -12,12 +12,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/nicholas-fedor/watchtower/internal/container"
 	"github.com/nicholas-fedor/watchtower/internal/container/filters"
 	"github.com/nicholas-fedor/watchtower/internal/registry/ratelimit"
 	"github.com/nicholas-fedor/watchtower/internal/update/cleanup"
 	mockUpdate "github.com/nicholas-fedor/watchtower/internal/update/mocks"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // TestUpdateAction_ImageReferences verifies how an update handles tagged,
@@ -39,9 +39,9 @@ func TestUpdateAction_ImageReferences(t *testing.T) {
 		t.Run("should process tagged images and update if stale", func(t *testing.T) {
 			t.Parallel()
 
-			client := &mockUpdate.MockClient{
+			client := &mockUpdate.FakeClient{
 				TestData: &mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainer(
 							"tagged-container",
 							"/tagged-container",
@@ -60,16 +60,16 @@ func TestUpdateAction_ImageReferences(t *testing.T) {
 			require.NoError(t, err)
 			require.Len(t, report.Scanned(), 1, "Tagged container should be scanned")
 			require.Len(t, report.Updated(), 1, "Tagged container should be updated if stale")
-			assert.True(t, slices.ContainsFunc(cleanupImageInfos, func(info cleanup.RemovedImageInfo) bool { return info.ImageID == types.ImageID("image:1.0.0") }))
+			assert.True(t, slices.ContainsFunc(cleanupImageInfos, func(info cleanup.RemovedImageInfo) bool { return info.ImageID == container.ImageID("image:1.0.0") }))
 			assert.Equal(t, int32(1), client.TestData.IsContainerStaleCount.Load(), "IsContainerStale should be called")
 		})
 
 		t.Run("should process untagged images and update if stale", func(t *testing.T) {
 			t.Parallel()
 
-			client := &mockUpdate.MockClient{
+			client := &mockUpdate.FakeClient{
 				TestData: &mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainer(
 							"untagged-container",
 							"/untagged-container",
@@ -88,16 +88,16 @@ func TestUpdateAction_ImageReferences(t *testing.T) {
 			require.NoError(t, err)
 			require.Len(t, report.Scanned(), 1, "Untagged container should be scanned")
 			require.Len(t, report.Updated(), 1, "Untagged container should be updated if stale")
-			assert.True(t, slices.ContainsFunc(cleanupImageInfos, func(info cleanup.RemovedImageInfo) bool { return info.ImageID == types.ImageID("image") }))
+			assert.True(t, slices.ContainsFunc(cleanupImageInfos, func(info cleanup.RemovedImageInfo) bool { return info.ImageID == container.ImageID("image") }))
 			assert.Equal(t, int32(1), client.TestData.IsContainerStaleCount.Load(), "IsContainerStale should be called")
 		})
 
 		t.Run("should skip pinned containers and not collect image IDs", func(t *testing.T) {
 			t.Parallel()
 
-			client := &mockUpdate.MockClient{
+			client := &mockUpdate.FakeClient{
 				TestData: &mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainer(
 							"pinned-container",
 							"/pinned-container",
@@ -124,9 +124,9 @@ func TestUpdateAction_ImageReferences(t *testing.T) {
 		t.Run("should skip bare sha256-pinned containers and not call IsContainerStale", func(t *testing.T) {
 			t.Parallel()
 
-			client := &mockUpdate.MockClient{
+			client := &mockUpdate.FakeClient{
 				TestData: &mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainer(
 							"bare-digest-container",
 							"/bare-digest-container",
@@ -152,9 +152,9 @@ func TestUpdateAction_ImageReferences(t *testing.T) {
 		t.Run("should skip pinned containers with tag and digest and not collect image IDs", func(t *testing.T) {
 			t.Parallel()
 
-			client := &mockUpdate.MockClient{
+			client := &mockUpdate.FakeClient{
 				TestData: &mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainer(
 							"pinned-tagged-container",
 							"/pinned-tagged-container",
@@ -181,9 +181,9 @@ func TestUpdateAction_ImageReferences(t *testing.T) {
 		t.Run("should process invalid image references with fallback", func(t *testing.T) {
 			t.Parallel()
 
-			client := &mockUpdate.MockClient{
+			client := &mockUpdate.FakeClient{
 				TestData: &mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainer(
 							"invalid-container",
 							"/invalid-container",
@@ -202,16 +202,16 @@ func TestUpdateAction_ImageReferences(t *testing.T) {
 			require.NoError(t, err)
 			require.Len(t, report.Scanned(), 1, "Invalid container should be scanned with fallback")
 			require.Len(t, report.Updated(), 1, "Invalid container should be updated with valid fallback")
-			assert.True(t, slices.ContainsFunc(cleanupImageInfos, func(info cleanup.RemovedImageInfo) bool { return info.ImageID == types.ImageID(":latest") }))
+			assert.True(t, slices.ContainsFunc(cleanupImageInfos, func(info cleanup.RemovedImageInfo) bool { return info.ImageID == container.ImageID(":latest") }))
 			assert.Equal(t, int32(1), client.TestData.IsContainerStaleCount.Load(), "IsContainerStale should be called")
 		})
 
 		t.Run("should skip containers with missing Config.Image and imageInfo.ID with error", func(t *testing.T) {
 			t.Parallel()
 
-			client := &mockUpdate.MockClient{
+			client := &mockUpdate.FakeClient{
 				TestData: &mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainerWithImageInfoP(
 							"edge-container",
 							"/edge-container",
@@ -244,9 +244,9 @@ func TestUpdateAction_ImageReferences(t *testing.T) {
 		t.Run("should skip containers with invalid fallback image reference", func(t *testing.T) {
 			t.Parallel()
 
-			client := &mockUpdate.MockClient{
+			client := &mockUpdate.FakeClient{
 				TestData: &mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainer(
 							"InvalidContainer",
 							"/InvalidContainer",
@@ -276,9 +276,9 @@ func TestUpdateAction_ImageReferences(t *testing.T) {
 		t.Run("should count all parallel staleness failures in the final report", func(t *testing.T) {
 			t.Parallel()
 
-			client := &mockUpdate.MockClient{
+			client := &mockUpdate.FakeClient{
 				TestData: &mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainerWithImageInfoP(
 							"invalid-ref-container",
 							"/invalid-ref-container",
@@ -322,9 +322,9 @@ func TestUpdateAction_ImageReferences(t *testing.T) {
 		t.Run("should count exhausted registry rate limits as failed", func(t *testing.T) {
 			t.Parallel()
 
-			client := &mockUpdate.MockClient{
+			client := &mockUpdate.FakeClient{
 				TestData: &mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainer(
 							"rate-limited-container",
 							"/rate-limited-container",
@@ -357,9 +357,9 @@ func TestUpdateAction_ImageReferences(t *testing.T) {
 		t.Run("logs one notifiable warning per rate-limited container", func(t *testing.T) {
 			t.Parallel()
 
-			client := &mockUpdate.MockClient{
+			client := &mockUpdate.FakeClient{
 				TestData: &mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainer(
 							"rate-limited-container",
 							"/rate-limited-container",
@@ -407,9 +407,9 @@ func TestUpdateAction_ImageReferences(t *testing.T) {
 		t.Run("leaves a long Retry-After to the retry loop's warning", func(t *testing.T) {
 			t.Parallel()
 
-			client := &mockUpdate.MockClient{
+			client := &mockUpdate.FakeClient{
 				TestData: &mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainer(
 							"rate-limited-container",
 							"/rate-limited-container",

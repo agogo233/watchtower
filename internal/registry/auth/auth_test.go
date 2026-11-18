@@ -20,8 +20,9 @@ import (
 	mockAuth "github.com/nicholas-fedor/watchtower/internal/registry/auth/mocks"
 	"github.com/nicholas-fedor/watchtower/internal/registry/ratelimit"
 	registryConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/registry"
+	"github.com/nicholas-fedor/watchtower/internal/testutil/containerfixture"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/httpstub"
-	mockTypes "github.com/nicholas-fedor/watchtower/pkg/types/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/testutil/modelfixture"
 )
 
 // testBasicAuth is the base64 "user:pass" credential the stub registries expect
@@ -56,23 +57,6 @@ func newTestLogger(t *testing.T) *zerolog.Logger {
 //   - *zerolog.Logger: Logger that discards all events.
 func newNopLogger() *zerolog.Logger {
 	return new(zerolog.Nop())
-}
-
-// newImageContainer returns a mock container that runs image.
-//
-// Parameters:
-//   - t: Test that owns the mock.
-//   - image: Image reference the container runs.
-//
-// Returns:
-//   - *mockTypes.MockContainer: Mock that answers the image name reads of the auth code.
-func newImageContainer(t *testing.T, image string) *mockTypes.MockContainer {
-	t.Helper()
-
-	container := mockTypes.NewMockContainer(t)
-	container.EXPECT().ImageName().Return(image).Maybe()
-
-	return container
 }
 
 // registryImage returns the reference of an image hosted on server.
@@ -290,6 +274,41 @@ func TestResolveEndpoint(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantHost, gotHost)
 			assert.Equal(t, tt.wantScheme, gotScheme)
+		})
+	}
+}
+
+// TestRedactEndpoint verifies that a registry endpoint is logged as the host
+// [ResolveEndpoint] resolves it to, and that an endpoint it rejects is
+// replaced, since an endpoint can carry credentials.
+func TestRedactEndpoint(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		endpoint string
+		want     string
+	}{
+		{name: "mirror URL", endpoint: "https://mirror.example.com/", want: "mirror.example.com"},
+		{name: "port kept", endpoint: "http://mirror.example.com:5000", want: "mirror.example.com:5000"},
+		{
+			name:     "credentials, path and query dropped",
+			endpoint: "https://user:secret@mirror.example.com/token/abc?sig=secret",
+			want:     "mirror.example.com",
+		},
+		{name: "bare host", endpoint: "mirror.example.com", want: "mirror.example.com"},
+		{name: "bare host and port", endpoint: "mirror.example.com:5000", want: "mirror.example.com:5000"},
+		{name: "bare host with credentials", endpoint: "user:secret@mirror.example.com", want: "<redacted>"},
+		{name: "unsupported scheme", endpoint: "ftp://mirror.example.com", want: "<redacted>"},
+		{name: "unparseable URL", endpoint: "http://[::1", want: "<redacted>"},
+		{name: "empty endpoint", endpoint: "", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, tt.want, RedactEndpoint(tt.endpoint))
 		})
 	}
 }
@@ -631,7 +650,7 @@ func Test_processChallengeResponse(t *testing.T) {
 					Body:       io.NopCloser(strings.NewReader(`{"token":"test-token"}`)),
 				}, nil).Once()
 			},
-			want: TokenResult{Token: "Bearer test-token", ChallengeHost: "challenge.test.com"},
+			want: TokenResult{Token: "Bearer test-token"},
 		},
 		{
 			name:     "200 with empty auth header returns success",
@@ -716,7 +735,7 @@ func Test_processChallengeResponse(t *testing.T) {
 			}
 
 			got, err := processChallengeResponse(newTestLogger(t), t.Context(),
-				newImageContainer(t, "test/image"),
+				modelfixture.Container(containerfixture.WithImageName("test/image")),
 				tt.registryAuth,
 				client,
 				registryConfig.Registry{},
@@ -739,9 +758,9 @@ func Test_processChallengeResponse(t *testing.T) {
 }
 
 // Test_handleBearerAuth verifies that a Bearer challenge yields the fetched
-// token and the challenge host, and that a failed request or an empty token is
-// an error. After a redirect from HTTPS to HTTP, a challenge with credentials
-// is rejected before any token request, and one without credentials is not.
+// token and that a failed request or an empty token is an error. After a
+// redirect from HTTPS to HTTP, a challenge with credentials is rejected before
+// any token request, and one without credentials is not.
 //
 // The test resets the shared token cache, so it does not run in parallel.
 func Test_handleBearerAuth(t *testing.T) {
@@ -768,7 +787,7 @@ func Test_handleBearerAuth(t *testing.T) {
 					Body:       io.NopCloser(strings.NewReader(`{"token":"test-token"}`)),
 				}, nil).Once()
 			},
-			want: TokenResult{Token: "Bearer test-token", ChallengeHost: "success.test.com"},
+			want: TokenResult{Token: "Bearer test-token"},
 		},
 		{
 			name:          "client Do error returns wrapped error",
@@ -811,10 +830,9 @@ func Test_handleBearerAuth(t *testing.T) {
 				}, nil).Once()
 			},
 			want: TokenResult{
-				Token:         "Bearer anonymous-token",
-				ChallengeHost: "anonymous.test.com",
-				Redirected:    true,
-				RedirectHost:  "registry.example.com",
+				Token:        "Bearer anonymous-token",
+				Redirected:   true,
+				RedirectHost: "registry.example.com",
 			},
 		},
 		{
@@ -830,10 +848,9 @@ func Test_handleBearerAuth(t *testing.T) {
 				}, nil).Once()
 			},
 			want: TokenResult{
-				Token:         "Bearer ghcr-token",
-				ChallengeHost: "ghcr.io",
-				Redirected:    true,
-				RedirectHost:  "ghcr.io",
+				Token:        "Bearer ghcr-token",
+				Redirected:   true,
+				RedirectHost: "ghcr.io",
 			},
 		},
 	}
@@ -846,7 +863,7 @@ func Test_handleBearerAuth(t *testing.T) {
 			}
 
 			got, err := handleBearerAuth(newTestLogger(t), t.Context(), tt.wwwAuthHeader,
-				newImageContainer(t, "test/image"), tt.registryAuth, client, registryConfig.Registry{},
+				modelfixture.Container(containerfixture.WithImageName("test/image")), tt.registryAuth, client, registryConfig.Registry{},
 				tt.redirected, tt.redirectHost, "lscr.io", tt.downgraded)
 			if tt.wantErr != nil {
 				require.ErrorIs(t, err, tt.wantErr)
@@ -983,7 +1000,7 @@ func TestGetToken_bearerChallengeDowngrade(t *testing.T) {
 				registry.AppendHandlers(tokenHandler(t))
 			}
 
-			got, err := GetToken(newTestLogger(t), t.Context(), newImageContainer(t, "test/image"),
+			got, err := GetToken(newTestLogger(t), t.Context(), modelfixture.Container(containerfixture.WithImageName("test/image")),
 				tt.registryAuth, &registryClient{client: registry.Client()}, registryConfig.Registry{},
 				registry.URL())
 			if tt.wantErr != nil {
@@ -1014,8 +1031,9 @@ func TestGetToken(t *testing.T) {
 		wantErr   error
 	}{
 		{
-			name:    "empty image name fails to parse",
-			image:   "",
+			// Repository paths must be lowercase, so the name is no reference.
+			name:    "image name that is not a reference fails to parse",
+			image:   "test/Image:latest",
 			wantErr: errFailedParseImageName,
 		},
 		{
@@ -1049,7 +1067,7 @@ func TestGetToken(t *testing.T) {
 					Request:    &http.Request{URL: mustParseURL("https://index.docker.io/token?service=index.docker.io&scope=repository%3Atest%2Fimage%3Apull")},
 				}, nil).Once()
 			},
-			want: TokenResult{Token: "Bearer test-token", ChallengeHost: "index.docker.io"},
+			want: TokenResult{Token: "Bearer test-token"},
 		},
 		{
 			name:  "client Do error returns wrapped error",
@@ -1088,7 +1106,7 @@ func TestGetToken(t *testing.T) {
 				tt.setupMock(client)
 			}
 
-			got, err := GetToken(newTestLogger(t), t.Context(), newImageContainer(t, tt.image), "", client, registryConfig.Registry{}, "")
+			got, err := GetToken(newTestLogger(t), t.Context(), modelfixture.Container(containerfixture.WithImageName(tt.image)), "", client, registryConfig.Registry{}, "")
 			if tt.wantErr != nil {
 				require.ErrorIs(t, err, tt.wantErr)
 				assert.Empty(t, got.Token)
@@ -1109,9 +1127,17 @@ func TestGetToken(t *testing.T) {
 func TestGetToken_anonymousGHCRSkipsChallengeOnCachedToken(t *testing.T) {
 	seedAnonymousGHCRToken(t)
 
-	got, err := GetToken(newTestLogger(t), t.Context(), newImageContainer(t, "ghcr.io/linuxserver/sonarr:latest"), "", mockAuth.NewMockClient(t), registryConfig.Registry{}, "")
+	got, err := GetToken(
+		newTestLogger(t),
+		t.Context(),
+		modelfixture.Container(containerfixture.WithImageName("ghcr.io/linuxserver/sonarr:latest")),
+		"",
+		mockAuth.NewMockClient(t),
+		registryConfig.Registry{},
+		"",
+	)
 	require.NoError(t, err)
-	assert.Equal(t, TokenResult{Token: testAnonymousGHCRToken, ChallengeHost: "ghcr.io"}, got)
+	assert.Equal(t, TokenResult{Token: testAnonymousGHCRToken}, got)
 }
 
 // TestGetToken_anonymousLSCRSkipsChallengeOnCachedToken verifies that an
@@ -1122,9 +1148,17 @@ func TestGetToken_anonymousGHCRSkipsChallengeOnCachedToken(t *testing.T) {
 func TestGetToken_anonymousLSCRSkipsChallengeOnCachedToken(t *testing.T) {
 	seedAnonymousGHCRToken(t)
 
-	got, err := GetToken(newTestLogger(t), t.Context(), newImageContainer(t, "lscr.io/linuxserver/sonarr:latest"), "", mockAuth.NewMockClient(t), registryConfig.Registry{}, "")
+	got, err := GetToken(
+		newTestLogger(t),
+		t.Context(),
+		modelfixture.Container(containerfixture.WithImageName("lscr.io/linuxserver/sonarr:latest")),
+		"",
+		mockAuth.NewMockClient(t),
+		registryConfig.Registry{},
+		"",
+	)
 	require.NoError(t, err)
-	assert.Equal(t, TokenResult{Token: testAnonymousGHCRToken, ChallengeHost: "ghcr.io"}, got)
+	assert.Equal(t, TokenResult{Token: testAnonymousGHCRToken}, got)
 }
 
 // TestGetToken_anonymousGHCRChallengesWhenCacheEmpty verifies that an anonymous
@@ -1149,9 +1183,9 @@ func TestGetToken_anonymousGHCRChallengesWhenCacheEmpty(t *testing.T) {
 		Request:    &http.Request{URL: mustParseURL("https://ghcr.io/token")},
 	}, nil).Once()
 
-	got, err := GetToken(newTestLogger(t), t.Context(), newImageContainer(t, "ghcr.io/linuxserver/sonarr:latest"), "", client, registryConfig.Registry{}, "")
+	got, err := GetToken(newTestLogger(t), t.Context(), modelfixture.Container(containerfixture.WithImageName("ghcr.io/linuxserver/sonarr:latest")), "", client, registryConfig.Registry{}, "")
 	require.NoError(t, err)
-	assert.Equal(t, TokenResult{Token: "Bearer fresh-ghcr-token", ChallengeHost: "ghcr.io"}, got)
+	assert.Equal(t, TokenResult{Token: "Bearer fresh-ghcr-token"}, got)
 }
 
 // TestGetToken_anonymousGHCRDoesNotSkipMirrorOrCredentials verifies that a
@@ -1190,7 +1224,15 @@ func TestGetToken_anonymousGHCRDoesNotSkipMirrorOrCredentials(t *testing.T) {
 				Request:    &http.Request{URL: mustParseURL(tt.challengeURL)},
 			}, nil).Once()
 
-			got, err := GetToken(newTestLogger(t), t.Context(), newImageContainer(t, "ghcr.io/linuxserver/sonarr:latest"), tt.registryAuth, client, registryConfig.Registry{}, tt.endpoint)
+			got, err := GetToken(
+				newTestLogger(t),
+				t.Context(),
+				modelfixture.Container(containerfixture.WithImageName("ghcr.io/linuxserver/sonarr:latest")),
+				tt.registryAuth,
+				client,
+				registryConfig.Registry{},
+				tt.endpoint,
+			)
 			require.NoError(t, err)
 			assert.Equal(t, TokenResult{}, got)
 		})
@@ -1267,7 +1309,7 @@ func TestGetToken_registryChallenges(t *testing.T) {
 			server.AppendHandlers(challengeHandler(t, tt.status, tt.challenge))
 
 			got, err := GetToken(newTestLogger(t), t.Context(),
-				newImageContainer(t, registryImage(server)),
+				modelfixture.Container(containerfixture.WithImageName(registryImage(server))),
 				TransformAuth(newTestLogger(t), tt.dockerAuth),
 				server.Client(),
 				registryConfig.Registry{TLSSkip: tt.plainHTTP},
@@ -1302,7 +1344,7 @@ func TestGetToken_connectionFailures(t *testing.T) {
 		image := refusedAddr + "/test/image:latest"
 		settings := registryConfig.Registry{TLSSkip: true}
 
-		got, err := GetToken(newTestLogger(t), t.Context(), newImageContainer(t, image), testBasicAuth, &registryClient{client: refusingClient()}, settings, "")
+		got, err := GetToken(newTestLogger(t), t.Context(), modelfixture.Container(containerfixture.WithImageName(image)), testBasicAuth, &registryClient{client: refusingClient()}, settings, "")
 		require.ErrorIs(t, err, errFailedExecuteChallengeRequest)
 		require.ErrorIs(t, err, syscall.ECONNREFUSED)
 		assert.Empty(t, got.Token)
@@ -1314,7 +1356,15 @@ func TestGetToken_connectionFailures(t *testing.T) {
 		// The server has no handlers, since the TLS handshake never reaches one.
 		server := httpstub.New(t)
 
-		got, err := GetToken(newTestLogger(t), t.Context(), newImageContainer(t, registryImage(server)), "", NewAuthClient(nil, registryConfig.Registry{}), registryConfig.Registry{}, "")
+		got, err := GetToken(
+			newTestLogger(t),
+			t.Context(),
+			modelfixture.Container(containerfixture.WithImageName(registryImage(server))),
+			"",
+			NewAuthClient(nil, registryConfig.Registry{}),
+			registryConfig.Registry{},
+			"",
+		)
 		require.ErrorIs(t, err, errFailedExecuteChallengeRequest)
 		require.ErrorContains(t, err, "http: server gave HTTP response to HTTPS client")
 		assert.Empty(t, got.Token)
@@ -1335,7 +1385,15 @@ func TestGetToken_connectionFailures(t *testing.T) {
 		transport = transport.Clone()
 		transport.TLSClientConfig.MinVersion = tls.VersionTLS13
 
-		got, err := GetToken(newTestLogger(t), t.Context(), newImageContainer(t, registryImage(server)), "", &http.Client{Transport: transport}, registryConfig.Registry{}, "")
+		got, err := GetToken(
+			newTestLogger(t),
+			t.Context(),
+			modelfixture.Container(containerfixture.WithImageName(registryImage(server))),
+			"",
+			&http.Client{Transport: transport},
+			registryConfig.Registry{},
+			"",
+		)
 		require.ErrorIs(t, err, errFailedExecuteChallengeRequest)
 		assert.Empty(t, got.Token)
 	})
@@ -1360,9 +1418,9 @@ func TestGetToken_bearerChallenges(t *testing.T) {
 		server := httpstub.NewTLS(t)
 		server.AppendHandlers(challengeHandler(t, http.StatusUnauthorized, bearerChallenge(tokenServer.Addr())))
 
-		got, err := GetToken(newTestLogger(t), t.Context(), newImageContainer(t, registryImage(server)), "", server.Client(), registryConfig.Registry{}, "")
+		got, err := GetToken(newTestLogger(t), t.Context(), modelfixture.Container(containerfixture.WithImageName(registryImage(server))), "", server.Client(), registryConfig.Registry{}, "")
 		require.NoError(t, err)
-		assert.Equal(t, TokenResult{Token: "Bearer mock-token", ChallengeHost: tokenServer.Addr()}, got)
+		assert.Equal(t, TokenResult{Token: "Bearer mock-token"}, got)
 		assert.Len(t, server.ReceivedRequests(), 1)
 		assert.Len(t, tokenServer.ReceivedRequests(), 1)
 	})
@@ -1374,9 +1432,9 @@ func TestGetToken_bearerChallenges(t *testing.T) {
 		server.RouteToHandler(http.MethodGet, httpstub.Path("/v2/"), challengeHandler(t, http.StatusUnauthorized, bearerChallenge(server.Addr())))
 		server.RouteToHandler(http.MethodGet, httpstub.Path("/token"), tokenHandler(t))
 
-		got, err := GetToken(newTestLogger(t), t.Context(), newImageContainer(t, registryImage(server)), "", server.Client(), registryConfig.Registry{}, "")
+		got, err := GetToken(newTestLogger(t), t.Context(), modelfixture.Container(containerfixture.WithImageName(registryImage(server))), "", server.Client(), registryConfig.Registry{}, "")
 		require.NoError(t, err)
-		assert.Equal(t, TokenResult{Token: "Bearer mock-token", ChallengeHost: server.Addr()}, got)
+		assert.Equal(t, TokenResult{Token: "Bearer mock-token"}, got)
 		assert.Len(t, server.ReceivedRequests(), 2)
 	})
 
@@ -1391,9 +1449,9 @@ func TestGetToken_bearerChallenges(t *testing.T) {
 			tokenHandler(t),
 		))
 
-		got, err := GetToken(newTestLogger(t), t.Context(), newImageContainer(t, registryImage(server)), "", server.Client(), registryConfig.Registry{}, "")
+		got, err := GetToken(newTestLogger(t), t.Context(), modelfixture.Container(containerfixture.WithImageName(registryImage(server))), "", server.Client(), registryConfig.Registry{}, "")
 		require.NoError(t, err)
-		assert.Equal(t, TokenResult{Token: "Bearer mock-token", ChallengeHost: server.Addr()}, got)
+		assert.Equal(t, TokenResult{Token: "Bearer mock-token"}, got)
 		assert.Len(t, server.ReceivedRequests(), 2)
 	})
 
@@ -1410,13 +1468,12 @@ func TestGetToken_bearerChallenges(t *testing.T) {
 			httpstub.RespondWith(http.StatusFound, "", http.Header{"Location": {redirectServer.URL() + "/v2/"}}),
 		))
 
-		got, err := GetToken(newTestLogger(t), t.Context(), newImageContainer(t, registryImage(server)), "", server.Client(), registryConfig.Registry{}, "")
+		got, err := GetToken(newTestLogger(t), t.Context(), modelfixture.Container(containerfixture.WithImageName(registryImage(server))), "", server.Client(), registryConfig.Registry{}, "")
 		require.NoError(t, err)
 		assert.Equal(t, TokenResult{
-			Token:         "Bearer mock-token",
-			ChallengeHost: redirectServer.Addr(),
-			Redirected:    true,
-			RedirectHost:  redirectServer.Addr(),
+			Token:        "Bearer mock-token",
+			Redirected:   true,
+			RedirectHost: redirectServer.Addr(),
 		}, got)
 		assert.Len(t, server.ReceivedRequests(), 1)
 		assert.Len(t, redirectServer.ReceivedRequests(), 2)
@@ -1445,7 +1502,7 @@ func TestGetToken_redirectLimit(t *testing.T) {
 
 	settings := registryConfig.Registry{TLSSkip: true}
 
-	got, err := GetToken(newTestLogger(t), t.Context(), newImageContainer(t, registryImage(servers[0])), "", NewAuthClient(nil, settings), settings, "")
+	got, err := GetToken(newTestLogger(t), t.Context(), modelfixture.Container(containerfixture.WithImageName(registryImage(servers[0]))), "", NewAuthClient(nil, settings), settings, "")
 	require.ErrorIs(t, err, errUnexpectedStatus)
 	assert.Empty(t, got.Token)
 

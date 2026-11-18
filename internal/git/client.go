@@ -15,11 +15,11 @@ import (
 	"github.com/rs/zerolog"
 
 	composeLabels "github.com/nicholas-fedor/watchtower/internal/compose/labels"
+	"github.com/nicholas-fedor/watchtower/internal/container"
 	"github.com/nicholas-fedor/watchtower/internal/container/labels"
 	"github.com/nicholas-fedor/watchtower/internal/container/provenance"
 	"github.com/nicholas-fedor/watchtower/internal/git/semver"
 	gitConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/git"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // Options configures a Git watcher client. Credentials stay here, not on [gitConfig.Defaults].
@@ -57,14 +57,27 @@ type CheckResult struct {
 
 // Client inspects remotes and clones repositories for Git-sourced updates.
 type Client struct {
-	lister   RefLister
-	log      *zerolog.Logger
-	http     *http.Client
-	origins  map[string]url.URL
-	seen     map[string]seenStamp
+	// lister lists a remote's branches and tags for staleness checks.
+	lister RefLister
+	// log receives the client's log lines.
+	log *zerolog.Logger
+	// http sends provider API requests, such as tag lists and host probes.
+	http *http.Client
+	// origins maps a hostname to the HTTP API origin found for it.
+	origins map[string]url.URL
+	// seen holds, per repository, ref, and policy, the remote tip last
+	// observed without a rebuild.
+	seen map[string]seenStamp
+	// rejected holds, per Compose member, the commit a failed apply wrote and
+	// the baseline to check against instead.
 	rejected map[string]rejectedApply
-	opts     Options
-	mu       sync.Mutex
+	// unrestarted holds, per container, the commit and image of a build the
+	// no-restart configuration option left unused.
+	unrestarted map[container.ContainerID]unrestartedBuild
+	// opts holds the credentials, timeout, and host mappings the client uses.
+	opts Options
+	// mu guards seen, rejected, and unrestarted.
+	mu sync.Mutex
 }
 
 // seenStamp is a remote tip observed without rebuilding the running container.
@@ -80,6 +93,14 @@ type rejectedApply struct {
 	commit         string
 	previousCommit string
 	previousTag    string
+}
+
+// unrestartedBuild is an image built for a container that was not recreated.
+type unrestartedBuild struct {
+	// commit is the commit the image was built from.
+	commit string
+	// image is the image the build produced.
+	image container.ImageID
 }
 
 // unacceptedRevision is a baseline that cannot match a real Git object.
@@ -225,7 +246,7 @@ func (c *Client) Clone(ctx context.Context, repo string, rev CheckResult) (strin
 func CheckContainer(
 	ctx context.Context,
 	client *Client,
-	c types.Container,
+	c *container.Container,
 	defaults gitConfig.Defaults,
 ) (CheckResult, error) {
 	assoc, ok := provenance.ResolveAssociation(c, defaults)
@@ -310,7 +331,7 @@ type ApplyStampKey struct {
 //
 // Returns:
 //   - ApplyStampKey: Project name, directory, config files, service, and replica number.
-func ApplyStampKeyFrom(c types.Container) ApplyStampKey {
+func ApplyStampKeyFrom(c *container.Container) ApplyStampKey {
 	if c == nil {
 		return ApplyStampKey{}
 	}
@@ -410,6 +431,62 @@ func (c *Client) AcceptApply(key ApplyStampKey, commit string) {
 	}
 
 	delete(c.rejected, memberKey)
+}
+
+// RecordUnrestartedBuild records an image built for a container that the
+// no-restart configuration option leaves running.
+//
+// The running container keeps its old stamp. Later checks still find it
+// stale for the same commit. [Client.UnrestartedBuild] lets a later session in
+// this process find the image instead of building it again. The record lasts
+// until Watchtower exits.
+//
+// Parameters:
+//   - containerID: Container that was not recreated.
+//   - commit: Commit the image was built from.
+//   - image: Image the build produced.
+func (c *Client) RecordUnrestartedBuild(containerID container.ContainerID, commit string, image container.ImageID) {
+	if c == nil || containerID == "" || commit == "" || image == "" {
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.unrestarted == nil {
+		c.unrestarted = make(map[container.ContainerID]unrestartedBuild)
+	}
+
+	c.unrestarted[containerID] = unrestartedBuild{
+		commit: strings.ToLower(strings.TrimSpace(commit)),
+		image:  image,
+	}
+}
+
+// UnrestartedBuild returns the image recorded by [Client.RecordUnrestartedBuild]
+// for a container and commit.
+//
+// Parameters:
+//   - containerID: Container to look up.
+//   - commit: Commit the current check wants to build.
+//
+// Returns:
+//   - container.ImageID: The image built earlier from commit, or empty when
+//     none was recorded or it was built from another commit.
+func (c *Client) UnrestartedBuild(containerID container.ContainerID, commit string) container.ImageID {
+	if c == nil {
+		return ""
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	built, ok := c.unrestarted[containerID]
+	if !ok || !sameRevision(commit, built.commit) {
+		return ""
+	}
+
+	return built.image
 }
 
 // repositoryOperationError wraps a remote operation failure without exposing repository credentials.

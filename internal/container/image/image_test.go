@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,7 +29,6 @@ import (
 	"github.com/nicholas-fedor/watchtower/internal/testutil/httpstub"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/logcapture"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/modelfixture"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // Errors of a pull that a registry rate limited.
@@ -39,6 +39,12 @@ const (
 	// pull and the image once, before the limit.
 	wantRateLimitedPull = "failed to pull image: ghcr.io/linuxserver/nginx:latest: " +
 		"registry rate limited: retry-after 2h0m0s allowed 44000 per 1m0s"
+	// hubPullLimit is Docker Hub's pull rate limit as an engine using the
+	// containerd image store reports it.
+	hubPullLimit = "error from registry: You have reached your unauthenticated pull rate limit. " +
+		"https://www.docker.com/increase-rate-limit"
+	// wantHubPullLimit is the pull's error for that report.
+	wantHubPullLimit = "failed to pull image: docker.io/library/nginx:latest: registry rate limited: " + hubPullLimit
 )
 
 // newTestImageClient returns an image client on api with a daemon info cache of
@@ -234,8 +240,8 @@ func TestImageClient_shouldSkipPull(t *testing.T) {
 }
 
 // TestImageClient_PullImage verifies that a digest-pinned image is never pulled,
-// that pull failures are classified as authentication, missing image, or other
-// failures, and that a missing or failing registry mirror configuration falls
+// that a pull the engine fails is a [PullError] carrying the engine's error
+// unchanged, and that a missing or failing registry mirror configuration falls
 // back to the canonical registry.
 //
 // Pulls share package-level slots per registry host, so the test does not run
@@ -259,78 +265,46 @@ func TestImageClient_PullImage(t *testing.T) {
 		})
 	})
 
-	t.Run("pulling an image that requires authentication", func(t *testing.T) {
-		t.Run("should log at Debug level and return errPullImageUnauthorized for auth failures", func(t *testing.T) {
-			image := failingRegistry(t) + "/app:latest"
+	// The engine's error reaches the caller unchanged, so its category still
+	// reads through the PullError.
+	t.Run("the engine fails the pull", func(t *testing.T) {
+		tests := []struct {
+			name      string
+			engineErr error
+			category  func(error) bool
+		}{
+			{name: "authentication required", engineErr: cerrdefs.ErrUnauthenticated.WithMessage("unauthorized: authentication required"), category: cerrdefs.IsUnauthorized},
+			{name: "image not found", engineErr: cerrdefs.ErrNotFound.WithMessage("manifest unknown"), category: cerrdefs.IsNotFound},
+			{name: "server error", engineErr: errors.New("Error response from daemon: internal server error"), category: nil},
+		}
 
-			api := newImageAPI(t)
-			api.EXPECT().ImagePull(mock.Anything, image, mock.Anything).
-				Return(nil, cerrdefs.ErrUnauthenticated.WithMessage("unauthorized: authentication required")).Once()
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				image := failingRegistry(t) + "/app:latest"
 
-			log, logbuf := logcapture.New(zerolog.DebugLevel)
-			i := newTestImageClient(api, log, registryConfig.Registry{TLSSkip: true}, ratelimit.New())
+				api := newImageAPI(t)
+				api.EXPECT().ImagePull(mock.Anything, image, mock.Anything).Return(nil, tt.engineErr).Once()
 
-			err := i.PullImage(
-				t.Context(),
-				modelfixture.Container(containerfixture.WithImageName(image), containerfixture.WithRepoDigests([]string{image + "@sha256:abc"})),
-				warnAuto,
-				updateConfig.Policy{},
-			)
-			require.ErrorIs(t, err, errPullImageUnauthorized)
-			require.ErrorIs(t, err, errPullImageFailed)
-			require.EqualError(t, err, "failed to pull image: "+image+": authentication required: unauthorized: authentication required")
-			assert.Regexp(t, `level=debug msg="Image pull failed: authentication required"`, logbuf.String())
-			assert.NotContains(t, logbuf.String(), "level=warn")
-		})
-	})
+				log, logbuf := logcapture.New(zerolog.DebugLevel)
+				i := newTestImageClient(api, log, registryConfig.Registry{TLSSkip: true}, ratelimit.New())
 
-	t.Run("pulling an image that does not exist in registry", func(t *testing.T) {
-		t.Run("should log at Debug level and return errPullImageNotFound for not found errors", func(t *testing.T) {
-			image := failingRegistry(t) + "/nonexistent:latest"
+				err := i.PullImage(
+					t.Context(),
+					modelfixture.Container(containerfixture.WithImageName(image), containerfixture.WithRepoDigests([]string{image + "@sha256:" + containerfixture.RandomID()})),
+					warnAuto,
+					updateConfig.Policy{},
+				)
+				requirePullError(t, err, image, tt.engineErr.Error())
+				require.ErrorIs(t, err, tt.engineErr)
 
-			api := newImageAPI(t)
-			api.EXPECT().ImagePull(mock.Anything, image, mock.Anything).
-				Return(nil, cerrdefs.ErrNotFound.WithMessage("manifest for "+image+" not found")).Once()
+				if tt.category != nil {
+					assert.True(t, tt.category(err))
+				}
 
-			log, logbuf := logcapture.New(zerolog.DebugLevel)
-			i := newTestImageClient(api, log, registryConfig.Registry{TLSSkip: true}, ratelimit.New())
-
-			err := i.PullImage(
-				t.Context(),
-				modelfixture.Container(containerfixture.WithImageName(image), containerfixture.WithRepoDigests([]string{image + "@sha256:def"})),
-				warnAuto,
-				updateConfig.Policy{},
-			)
-			require.ErrorIs(t, err, errPullImageNotFound)
-			require.ErrorIs(t, err, errPullImageFailed)
-			require.EqualError(t, err, "failed to pull image: "+image+": image not found: manifest for "+image+" not found")
-			assert.Contains(t, logbuf.String(), "Image pull failed: image not found in registry")
-		})
-	})
-
-	t.Run("pulling an image with a server error", func(t *testing.T) {
-		t.Run("should log at Debug level and return errPullImageFailed for other errors", func(t *testing.T) {
-			image := failingRegistry(t) + "/app:latest"
-
-			api := newImageAPI(t)
-			api.EXPECT().ImagePull(mock.Anything, image, mock.Anything).
-				Return(nil, errors.New("Error response from daemon: internal server error")).Once()
-
-			log, logbuf := logcapture.New(zerolog.DebugLevel)
-			i := newTestImageClient(api, log, registryConfig.Registry{TLSSkip: true}, ratelimit.New())
-
-			err := i.PullImage(
-				t.Context(),
-				modelfixture.Container(containerfixture.WithImageName(image), containerfixture.WithRepoDigests([]string{image + "@sha256:ghi"})),
-				warnAuto,
-				updateConfig.Policy{},
-			)
-			require.ErrorIs(t, err, errPullImageFailed)
-			require.EqualError(t, err, "failed to pull image: "+image+": Error response from daemon: internal server error")
-			require.NotErrorIs(t, err, errPullImageUnauthorized)
-			require.NotErrorIs(t, err, errPullImageNotFound)
-			assert.Contains(t, logbuf.String(), "Failed to initiate image pull")
-		})
+				assert.Regexp(t, `level=debug msg="Failed to initiate image pull"`, logbuf.String())
+				assert.NotContains(t, logbuf.String(), "level=warn")
+			})
+		}
 	})
 
 	t.Run("pulling an image with registry mirrors configured", func(t *testing.T) {
@@ -349,7 +323,7 @@ func TestImageClient_PullImage(t *testing.T) {
 				warnAuto,
 				updateConfig.Policy{},
 			)
-			require.ErrorIs(t, err, errPullImageUnauthorized)
+			requirePullError(t, err, image, "unauthorized")
 		})
 
 		t.Run("should handle Info() API failure gracefully and fall back to canonical", func(t *testing.T) {
@@ -368,9 +342,29 @@ func TestImageClient_PullImage(t *testing.T) {
 				warnAuto,
 				updateConfig.Policy{},
 			)
-			require.ErrorIs(t, err, errPullImageUnauthorized)
+			requirePullError(t, err, image, "unauthorized")
 		})
 	})
+}
+
+// requirePullError checks that err is a [PullError] for image whose engine
+// error reads engineErr. The engine reads as Docker, since only the container
+// client knows whether it is Podman.
+//
+// Parameters:
+//   - t: Test handle.
+//   - err: The pull's error.
+//   - image: The image the pull was for.
+//   - engineErr: The engine's error message.
+func requirePullError(t *testing.T, err error, image, engineErr string) {
+	t.Helper()
+
+	pullErr, ok := errors.AsType[*PullError](err)
+	require.True(t, ok, "want a *PullError, got %T: %v", err, err)
+	assert.Equal(t, image, pullErr.Image)
+	assert.False(t, pullErr.Podman)
+	require.EqualError(t, pullErr.Err, engineErr)
+	require.EqualError(t, err, "Docker could not pull "+image+": "+engineErr)
 }
 
 // TestImageClient_performImagePull verifies that a pull waits for its progress
@@ -391,6 +385,21 @@ func TestImageClient_performImagePull(t *testing.T) {
 			i := newTestImageClient(api, newTestLogger(t), registryConfig.Registry{}, ratelimit.New())
 
 			require.NoError(t, i.performImagePull(t.Context(), "registry.example.com/app:latest", dockerClient.ImagePullOptions{}))
+		})
+
+		t.Run("returns the engine's error when the stream reports a failure", func(t *testing.T) {
+			// The engine's text for a registry that did not answer in time.
+			const engineErr = `failed to copy: httpReadSeeker: failed open: failed to do request: ` +
+				`Get "https://ghcr.io/v2/linuxserver/lidarr/manifests/sha256:7f4e": net/http: timeout awaiting response headers`
+
+			api := newImageAPI(t)
+			api.EXPECT().ImagePull(mock.Anything, "registry.example.com/app:latest", dockerClient.ImagePullOptions{}).
+				Return(pullResponse(t, errors.New(engineErr)), nil).Once()
+
+			i := newTestImageClient(api, newTestLogger(t), registryConfig.Registry{}, ratelimit.New())
+
+			err := i.performImagePull(t.Context(), "registry.example.com/app:latest", dockerClient.ImagePullOptions{})
+			requirePullError(t, err, "registry.example.com/app:latest", engineErr)
 		})
 
 		t.Run("returns a rate-limit error when the stream reports toomanyrequests", func(t *testing.T) {
@@ -419,6 +428,19 @@ func TestImageClient_performImagePull(t *testing.T) {
 			err := i.performImagePull(ctx, "ghcr.io/linuxserver/nginx:latest", dockerClient.ImagePullOptions{})
 			assert.True(t, ratelimit.Is(err), "unexpected error %v", err)
 			assert.EqualError(t, err, wantRateLimitedPull)
+		})
+
+		t.Run("returns a rate-limit error after one attempt when the engine reports Docker Hub's pull rate limit", func(t *testing.T) {
+			// Docker Engine 29.10 and later classify the limit from the registry's 429.
+			api := newImageAPI(t)
+			api.EXPECT().ImagePull(mock.Anything, "docker.io/library/nginx:latest", dockerClient.ImagePullOptions{}).
+				Return(pullResponse(t, cerrdefs.ErrResourceExhausted.WithMessage(hubPullLimit)), nil).Once()
+
+			i := newTestImageClient(api, newTestLogger(t), registryConfig.Registry{}, ratelimit.New())
+
+			err := i.performImagePull(t.Context(), "docker.io/library/nginx:latest", dockerClient.ImagePullOptions{})
+			assert.True(t, ratelimit.Is(err), "unexpected error %v", err)
+			assert.EqualError(t, err, wantHubPullLimit)
 		})
 
 		t.Run("backs off and succeeds when the daemon reports a sub-millisecond retry-after", func(t *testing.T) {
@@ -636,10 +658,10 @@ func TestImageClient_RemoveImageByID(t *testing.T) {
 			log, logbuf := logcapture.New(zerolog.DebugLevel)
 			c := newTestImageClient(api, log, registryConfig.Registry{}, ratelimit.New())
 
-			require.NoError(t, c.RemoveImageByID(t.Context(), types.ImageID(imageA), "test-image"))
+			require.NoError(t, c.RemoveImageByID(t.Context(), container.ImageID(imageA), "test-image"))
 
-			shortA := types.ImageID(imageA).ShortID()
-			shortAParent := types.ImageID(imageAParent).ShortID()
+			shortA := container.ImageID(imageA).ShortID()
+			shortAParent := container.ImageID(imageAParent).ShortID()
 
 			assert.Regexp(t, fmt.Sprintf(`msg="Image removal details" deleted="%s, %s" image_id=%s image_name=test-image untagged=%s`, shortA, shortAParent, shortA, shortA), logbuf.String())
 			assert.Regexp(t, fmt.Sprintf(`msg="Cleaned up old image" image_id=%s image_name=test-image`, shortA), logbuf.String())
@@ -661,7 +683,7 @@ func TestImageClient_RemoveImageByID(t *testing.T) {
 
 			c := newTestImageClient(api, newTestLogger(t), registryConfig.Registry{}, ratelimit.New())
 
-			err := c.RemoveImageByID(t.Context(), types.ImageID(image), "test-image")
+			err := c.RemoveImageByID(t.Context(), container.ImageID(image), "test-image")
 			assert.True(t, cerrdefs.IsNotFound(err), "unexpected error %v", err)
 		})
 	})
@@ -685,7 +707,7 @@ func TestImageClient_RemoveImageByID(t *testing.T) {
 
 					c := newTestImageClient(api, newTestLogger(t), registryConfig.Registry{}, ratelimit.New())
 
-					require.ErrorIs(t, c.RemoveImageByID(t.Context(), types.ImageID(imageA), "test-image"), ErrImageInUse)
+					require.ErrorIs(t, c.RemoveImageByID(t.Context(), container.ImageID(imageA), "test-image"), ErrImageInUse)
 				})
 			}
 		})
@@ -703,7 +725,7 @@ func TestImageClient_RemoveImageByID(t *testing.T) {
 
 			c := newTestImageClient(api, newTestLogger(t), registryConfig.Registry{}, ratelimit.New())
 
-			err := c.RemoveImageByID(t.Context(), types.ImageID(containerfixture.RandomID()), "test-image")
+			err := c.RemoveImageByID(t.Context(), container.ImageID(containerfixture.RandomID()), "test-image")
 			require.ErrorContains(t, err, "cannot verify image usage")
 		})
 	})
@@ -724,7 +746,7 @@ func TestImageClient_RemoveImageByID(t *testing.T) {
 			log, logbuf := logcapture.New(zerolog.WarnLevel)
 			c := newTestImageClient(api, log, registryConfig.Registry{}, ratelimit.New())
 
-			require.ErrorIs(t, c.RemoveImageByID(ctx, types.ImageID(containerfixture.RandomID()), "test-image"), context.Canceled)
+			require.ErrorIs(t, c.RemoveImageByID(ctx, container.ImageID(containerfixture.RandomID()), "test-image"), context.Canceled)
 			assert.NotContains(t, logbuf.String(), "Failed to list containers for image usage check")
 		})
 	})
@@ -754,7 +776,7 @@ func TestImageClient_IsContainerStale_noPull(t *testing.T) {
 			stale, latestID, _, err := c.IsContainerStale(t.Context(), runningImage("test-image:latest", currentImageID), updateConfig.Policy{NoPull: true}, "")
 			require.NoError(t, err)
 			assert.False(t, stale)
-			assert.Equal(t, types.ImageID(currentImageID), latestID)
+			assert.Equal(t, container.ImageID(currentImageID), latestID)
 			assert.Contains(t, logbuf.String(), `msg="Skipping image pull due to no-pull setting - checking local image only"`)
 			assert.Contains(t, logbuf.String(), `msg="No new image found"`)
 		})
@@ -778,7 +800,7 @@ func TestImageClient_IsContainerStale_noPull(t *testing.T) {
 			stale, latestID, _, err := c.IsContainerStale(t.Context(), runningImage("test-image:latest", currentImageID), updateConfig.Policy{NoPull: true}, "")
 			require.NoError(t, err)
 			assert.True(t, stale)
-			assert.Equal(t, types.ImageID(newImageID), latestID)
+			assert.Equal(t, container.ImageID(newImageID), latestID)
 			assert.Contains(t, logbuf.String(), `msg="Skipping image pull due to no-pull setting - checking local image only"`)
 			assert.Contains(t, logbuf.String(), `msg="Found new image"`)
 		})
@@ -869,7 +891,7 @@ func TestImageClient_IsContainerStale_noPull(t *testing.T) {
 			stale, latestID, _, err := c.IsContainerStale(t.Context(), runningImage("test-image:latest", currentImageID), updateConfig.Policy{NoPull: true}, "")
 			require.Error(t, err)
 			assert.False(t, stale)
-			assert.Equal(t, types.ImageID(currentImageID), latestID)
+			assert.Equal(t, container.ImageID(currentImageID), latestID)
 			assert.Contains(t, logbuf.String(), `msg="Skipping image pull due to no-pull setting - checking local image only"`)
 			assert.Contains(t, logbuf.String(), `msg="Failed to inspect latest image"`)
 		})
@@ -902,10 +924,13 @@ func TestImageClient_IsContainerStale_noPull(t *testing.T) {
 	})
 }
 
-// TestImageClient_IsContainerStale_pull verifies the staleness check that pulls:
-// a registry digest that differs from the running image's is pulled and the new
-// image's digest reported, a matching digest skips the pull while the local tag
-// is still compared, and an image without repo digests is never pulled.
+// TestImageClient_IsContainerStale_pull verifies the staleness check that pulls.
+//
+// A registry digest that differs from the running image's is pulled and the
+// new image's digest reported. A matching digest skips the pull while the
+// local tag is still compared. An image the engine cannot find leaves the
+// running one current, and any other failed pull returns the engine's error.
+// An image without repo digests is never pulled.
 //
 // Pulls share package-level slots per registry host, so the test does not run
 // in parallel.
@@ -953,10 +978,43 @@ func TestImageClient_IsContainerStale_pull(t *testing.T) {
 			stale, latestID, latestDigest, err := c.IsContainerStale(t.Context(), runningImage(image, currentImageID, registry.Addr()+"/test/image@"+localDigest), updateConfig.Policy{}, "")
 			require.NoError(t, err)
 			assert.False(t, stale)
-			assert.Equal(t, types.ImageID(currentImageID), latestID)
+			assert.Equal(t, container.ImageID(currentImageID), latestID)
 			assert.Equal(t, localDigest, latestDigest)
 			assert.Contains(t, logbuf.String(), "Digest match, skipping pull")
 		})
+	})
+
+	t.Run("the engine's pull fails", func(t *testing.T) {
+		tests := []struct {
+			name    string
+			pullErr error
+			wantErr bool
+		}{
+			{name: "the registry does not have the image", pullErr: cerrdefs.ErrNotFound.WithMessage("manifest unknown"), wantErr: false},
+			{name: "the registry does not answer", pullErr: errors.New("net/http: timeout awaiting response headers"), wantErr: true},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				currentImageID := "sha256:" + containerfixture.RandomID()
+				image := failingRegistry(t) + "/app:latest"
+
+				api := newImageAPI(t)
+				api.EXPECT().ImagePull(mock.Anything, image, mock.Anything).Return(nil, tt.pullErr).Once()
+
+				c := newTestImageClient(api, newTestLogger(t), registryConfig.Registry{TLSSkip: true}, ratelimit.New())
+
+				stale, latestID, _, err := c.IsContainerStale(t.Context(), runningImage(image, currentImageID, image+"@sha256:"+containerfixture.RandomID()), updateConfig.Policy{}, "")
+				assert.False(t, stale)
+				assert.Equal(t, container.ImageID(currentImageID), latestID)
+
+				if tt.wantErr {
+					requirePullError(t, err, image, tt.pullErr.Error())
+				} else {
+					require.NoError(t, err)
+				}
+			})
+		}
 	})
 
 	// Empty RepoDigests skips the registry pull, but HasNewImage still compares
@@ -982,6 +1040,87 @@ func TestImageClient_IsContainerStale_pull(t *testing.T) {
 			assert.Contains(t, logbuf.String(), "Found new image")
 		})
 	})
+}
+
+// TestImageClient_IsContainerStale_cooldown verifies the debug line the staleness
+// check logs when a cooldown holds a newer image back. A deferral logs that the
+// cooldown is active. A failed age lookup logs that the image age is
+// unavailable. Neither logs a failed pull, since no pull was attempted.
+func TestImageClient_IsContainerStale_cooldown(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		// registry starts the registry the image is checked against and
+		// returns the image's name.
+		registry func(t *testing.T) string
+		name     string
+		// message is the debug line the check logs.
+		message string
+		// absent is the other outcome's debug line, which the check must not log.
+		absent   string
+		deferred bool
+	}{
+		{
+			name: "deferral",
+			registry: func(t *testing.T) string {
+				t.Helper()
+
+				return createdRegistry(t, time.Now().Add(-time.Minute)) + "/org/app:1.0"
+			},
+			message:  "Cooldown active - pull skipped",
+			absent:   "Image age unavailable - pull skipped",
+			deferred: true,
+		},
+		{
+			name: "failed age lookup",
+			registry: func(t *testing.T) string {
+				t.Helper()
+
+				return notFoundRegistry(t) + "/org/app:1.0"
+			},
+			message:  "Image age unavailable - pull skipped",
+			absent:   "Cooldown active - pull skipped",
+			deferred: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			image := tt.registry(t)
+			repoDigest := strings.TrimSuffix(image, ":1.0") + "@sha256:" + containerfixture.RandomID()
+			currentImageID := "sha256:" + containerfixture.RandomID()
+
+			// ImagePull has no expectation. A pull fails the test.
+			log, buf := logcapture.NewJSON(zerolog.DebugLevel)
+			c := newTestImageClient(newImageAPI(t), log, registryConfig.Registry{TLSSkip: true}, ratelimit.New())
+
+			stale, latestID, _, err := c.IsContainerStale(t.Context(), runningImage(image, currentImageID, repoDigest),
+				updateConfig.Policy{CooldownDelay: time.Hour}, warnAuto)
+
+			var cooldownErr *CooldownError
+			require.ErrorAs(t, err, &cooldownErr)
+			assert.Equal(t, tt.deferred, errors.Is(err, ErrImageCooldown))
+			assert.False(t, stale)
+			assert.Equal(t, container.ImageID(currentImageID), latestID)
+
+			debug := logcapture.Messages(t, buf.String(), "debug")
+			assert.Contains(t, debug, tt.message)
+			assert.NotContains(t, debug, tt.absent)
+
+			// The debug line carries the error the check returns.
+			var logged []any
+
+			for _, entry := range logcapture.Entries[logcapture.Entry](t, buf.String()) {
+				if entry["message"] == tt.message {
+					logged = append(logged, entry["error"])
+				}
+			}
+
+			assert.Equal(t, []any{err.Error()}, logged)
+		})
+	}
 }
 
 // TestIsImagePinnedByDigest verifies which image references are pinned by a
@@ -1038,13 +1177,13 @@ func TestImageClient_CheckContainerUpdate(t *testing.T) {
 			t.Run(name, func(t *testing.T) {
 				t.Parallel()
 
-				container := modelfixture.Container(containerfixture.WithImageName(ref))
+				target := modelfixture.Container(containerfixture.WithImageName(ref))
 				c := newTestImageClient(newImageAPI(t), newTestLogger(t), registryConfig.Registry{}, ratelimit.New())
 
-				available, latestID, latestDigest, err := c.CheckContainerUpdate(t.Context(), container, updateConfig.Policy{})
+				available, latestID, latestDigest, err := c.CheckContainerUpdate(t.Context(), target, updateConfig.Policy{})
 				require.NoError(t, err)
 				assert.False(t, available)
-				assert.Equal(t, string(container.ImageID()), string(latestID))
+				assert.Equal(t, string(target.ImageID()), string(latestID))
 				assert.Empty(t, latestDigest)
 			})
 		}
@@ -1066,7 +1205,7 @@ func TestImageClient_CheckContainerUpdate(t *testing.T) {
 			available, latestID, _, err := c.CheckContainerUpdate(t.Context(), runningImage("test-image:latest", currentImageID), updateConfig.Policy{NoPull: true})
 			require.NoError(t, err)
 			assert.False(t, available)
-			assert.Equal(t, types.ImageID(currentImageID), latestID)
+			assert.Equal(t, container.ImageID(currentImageID), latestID)
 		})
 	})
 
@@ -1082,7 +1221,7 @@ func TestImageClient_CheckContainerUpdate(t *testing.T) {
 			available, latestID, latestDigest, err := c.CheckContainerUpdate(t.Context(), runningImage("local-build:latest", currentImageID, []string{}...), updateConfig.Policy{})
 			require.NoError(t, err)
 			assert.False(t, available)
-			assert.Equal(t, types.ImageID(currentImageID), latestID)
+			assert.Equal(t, container.ImageID(currentImageID), latestID)
 			assert.Empty(t, latestDigest)
 		})
 	})
@@ -1105,7 +1244,7 @@ func TestImageClient_CheckContainerUpdate(t *testing.T) {
 			available, latestID, latestDigest, err := c.CheckContainerUpdate(t.Context(), runningImage(image, currentImageID, registry.Addr()+"/test/image@"+localDigest), updateConfig.Policy{})
 			require.NoError(t, err)
 			assert.False(t, available)
-			assert.Equal(t, types.ImageID(currentImageID), latestID)
+			assert.Equal(t, container.ImageID(currentImageID), latestID)
 			assert.Equal(t, localDigest, latestDigest)
 			assert.Len(t, registry.ReceivedRequests(), 2)
 		})
@@ -1126,7 +1265,7 @@ func TestImageClient_CheckContainerUpdate(t *testing.T) {
 			available, latestID, latestDigest, err := c.CheckContainerUpdate(t.Context(), runningImage(image, currentImageID, registry.Addr()+"/test/image@"+localDigest), updateConfig.Policy{})
 			require.NoError(t, err)
 			assert.True(t, available)
-			assert.Equal(t, types.ImageID(""), latestID)
+			assert.Equal(t, container.ImageID(""), latestID)
 			assert.Equal(t, remoteDigest, latestDigest)
 			assert.Len(t, registry.ReceivedRequests(), 2)
 		})
@@ -1186,6 +1325,12 @@ func TestExtractImageDigest(t *testing.T) {
 				want:        "sha256:bbb",
 			},
 			{
+				name:        "takes the first of several RepoDigests matching the image name",
+				repoDigests: []string{"docker.io/library/nginx@sha256:first", "nginx@sha256:second"},
+				imageName:   "nginx:latest",
+				want:        "sha256:first",
+			},
+			{
 				name:        "preserves the registry port when matching a tagged image name",
 				repoDigests: []string{"registry.example.com:5000/nginx@sha256:def456", "docker.io/library/nginx@sha256:bbb"},
 				imageName:   "registry.example.com:5000/nginx:latest",
@@ -1219,6 +1364,50 @@ func TestExtractImageDigest(t *testing.T) {
 			})
 		}
 	})
+}
+
+// TestLocalDigest verifies that a container's local digest is chosen by its
+// own image name and is empty when its image was not inspected. The selection
+// rules themselves belong to TestExtractImageDigest.
+func TestLocalDigest(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		container *container.Container
+		want      string
+	}{
+		{
+			name: "image not inspected",
+			container: modelfixture.ContainerWithoutImageInfo(
+				containerfixture.WithImageName("nginx:latest"),
+			),
+			want: "",
+		},
+		{
+			name:      "image without repo digests",
+			container: runningImage("nginx:latest", "sha256:abc"),
+			want:      "",
+		},
+		{
+			name: "the container's repository among several",
+			container: runningImage(
+				"ghcr.io/org/app:latest",
+				"sha256:abc",
+				"docker.io/org/app@sha256:hub",
+				"ghcr.io/org/app@sha256:ghcr",
+			),
+			want: "sha256:ghcr",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, tt.want, LocalDigest(tt.container))
+		})
+	}
 }
 
 // TestImageClient_isOutsideCooldown_beforePull verifies that the cooldown gate
@@ -1288,8 +1477,8 @@ func newImageAPI(t *testing.T) *mockContainer.MockAPIClient {
 func runningImage(imageName, imageID string, repoDigests ...string) *container.Container {
 	options := []containerfixture.Update{
 		containerfixture.WithImageName(imageName),
-		func(container *dockerContainer.InspectResponse, image *dockerImage.InspectResponse) {
-			container.Image = imageID
+		func(c *dockerContainer.InspectResponse, image *dockerImage.InspectResponse) {
+			c.Image = imageID
 			image.ID = imageID
 		},
 	}

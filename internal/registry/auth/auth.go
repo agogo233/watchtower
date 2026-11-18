@@ -11,10 +11,10 @@ import (
 	"github.com/distribution/reference"
 	"github.com/rs/zerolog"
 
+	"github.com/nicholas-fedor/watchtower/internal/container"
 	"github.com/nicholas-fedor/watchtower/internal/meta"
 	"github.com/nicholas-fedor/watchtower/internal/registry/ratelimit"
 	registryConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/registry"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // Errors for auth operations.
@@ -38,8 +38,6 @@ var ErrMissingRegistryHost = errors.New("image reference names no registry host"
 type TokenResult struct {
 	// Token is the authentication token (for example "Basic ..." or "Bearer ...").
 	Token string
-	// ChallengeHost is the challenge host (for example "ghcr.io"), empty if not applicable.
-	ChallengeHost string
 	// RedirectHost is the final host after redirects, empty if not redirected.
 	RedirectHost string
 	// Redirected is true if the challenge request was redirected.
@@ -125,6 +123,27 @@ func ResolveEndpoint(endpoint, canonical, scheme string) (string, string, error)
 	}
 
 	return host, hostScheme, nil
+}
+
+// RedactEndpoint returns the host a registry endpoint override names, for logs.
+//
+// The endpoint is read as [ResolveEndpoint] reads it, so the log shows the host
+// a request goes to and never the endpoint's credentials, path or query. An
+// endpoint that [ResolveEndpoint] rejects gives a placeholder. An empty
+// endpoint gives an empty string.
+//
+// Parameters:
+//   - endpoint: Registry endpoint override, or empty for the canonical host.
+//
+// Returns:
+//   - string: The endpoint's host, "<redacted>", or empty.
+func RedactEndpoint(endpoint string) string {
+	host, _, err := ResolveEndpoint(endpoint, "", "https")
+	if err != nil {
+		return "<redacted>"
+	}
+
+	return host
 }
 
 // isRequestHost reports whether host, with an optional port, is the whole
@@ -242,13 +261,12 @@ func getChallengeRequest(log *zerolog.Logger, ctx context.Context, challengeURL 
 //   - redirectHost: The final host after redirects.
 //
 // Returns:
-//   - TokenResult: Result with empty token and no challenge host.
+//   - TokenResult: Result with an empty token.
 func handleSuccessfulChallenge(redirected bool, redirectHost string) TokenResult {
 	return TokenResult{
-		Redirected:    redirected,
-		RedirectHost:  redirectHost,
-		ChallengeHost: "",
-		Token:         "",
+		Redirected:   redirected,
+		RedirectHost: redirectHost,
+		Token:        "",
 	}
 }
 
@@ -307,10 +325,9 @@ func handleBasicAuthChallenge(
 	log.Debug().Msg("Using Basic auth")
 
 	return TokenResult{
-		Token:         "Basic " + registryAuth,
-		ChallengeHost: "",
-		Redirected:    redirected,
-		RedirectHost:  redirectHost,
+		Token:        "Basic " + registryAuth,
+		Redirected:   redirected,
+		RedirectHost: redirectHost,
 	}, nil
 }
 
@@ -336,7 +353,7 @@ func handleUnsupportedChallenge(log *zerolog.Logger, challenge string) (TokenRes
 // Parameters:
 //   - log: Contextual logger.
 //   - ctx: Context for request lifecycle control.
-//   - container: Container with image info.
+//   - c: Container with image info.
 //   - registryAuth: Base64-encoded auth string.
 //   - client: Client for HTTP requests.
 //   - settings: Registry request settings.
@@ -352,7 +369,7 @@ func handleUnsupportedChallenge(log *zerolog.Logger, challenge string) (TokenRes
 func processChallengeResponse(
 	log *zerolog.Logger,
 	ctx context.Context,
-	container types.Container,
+	c *container.Container,
 	registryAuth string,
 	client Client,
 	settings registryConfig.Registry,
@@ -408,7 +425,7 @@ func processChallengeResponse(
 			log,
 			ctx,
 			response.wwwAuthHeader,
-			container,
+			c,
 			registryAuth,
 			client,
 			settings,
@@ -428,7 +445,7 @@ func processChallengeResponse(
 //   - log: Contextual logger.
 //   - ctx: Context for request lifecycle control.
 //   - wwwAuthHeader: The WWW-Authenticate header value.
-//   - container: Container with image info.
+//   - c: Container with image info.
 //   - registryAuth: Base64-encoded auth string.
 //   - client: Client for HTTP requests.
 //   - settings: Registry request settings.
@@ -449,7 +466,7 @@ func handleBearerAuth(
 	log *zerolog.Logger,
 	ctx context.Context,
 	wwwAuthHeader string,
-	container types.Container,
+	c *container.Container,
 	registryAuth string,
 	client Client,
 	settings registryConfig.Registry,
@@ -468,35 +485,13 @@ func handleBearerAuth(
 		return TokenResult{}, fmt.Errorf("%w: %s", errInsecureChallengeRedirect, originalHost)
 	}
 
-	normalizedRef, err := reference.ParseNormalizedNamed(container.ImageName())
+	normalizedRef, err := reference.ParseNormalizedNamed(c.ImageName())
 	if err != nil {
 		log.Debug().
 			Err(err).
 			Msg("Failed to parse image name")
 
 		return TokenResult{}, fmt.Errorf("%w: %w", errFailedParseImageName, err)
-	}
-
-	authURL, err := getAuthURL(
-		log,
-		strings.ToLower(wwwAuthHeader),
-		normalizedRef,
-		registryAuth,
-		settings,
-	)
-	if err != nil {
-		log.Debug().
-			Err(err).
-			Msg("Failed to construct bearer auth URL")
-
-		return TokenResult{}, fmt.Errorf("%w: %w", errFailedConstructBearerAuthURL, err)
-	}
-
-	challengeHost := authURL.Host
-	if challengeHost != "" {
-		log.Debug().
-			Str("challenge_host", challengeHost).
-			Msg("Extracted challenge host")
 	}
 
 	token, err := getBearerToken(
@@ -525,20 +520,14 @@ func handleBearerAuth(
 		)
 	}
 
-	log.Debug().
-		Bool("token_present", token != "").
-		Str("challenge_host", challengeHost).
-		Msg("Returning Bearer token and challenge host")
-
 	return TokenResult{
-		Token:         token,
-		ChallengeHost: challengeHost,
-		Redirected:    redirected,
-		RedirectHost:  redirectHost,
+		Token:        token,
+		Redirected:   redirected,
+		RedirectHost: redirectHost,
 	}, nil
 }
 
-// GetToken fetches a token and the challenge host for the registry hosting the provided image.
+// GetToken fetches a token for the registry hosting the provided image.
 //
 // When endpoint is non-empty, it is used as the registry host for the challenge URL
 // instead of the canonical registry host. This enables digest checks against configured
@@ -550,29 +539,29 @@ func handleBearerAuth(
 // Parameters:
 //   - log: Process logger.
 //   - ctx: Context for request lifecycle control.
-//   - container: Container with image info.
+//   - c: Container with image info.
 //   - registryAuth: Base64-encoded auth string.
 //   - client: Client for HTTP requests.
 //   - settings: Registry request settings.
 //   - endpoint: Optional registry host override (for example a mirror address). Empty uses the canonical host.
 //
 // Returns:
-//   - TokenResult: Authentication result containing token, challenge host, and redirect info.
+//   - TokenResult: Authentication result containing the token and redirect info.
 //   - error: Non-nil if operation fails, nil on success.
 func GetToken(
 	log *zerolog.Logger,
 	ctx context.Context,
-	container types.Container,
+	c *container.Container,
 	registryAuth string,
 	client Client,
 	settings registryConfig.Registry,
 	endpoint string,
 ) (TokenResult, error) {
 	// Scope all subsequent logs in this call with the image name.
-	clog := log.With().Str("image", container.ImageName()).Logger()
+	clog := log.With().Str("image", c.ImageName()).Logger()
 
 	// Parse image name into a normalized reference.
-	normalizedRef, err := reference.ParseNormalizedNamed(container.ImageName())
+	normalizedRef, err := reference.ParseNormalizedNamed(c.ImageName())
 	if err != nil {
 		clog.Debug().
 			Err(err).
@@ -589,7 +578,6 @@ func GetToken(
 	)
 	if ok {
 		clog.Debug().
-			Str("challenge_host", result.ChallengeHost).
 			Msg("Using cached anonymous GHCR token, skipping challenge")
 
 		return result, nil
@@ -652,21 +640,11 @@ func GetToken(
 
 	// Extract the challenge header.
 	wwwAuthHeader := response.Header.Get(challengeHeaderName)
-	// Log endpoint in sanitized form (host only) to avoid leaking credentials.
-	sanitizedEndpoint := endpoint
-	if endpoint != "" {
-		sanitizedEndpoint = "<redacted>"
-
-		u, parseErr := url.Parse(endpoint)
-		if parseErr == nil && u.Host != "" {
-			sanitizedEndpoint = u.Host
-		}
-	}
 
 	clog.Debug().
 		Str("status", response.Status).
 		Str("header", wwwAuthHeader).
-		Str("mirrors", sanitizedEndpoint).
+		Str("registry_endpoint", RedactEndpoint(endpoint)).
 		Msg("Received challenge response")
 
 	parsedResponse := challengeResponse{
@@ -680,7 +658,7 @@ func GetToken(
 	return processChallengeResponse(
 		&clog,
 		ctx,
-		container,
+		c,
 		registryAuth,
 		client,
 		settings,

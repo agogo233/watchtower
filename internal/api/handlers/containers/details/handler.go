@@ -8,11 +8,17 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/rs/zerolog"
 
-	containerClient "github.com/nicholas-fedor/watchtower/internal/container/client"
+	"github.com/nicholas-fedor/watchtower/internal/container"
+	"github.com/nicholas-fedor/watchtower/internal/container/filters"
 	containerImage "github.com/nicholas-fedor/watchtower/internal/container/image"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
+
+// ContainerLister lists the containers the handler reports on.
+type ContainerLister interface {
+	// ListContainers returns the containers that pass every filter.
+	ListContainers(ctx context.Context, filter ...filters.Filter) ([]*container.Container, error)
+}
 
 // ContainerDetails holds detailed information about a single watched container.
 type ContainerDetails struct {
@@ -137,13 +143,13 @@ func (h *Handler) Handle(c fiber.Ctx) error {
 //   - error: Non-nil if listing containers fails.
 func GetContainerDetails(
 	ctx context.Context,
-	client containerClient.Client,
-	filter types.Filter,
+	client ContainerLister,
+	filter filters.Filter,
 	nameFilter,
 	imageFilter string,
 	params updateParams.Params,
 ) ([]ContainerDetails, error) {
-	var list []types.Container
+	var list []*container.Container
 
 	var err error
 
@@ -154,7 +160,7 @@ func GetContainerDetails(
 	}
 
 	if err != nil {
-		return nil, fmt.Errorf("failed to list containers: %w", err)
+		return nil, err //nolint:wrapcheck // The client's error already names the failed listing.
 	}
 
 	details := make([]ContainerDetails, 0, len(list))
@@ -179,10 +185,11 @@ func GetContainerDetails(
 
 		scope, _ := c.Scope()
 
-		containerDetails := ContainerDetails{
+		details = append(details, ContainerDetails{
 			Name:        c.Name(),
 			Image:       c.ImageName(),
 			ImageID:     string(c.ImageID()),
+			Digest:      containerImage.LocalDigest(c),
 			Running:     c.IsRunning(),
 			Watchtower:  c.IsWatchtower(),
 			MonitorOnly: c.IsMonitorOnly(params.Policy),
@@ -190,14 +197,7 @@ func GetContainerDetails(
 			Enabled:     enabled,
 			Stale:       c.IsStale(),
 			Scope:       scope,
-		}
-
-		info := c.ImageInfo()
-		if info != nil {
-			containerDetails.Digest = containerImage.ExtractImageDigest(info.RepoDigests, containerDetails.Image)
-		}
-
-		details = append(details, containerDetails)
+		})
 	}
 
 	return details, nil

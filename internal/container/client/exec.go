@@ -9,13 +9,13 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	dockerClient "github.com/moby/moby/client"
 
+	"github.com/nicholas-fedor/watchtower/internal/container"
 	"github.com/nicholas-fedor/watchtower/internal/container/redact"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
+	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
 )
 
 // tailBuffer is an [io.Writer] that keeps the last bytes written to it.
@@ -33,22 +33,6 @@ const maxExecOutput = 2 << 10
 
 // droppedOutputMarker starts output whose beginning was dropped.
 const droppedOutputMarker = "…"
-
-// Parts of terminal escape sequences.
-const (
-	// escape is ESC. It starts 7-bit terminal escape sequences.
-	escape = '\x1b'
-	// c1Offset is what a C1 control adds to its 7-bit introducer, as CSI is '[' plus 0x40.
-	c1Offset = 0x40
-	// lastIntermediateByte is the highest intermediate byte of an escape sequence.
-	lastIntermediateByte = 0x2f
-	// lastParameterByte is the highest parameter byte of a CSI sequence.
-	lastParameterByte = 0x3f
-	// stringTerminator is ESC \. It ends OSC, DCS, SOS, PM and APC strings.
-	stringTerminator = "\x1b\\"
-	// c1StringTerminator is the 8-bit form of the string terminator.
-	c1StringTerminator = "\u009c"
-)
 
 // Errors for executing commands in containers.
 var (
@@ -73,7 +57,7 @@ var (
 //
 // Parameters:
 //   - ctx: Context for cancellation and timeout control.
-//   - container: Container to execute command in.
+//   - target: Container to execute command in.
 //   - command: Command to execute.
 //   - timeout: Minutes to wait before timeout (0 for no timeout).
 //   - uid: UID to run command as (-1 to use container default).
@@ -82,21 +66,21 @@ var (
 // Returns:
 //   - bool: True if updates should be skipped, false otherwise.
 //   - error: Non-nil if execution fails, nil on success.
-func (c *client) ExecuteCommand(
+func (c *Client) ExecuteCommand(
 	ctx context.Context,
-	container types.Container,
+	target *container.Container,
 	command string,
 	timeout int,
 	uid int,
 	gid int,
 ) (bool, error) {
 	clogVal := c.logger().With().
-		Str("container_id", string(container.ID())).
+		Str("container_id", string(target.ID())).
 		Logger()
 	clog := &clogVal
 
 	// Generate JSON metadata for the container.
-	metadataJSON, err := generateContainerMetadata(container)
+	metadataJSON, err := generateContainerMetadata(target)
 	if err != nil {
 		clog.Debug().
 			Err(err).
@@ -139,7 +123,7 @@ func (c *client) ExecuteCommand(
 	// Create the exec instance using the parent context.
 	exec, err := c.api.ExecCreate(
 		ctx,
-		string(container.ID()),
+		string(target.ID()),
 		execConfig,
 	)
 	if err != nil {
@@ -260,7 +244,7 @@ func readExecOutput(ctx context.Context, response dockerClient.ExecAttachResult)
 
 	// URL user information is replaced after cleaning. An escape sequence then
 	// cannot split a URL to hide it.
-	output := oneLine(redact.Userinfo(printableOutput(string(kept.data)), ""))
+	output := redact.Userinfo(logging.PrintableLine(string(kept.data)), "")
 	if kept.dropped {
 		output = droppedOutputMarker + output
 	}
@@ -278,7 +262,7 @@ func readExecOutput(ctx context.Context, response dockerClient.ExecAttachResult)
 // Returns:
 //   - bool: True if updates should be skipped (exit code 75), false otherwise.
 //   - error: Non-nil if inspection fails, the command errors, or ctx ends first.
-func (c *client) waitForExec(
+func (c *Client) waitForExec(
 	ctx context.Context,
 	execID string,
 	execOutput string,
@@ -360,155 +344,19 @@ func lastCharacters(text []byte, limit int) []byte {
 	return text[start:]
 }
 
-// printableOutput removes from command output what could change how a terminal or notification shows it.
-//
-// Output written inside a container is untrusted. Terminal escape sequences
-// could retitle or reprogram a terminal that shows the text. Invisible format
-// characters could hide text or make it read differently than it is. Removed:
-//   - terminal escape sequences in 7-bit and 8-bit form, such as colours,
-//     window titles and clipboard writes
-//   - control characters other than newline and tab
-//   - Unicode format characters, such as bidirectional controls, zero-width
-//     characters and tag characters
-//
-// A lone carriage return becomes a newline. One before a newline is dropped.
-// The Unicode line and paragraph separators also become newlines, since some
-// services show them as line breaks. Invalid UTF-8 becomes U+FFFD.
-//
-// Parameters:
-//   - raw: Output as the command wrote it.
-//
-// Returns:
-//   - string: The printable text.
-func printableOutput(raw string) string {
-	var out strings.Builder
-
-	out.Grow(len(raw))
-
-	for index := 0; index < len(raw); {
-		char, size := utf8.DecodeRuneInString(raw[index:])
-		index += size
-
-		switch {
-		case char == '\r':
-			if !strings.HasPrefix(raw[index:], "\n") {
-				out.WriteByte('\n')
-			}
-		case unicode.In(char, unicode.Zl, unicode.Zp):
-			out.WriteByte('\n')
-		case char == escape || (char >= 0x80 && char <= 0x9f):
-			index = escapeSequenceEnd(raw, index, char)
-		case (unicode.IsControl(char) && char != '\n' && char != '\t') || unicode.Is(unicode.Cf, char):
-			// Dropped.
-		default:
-			out.WriteRune(char)
-		}
-	}
-
-	return out.String()
-}
-
-// oneLine joins the non-blank lines of text with " | ".
-//
-// Notifications put each log entry on a line of its own. Output kept on one
-// line cannot start a line that reads like another Watchtower message.
-//
-// Parameters:
-//   - text: Text that may span lines.
-//
-// Returns:
-//   - string: The lines, each trimmed, joined on one line.
-func oneLine(text string) string {
-	var lines []string
-
-	for line := range strings.Lines(text) {
-		if trimmed := strings.TrimSpace(line); trimmed != "" {
-			lines = append(lines, trimmed)
-		}
-	}
-
-	return strings.Join(lines, " | ")
-}
-
-// escapeSequenceEnd returns where the escape sequence that introducer starts ends in raw.
-//
-// Parameters:
-//   - raw: Text that holds the sequence.
-//   - index: Position just after the introducer.
-//   - introducer: ESC or an 8-bit C1 control.
-//
-// Returns:
-//   - int: Position just after the sequence. The end of raw when it is unterminated.
-func escapeSequenceEnd(raw string, index int, introducer rune) int {
-	// The sequence's kind is its 7-bit introducer, such as '[' for CSI. A C1
-	// control is the 7-bit introducer plus 0x40.
-	kind := introducer - c1Offset
-
-	if introducer == escape {
-		kind = escape
-
-		if index < len(raw) && raw[index] >= '@' && raw[index] <= '_' {
-			kind = rune(raw[index])
-			index++
-		}
-	}
-
-	// The highest parameter or intermediate byte. A final byte above it ends
-	// the sequence.
-	last := byte(lastIntermediateByte)
-
-	switch kind {
-	case '[':
-		// CSI, such as a colour, also takes parameter bytes.
-		last = lastParameterByte
-	case ']', 'P', 'X', '^', '_':
-		// OSC, DCS, SOS, PM and APC strings end with BEL, ESC \ or the 8-bit
-		// string terminator.
-		for index < len(raw) {
-			switch {
-			case raw[index] == '\a':
-				return index + 1
-			case strings.HasPrefix(raw[index:], stringTerminator):
-				return index + len(stringTerminator)
-			case strings.HasPrefix(raw[index:], c1StringTerminator):
-				return index + len(c1StringTerminator)
-			default:
-				index++
-			}
-		}
-
-		return index
-	case escape:
-		// Other escape sequences take intermediate bytes.
-	default:
-		// Other C1 controls stand alone.
-		return index
-	}
-
-	for index < len(raw) && raw[index] >= 0x20 && raw[index] <= last {
-		index++
-	}
-
-	if index < len(raw) && raw[index] > last && raw[index] <= 0x7e {
-		index++
-	}
-
-	return index
-}
-
 // generateContainerMetadata creates a JSON-formatted string of container metadata.
 //
 // Parameters:
-//   - container: Container object to extract metadata from.
+//   - c: Container object to extract metadata from.
 //
 // Returns:
 //   - string: JSON string containing metadata (e.g., name, ID, image name, stop signal, labels).
 //   - error: Non-nil if JSON marshaling fails, nil otherwise.
-func generateContainerMetadata(container types.Container) (string, error) {
+func generateContainerMetadata(c *container.Container) (string, error) {
 	// Filter Watchtower-specific labels to reduce JSON size
 	labels := make(map[string]string)
 
-	containerInfo := container.ContainerInfo()
+	containerInfo := c.ContainerInfo()
 	if containerInfo != nil &&
 		containerInfo.Config != nil {
 		for key, value := range containerInfo.Config.Labels {
@@ -525,10 +373,10 @@ func generateContainerMetadata(container types.Container) (string, error) {
 		StopSignal string            `json:"stop_signal"`
 		Labels     map[string]string `json:"labels"`
 	}{
-		Name:       container.Name(),
-		ID:         string(container.ID()),
-		ImageName:  container.ImageName(),
-		StopSignal: container.StopSignal(),
+		Name:       c.Name(),
+		ID:         string(c.ID()),
+		ImageName:  c.ImageName(),
+		StopSignal: c.StopSignal(),
 		Labels:     labels,
 	}
 

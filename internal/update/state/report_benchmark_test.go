@@ -4,18 +4,18 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/nicholas-fedor/watchtower/pkg/types"
+	"github.com/nicholas-fedor/watchtower/internal/container"
 )
 
 func BenchmarkReport_All(b *testing.B) {
 	const n = 64
 
-	scanned := make([]types.ContainerReport, n)
-	updated := make([]types.ContainerReport, n/8)
-	fresh := make([]types.ContainerReport, n/2)
+	scanned := make([]*ContainerStatus, n)
+	updated := make([]*ContainerStatus, n/8)
+	fresh := make([]*ContainerStatus, n/2)
 
 	for i := range scanned {
-		scanned[i] = &ContainerStatus{containerID: types.ContainerID("c" + strconv.Itoa(i))}
+		scanned[i] = &ContainerStatus{containerID: container.ContainerID("c" + strconv.Itoa(i))}
 	}
 
 	for i := range updated {
@@ -27,7 +27,7 @@ func BenchmarkReport_All(b *testing.B) {
 	}
 
 	b.Run("reuseRestarted", func(b *testing.B) {
-		restarted := make([]types.ContainerReport, n/8)
+		restarted := make([]*ContainerStatus, n/8)
 		for i := range restarted {
 			restarted[i] = scanned[n/8+i]
 		}
@@ -42,9 +42,9 @@ func BenchmarkReport_All(b *testing.B) {
 	b.Run("uniqueRestarted", func(b *testing.B) {
 		// Unique restarted IDs make the combined result larger than the old
 		// capacity of scanned+updated+fresh (64+8+32).
-		restarted := make([]types.ContainerReport, n)
+		restarted := make([]*ContainerStatus, n)
 		for i := range restarted {
-			restarted[i] = &ContainerStatus{containerID: types.ContainerID("r" + strconv.Itoa(i))}
+			restarted[i] = &ContainerStatus{containerID: container.ContainerID("r" + strconv.Itoa(i))}
 		}
 
 		b.ReportAllocs()

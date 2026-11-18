@@ -22,13 +22,12 @@ import (
 	dockerContainer "github.com/moby/moby/api/types/container"
 	dockerImage "github.com/moby/moby/api/types/image"
 
+	mockCmd "github.com/nicholas-fedor/watchtower/cmd/mocks"
 	"github.com/nicholas-fedor/watchtower/internal/container"
 	containerClient "github.com/nicholas-fedor/watchtower/internal/container/client"
-	mockContainerClient "github.com/nicholas-fedor/watchtower/internal/container/client/mocks"
-	"github.com/nicholas-fedor/watchtower/internal/container/labels"
 	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
 	"github.com/nicholas-fedor/watchtower/internal/settings"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
+	dockerConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/docker"
 )
 
 // preRunExitHelperEnv selects a preRun exit case when the test binary is
@@ -36,7 +35,7 @@ import (
 const preRunExitHelperEnv = "WATCHTOWER_CMD_PRE_RUN_EXIT_HELPER"
 
 // selfID is the container ID the preRun tests detect for Watchtower itself.
-var selfID = types.ContainerID(strings.Repeat("c", 64))
+var selfID = container.ContainerID(strings.Repeat("c", 64))
 
 // selfDetection is what the self container ID detection can read: the
 // mountinfo and cgroup files, and the HOSTNAME variable. Empty means absent.
@@ -61,9 +60,9 @@ func cgroupWithSelf() string {
 
 // setPreRunState prepares the process state preRun reads and writes, and
 // restores it when the test ends. newClient returns client, self container ID
-// detection reads only detection, and the Docker variables and registry TLS
-// settings preRun sets are restored.
-func setPreRunState(t *testing.T, client containerClient.Client, detection selfDetection) {
+// detection reads only detection, and the Docker variables preRun reads and
+// sets are cleared and restored.
+func setPreRunState(t *testing.T, client DockerClient, detection selfDetection) {
 	t.Helper()
 
 	setRunState(t, runTestState{})
@@ -93,7 +92,7 @@ func setPreRunState(t *testing.T, client containerClient.Client, detection selfD
 
 	setProcessFs(t, fsys)
 
-	newClient = func(context.Context, *zerolog.Logger, containerClient.ClientOptions) (containerClient.Client, error) {
+	newClient = func(context.Context, *zerolog.Logger, containerClient.ClientOptions) (DockerClient, error) {
 		return client, nil
 	}
 
@@ -126,7 +125,7 @@ func setProcessFs(t *testing.T, fsys fs.FS) {
 // selfContainer returns the Watchtower container preRun detects, with the
 // given name and container hostname. Its restart policy is "unless-stopped",
 // so disabling its restarts sends a policy update.
-func selfContainer(name, hostname string) types.Container {
+func selfContainer(name, hostname string) *container.Container {
 	return container.NewContainer(nil,
 		&dockerContainer.InspectResponse{
 			ID:      string(selfID),
@@ -171,8 +170,8 @@ func TestPreRun_SelfDetection(t *testing.T) {
 		name      string
 		args      []string
 		detection selfDetection
-		setup     func(client *mockContainerClient.MockClient)
-		wantID    types.ContainerID
+		setup     func(client *mockCmd.MockDockerClient)
+		wantID    container.ContainerID
 		wantName  string
 		wantCalls []string
 		// wantUnknown is whether the own container is marked unknown.
@@ -197,7 +196,7 @@ func TestPreRun_SelfDetection(t *testing.T) {
 		{
 			name:      "found from mountinfo",
 			detection: selfDetection{mountinfo: mountinfoWithSelf()},
-			setup: func(client *mockContainerClient.MockClient) {
+			setup: func(client *mockCmd.MockDockerClient) {
 				client.EXPECT().GetCurrentWatchtowerContainer(mock.Anything, selfID).
 					Return(selfContainer("/watchtower", ""), nil)
 			},
@@ -208,7 +207,7 @@ func TestPreRun_SelfDetection(t *testing.T) {
 		{
 			name:      "found from cgroup",
 			detection: selfDetection{cgroup: cgroupWithSelf()},
-			setup: func(client *mockContainerClient.MockClient) {
+			setup: func(client *mockCmd.MockDockerClient) {
 				client.EXPECT().GetCurrentWatchtowerContainer(mock.Anything, selfID).
 					Return(selfContainer("/watchtower", ""), nil)
 			},
@@ -219,9 +218,9 @@ func TestPreRun_SelfDetection(t *testing.T) {
 		{
 			name:      "found from hostname",
 			detection: selfDetection{hostname: "wt-host"},
-			setup: func(client *mockContainerClient.MockClient) {
+			setup: func(client *mockCmd.MockDockerClient) {
 				self := selfContainer("/watchtower", "wt-host")
-				client.EXPECT().ListContainers(mock.Anything).Return([]types.Container{self}, nil)
+				client.EXPECT().ListContainers(mock.Anything).Return([]*container.Container{self}, nil)
 				client.EXPECT().GetCurrentWatchtowerContainer(mock.Anything, selfID).Return(self, nil)
 			},
 			wantID:    selfID,
@@ -235,7 +234,7 @@ func TestPreRun_SelfDetection(t *testing.T) {
 			name:      "lookup fails with an explicit scope and the ID is kept",
 			args:      []string{"--scope", "prod"},
 			detection: selfDetection{mountinfo: mountinfoWithSelf()},
-			setup: func(client *mockContainerClient.MockClient) {
+			setup: func(client *mockCmd.MockDockerClient) {
 				client.EXPECT().GetCurrentWatchtowerContainer(withoutDeadline, selfID).Return(nil, errRunTestDocker)
 			},
 			wantID:      selfID,
@@ -251,7 +250,7 @@ func TestPreRun_SelfDetection(t *testing.T) {
 			name:      "lookup fails during a health check and the ID is kept",
 			args:      []string{"--health-check"},
 			detection: selfDetection{mountinfo: mountinfoWithSelf()},
-			setup: func(client *mockContainerClient.MockClient) {
+			setup: func(client *mockCmd.MockDockerClient) {
 				client.EXPECT().GetCurrentWatchtowerContainer(withDeadline, selfID).
 					Return(nil, fmt.Errorf("inspect: %w", context.DeadlineExceeded))
 			},
@@ -266,7 +265,7 @@ func TestPreRun_SelfDetection(t *testing.T) {
 			// detection and does not try again.
 			name:      "detected ID names no container and is cleared",
 			detection: selfDetection{mountinfo: mountinfoWithSelf(), marker: true},
-			setup: func(client *mockContainerClient.MockClient) {
+			setup: func(client *mockCmd.MockDockerClient) {
 				client.EXPECT().GetCurrentWatchtowerContainer(mock.Anything, selfID).
 					Return(nil, fmt.Errorf("inspect: %w", cerrdefs.ErrNotFound))
 			},
@@ -276,10 +275,14 @@ func TestPreRun_SelfDetection(t *testing.T) {
 			wantError:   cerrdefs.ErrNotFound.Error(),
 		},
 		{
-			name:      "old instance continues in run-once mode",
-			args:      []string{"--run-once"},
+			// A health check probe can run in an old container during a
+			// self-update. It changes no containers, so it neither starts an
+			// orphaned replacement that the handoff is about to start nor
+			// disables the old container's restarts.
+			name:      "old instance continues in a health check",
+			args:      []string{"--health-check"},
 			detection: selfDetection{mountinfo: mountinfoWithSelf()},
-			setup: func(client *mockContainerClient.MockClient) {
+			setup: func(client *mockCmd.MockDockerClient) {
 				client.EXPECT().GetCurrentWatchtowerContainer(mock.Anything, selfID).
 					Return(selfContainer("/watchtower-old-cccccccccccc", ""), nil)
 			},
@@ -291,7 +294,7 @@ func TestPreRun_SelfDetection(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mockClient := mockContainerClient.NewMockClient(t)
+			mockClient := mockCmd.NewMockDockerClient(t)
 			if tt.setup != nil {
 				tt.setup(mockClient)
 			}
@@ -355,7 +358,7 @@ func captureStderr(t *testing.T) func() string {
 }
 
 // containerName names a container, or returns "" when it is nil.
-func containerName(c types.Container) string {
+func containerName(c *container.Container) string {
 	if c == nil {
 		return ""
 	}
@@ -364,23 +367,97 @@ func containerName(c types.Container) string {
 }
 
 // TestPreRun_Configuration verifies that preRun loads the configuration from
-// the flags and exports the Docker connection settings to the environment,
-// where the Docker client reads them.
+// the flags, passes the Docker connection settings to the Docker client, and
+// exports them to the environment, where Compose rebuilds read them.
 func TestPreRun_Configuration(t *testing.T) {
-	setPreRunState(t, mockContainerClient.NewMockClient(t), selfDetection{})
+	mockClient := mockCmd.NewMockDockerClient(t)
+	setPreRunState(t, mockClient, selfDetection{})
+
+	var gotOpts containerClient.ClientOptions
+
+	newClient = func(_ context.Context, _ *zerolog.Logger, opts containerClient.ClientOptions) (DockerClient, error) {
+		gotOpts = opts
+
+		return mockClient, nil
+	}
 
 	require.NoError(t, newRunProcess().preRun(newTestRootCommand(t,
 		"--scope", "prod",
 		"--host", "tcp://docker.example.com:2376",
 		"--tlsverify",
 		"--api-version", "1.47",
+		"--cert-path", "/certs",
 	), nil))
 
 	assert.Equal(t, "prod", appCfg.Filter.Scope)
-	// With TLS verification enabled, a tcp:// host is exported as https://.
-	assert.Equal(t, "https://docker.example.com:2376", os.Getenv("DOCKER_HOST"))
+	assert.Equal(t, dockerConfig.Docker{
+		Host:       "tcp://docker.example.com:2376",
+		TLSVerify:  true,
+		APIVersion: "1.47",
+		CertPath:   "/certs",
+	}, gotOpts.Docker)
+	assert.Equal(t, "tcp://docker.example.com:2376", os.Getenv("DOCKER_HOST"))
 	assert.Equal(t, "1", os.Getenv("DOCKER_TLS_VERIFY"))
 	assert.Equal(t, "1.47", os.Getenv("DOCKER_API_VERSION"))
+	assert.Equal(t, "/certs", os.Getenv("DOCKER_CERT_PATH"))
+}
+
+// TestPreRun_loadsSettingsOnce verifies that a run of the root command loads
+// its settings once, in preRun, with the positional container names. A
+// warning from loading the settings is then logged once, before notifications
+// are set up, so no notification carries it. The logger:// service writes each
+// notification to the same output, so a notified copy would appear there too.
+func TestPreRun_loadsSettingsOnce(t *testing.T) {
+	mockClient := mockCmd.NewMockDockerClient(t)
+	mockClient.EXPECT().GetVersion().Return("1.47")
+	mockClient.EXPECT().ListContainers(mock.Anything, withFilter).Return(nil, nil)
+
+	setPreRunState(t, mockClient, selfDetection{})
+
+	// Outside a container, so the run has no restart policy to disable.
+	processID = func() int { return 4242 }
+
+	readStderr := captureStderr(t)
+	proc := newRunProcess()
+
+	require.NoError(t, newExecuteCommand(t, proc,
+		"--run-once", "--monitor-only", "--no-pull", "--notification-url", "logger://", "web",
+	).Execute())
+
+	// Closing the notifier sends what it still holds.
+	notifier.Close()
+
+	assert.Equal(t, []string{"web"}, appCfg.Filter.Names)
+	assert.Equal(t, 1, strings.Count(readStderr(), "Combining monitor-only and no-pull might result in no updates"))
+}
+
+// TestPreRun_scopeLabel verifies that a run without an explicit scope takes
+// the scope from Watchtower's own scope label and builds its filter for that
+// scope. A replacement from a self-update keeps the scope of the instance it
+// replaced this way.
+func TestPreRun_scopeLabel(t *testing.T) {
+	self := selfContainer("/watchtower", "")
+	self.SetLabel(scopeLabelKey, "prod")
+
+	mockClient := mockCmd.NewMockDockerClient(t)
+	mockClient.EXPECT().GetCurrentWatchtowerContainer(mock.Anything, selfID).Return(self, nil)
+	mockClient.EXPECT().GetVersion().Return("1.47").Maybe()
+	mockClient.EXPECT().ListContainers(mock.Anything, withFilter).Return(nil, nil).Maybe()
+	mockClient.EXPECT().ListLabeledContainers(mock.Anything, mock.Anything).Return(nil, nil).Maybe()
+	mockClient.EXPECT().SetRestartPolicy(mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+
+	setPreRunState(t, mockClient, selfDetection{mountinfo: mountinfoWithSelf()})
+
+	require.NoError(t, newExecuteCommand(t, newRunProcess(), "--run-once", "--log-level", "error").Execute())
+
+	assert.Equal(t, "prod", appCfg.Filter.Scope)
+	assert.Equal(t, "Only checking containers in scope prod", appCfg.Filter.Desc)
+
+	inScope := runFixtureContainer("a1a1", "/app", "2026-10-01T12:00:00Z", map[string]string{scopeLabelKey: "prod"})
+	unscoped := runFixtureContainer("b2b2", "/other", "2026-10-01T12:00:00Z", nil)
+
+	assert.True(t, appCfg.Filter.Predicate(inScope), "a container in the label's scope is selected")
+	assert.False(t, appCfg.Filter.Predicate(unscoped), "a container without a scope is not selected")
 }
 
 // TestPreRun_RegistryTLSSettings verifies that the container client and the
@@ -431,12 +508,12 @@ func TestPreRun_RegistryTLSSettings(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mockClient := mockContainerClient.NewMockClient(t)
+			mockClient := mockCmd.NewMockDockerClient(t)
 			setPreRunState(t, mockClient, selfDetection{})
 
 			var clientOptions containerClient.ClientOptions
 
-			newClient = func(_ context.Context, _ *zerolog.Logger, opts containerClient.ClientOptions) (containerClient.Client, error) {
+			newClient = func(_ context.Context, _ *zerolog.Logger, opts containerClient.ClientOptions) (DockerClient, error) {
 				clientOptions = opts
 
 				return mockClient, nil
@@ -502,7 +579,7 @@ func TestPreRun_PorcelainKeepsExplicitSettings(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			setPreRunState(t, mockContainerClient.NewMockClient(t), selfDetection{})
+			setPreRunState(t, mockCmd.NewMockDockerClient(t), selfDetection{})
 
 			cmd := newTestRootCommand(t, tt.args...)
 
@@ -545,12 +622,20 @@ func TestPreRun_Exit(t *testing.T) {
 			// is created for that when startup has not created it yet.
 			helperCase:   "invalid-environment",
 			wantExitCode: 1,
-			wantOutput:   []string{"SetRestartPolicy cccccccccccc no", "Failed to apply environment configuration"},
+			wantOutput: []string{
+				"SetRestartPolicy cccccccccccc no",
+				"apply environment configuration:",
+				"Failed to load configuration",
+			},
 		},
 		{
 			helperCase:   "invalid-log-format",
 			wantExitCode: 1,
-			wantOutput:   []string{"SetRestartPolicy cccccccccccc no", "Failed to initialize logging"},
+			wantOutput: []string{
+				"SetRestartPolicy cccccccccccc no",
+				"set up logging:",
+				"Failed to load configuration",
+			},
 		},
 		{
 			// Because the notification settings are part of the configuration
@@ -566,10 +651,22 @@ func TestPreRun_Exit(t *testing.T) {
 			helperCase:   "invalid-log-format-with-host-flag",
 			wantExitCode: 1,
 			wantOutput: []string{
-				"newClient DOCKER_HOST=tcp://socket-proxy:2375 bounded=true",
+				"newClient host=tcp://socket-proxy:2375 bounded=true",
 				"SetRestartPolicy cccccccccccc no",
-				"Failed to initialize logging",
+				"Failed to load configuration",
 			},
+		},
+		{
+			// TLS verification without a certificate path would connect in
+			// plain HTTP, so neither startup nor the exit path connects.
+			helperCase:   "tls-verify-without-cert-path",
+			wantExitCode: 1,
+			wantOutput: []string{
+				logging.RestartsKept,
+				"Failed to load configuration",
+				"tlsverify requires cert-path for a remote Docker host",
+			},
+			unwantedOutput: []string{"newClient", "SetRestartPolicy"},
 		},
 		{
 			// Without a Docker client, the restart policy cannot be changed, so
@@ -593,7 +690,7 @@ func TestPreRun_Exit(t *testing.T) {
 			wantExitCode: 1,
 			wantOutput: []string{
 				logging.RestartsKept,
-				"Failed to initialize logging",
+				"Failed to load configuration",
 			},
 			unwantedOutput: []string{"SetRestartPolicy"},
 		},
@@ -616,7 +713,7 @@ func TestPreRun_Exit(t *testing.T) {
 			helperCase:   "host-flag-before-unknown-flag",
 			wantExitCode: 1,
 			wantOutput: []string{
-				"newClient DOCKER_HOST=tcp://socket-proxy:2375",
+				"newClient host=tcp://socket-proxy:2375",
 				"SetRestartPolicy cccccccccccc no",
 				"Failed to execute root command",
 			},
@@ -641,9 +738,38 @@ func TestPreRun_Exit(t *testing.T) {
 			wantOutput:   []string{"SetRestartPolicy cccccccccccc no"},
 		},
 		{
-			helperCase:   "invalid-restart-of-chain-parent",
+			// A run-once instance in an old container retires before its run.
+			helperCase:   "invalid-restart-of-old-instance-in-run-once",
 			wantExitCode: 0,
 			wantOutput:   []string{"SetRestartPolicy cccccccccccc no"},
+		},
+		{
+			// A failed policy update is logged at debug only. An old container
+			// that the runtime starts again exits as old once more, until the
+			// instance that replaced it removes it.
+			helperCase:     "invalid-restart-of-old-instance-restarts-kept",
+			wantExitCode:   0,
+			wantOutput:     []string{"SetRestartPolicy cccccccccccc no"},
+			unwantedOutput: []string{logging.RestartsKept, errRunTestDocker.Error()},
+		},
+		{
+			// An old instance that starts its orphaned replacement sends the
+			// recovery in one notification before it exits.
+			helperCase:   "orphan-recovery-by-old-instance",
+			wantExitCode: 0,
+			wantOutput: []string{
+				"SetRestartPolicy cccccccccccc no",
+				"Recovered orphaned Watchtower container: watchtower (0f0f0f0f0f0f)",
+			},
+			wantOnce: []string{"Recovered orphaned Watchtower container: watchtower (0f0f0f0f0f0f)"},
+		},
+		{
+			// An old instance still starts its orphaned replacement and exits
+			// when Shoutrrr rejects a notification URL.
+			helperCase:     "orphan-recovery-with-rejected-notification-url",
+			wantExitCode:   0,
+			wantOutput:     []string{logging.OrphanRecovered, "SetRestartPolicy cccccccccccc no"},
+			unwantedOutput: []string{"Failed to initialize notifications"},
 		},
 		{
 			// A notification URL that Shoutrrr rejects fails on every start,
@@ -750,9 +876,9 @@ func preRunExitHelper(t *testing.T, helperCase string) {
 	detection := selfDetection{mountinfo: mountinfoWithSelf(), marker: true}
 	pid := 1
 
-	mockClient := mockContainerClient.NewMockClient(t)
+	mockClient := mockCmd.NewMockDockerClient(t)
 	mockClient.EXPECT().SetRestartPolicy(mock.Anything, mock.Anything, mock.Anything).
-		RunAndReturn(func(_ context.Context, id types.ContainerID, policy dockerContainer.RestartPolicy) error {
+		RunAndReturn(func(_ context.Context, id container.ContainerID, policy dockerContainer.RestartPolicy) error {
 			fmt.Fprintf(os.Stderr, "SetRestartPolicy %s %s\n", containerLabel(id), policy.Name)
 
 			return policyErr
@@ -768,6 +894,8 @@ func preRunExitHelper(t *testing.T, helperCase string) {
 	case "invalid-log-format-without-container-id":
 		args = []string{"--log-format", "bogus"}
 		detection = selfDetection{}
+	case "tls-verify-without-cert-path":
+		args = []string{"--host", "tcp://socket-proxy:2376", "--tlsverify"}
 	case "invalid-log-format-with-host-flag":
 		args = []string{"--host", "tcp://socket-proxy:2375", "--log-format", "bogus"}
 	case "invalid-configuration-outside-main-process":
@@ -788,21 +916,43 @@ func preRunExitHelper(t *testing.T, helperCase string) {
 	case "orchestrator-without-settings":
 		args = []string{"--self-update-orchestrator"}
 		detection = selfDetection{}
-	case "invalid-restart-of-old-instance":
+	case "invalid-restart-of-old-instance", "invalid-restart-of-old-instance-in-run-once",
+		"invalid-restart-of-old-instance-restarts-kept":
 		old := selfContainer("/watchtower-old-cccccccccccc", "")
 		detection = selfDetection{mountinfo: mountinfoWithSelf()}
 
+		switch helperCase {
+		case "invalid-restart-of-old-instance-in-run-once":
+			args = []string{"--run-once"}
+		case "invalid-restart-of-old-instance-restarts-kept":
+			policyErr = errRunTestDocker
+		default:
+		}
+
 		mockClient.EXPECT().GetCurrentWatchtowerContainer(mock.Anything, selfID).Return(old, nil)
-		mockClient.EXPECT().ListContainers(mock.Anything, withFilter).Return([]types.Container{old}, nil).Maybe()
-	case "invalid-restart-of-chain-parent":
-		// The container's chain lists its own ID, which marks it as the parent
-		// of a newer instance.
-		parent := selfContainer("/watchtower", "")
-		parent.ContainerInfo().Config.Labels[labels.ContainerChain] = strings.Repeat("a", 64) + "," + string(selfID)
+		mockClient.EXPECT().ListLabeledContainers(mock.Anything, watchtowerLabelKey).Return([]*container.Container{old}, nil).Once()
+	case "orphan-recovery-by-old-instance", "orphan-recovery-with-rejected-notification-url":
+		args = []string{"--log-level", "info", "--notification-url", "logger://"}
+		if helperCase == "orphan-recovery-with-rejected-notification-url" {
+			args = []string{"--log-level", "info", "--notification-url", "discord://secrettoken@notanumber"}
+		}
+
+		old := selfContainer("/watchtower-old-cccccccccccc", "")
+		orphanID := container.ContainerID(strings.Repeat("0f", 32))
+		orphan := container.NewContainer(nil,
+			&dockerContainer.InspectResponse{
+				ID:     string(orphanID),
+				Name:   "/watchtower",
+				State:  &dockerContainer.State{Status: dockerContainer.StateCreated},
+				Config: &dockerContainer.Config{Labels: map[string]string{watchtowerLabelKey: "true"}},
+			},
+			nil,
+		)
 		detection = selfDetection{mountinfo: mountinfoWithSelf()}
 
-		mockClient.EXPECT().GetCurrentWatchtowerContainer(mock.Anything, selfID).Return(parent, nil)
-		mockClient.EXPECT().ListContainers(mock.Anything, withFilter).Return([]types.Container{parent}, nil).Maybe()
+		mockClient.EXPECT().GetCurrentWatchtowerContainer(mock.Anything, selfID).Return(old, nil)
+		mockClient.EXPECT().ListLabeledContainers(mock.Anything, watchtowerLabelKey).Return([]*container.Container{old, orphan}, nil)
+		mockClient.EXPECT().StartContainerByID(mock.Anything, orphanID).Return(nil).Once()
 	case "rejected-notification-url":
 		args = []string{"--notification-url", "discord://secrettoken@notanumber"}
 		detection = selfDetection{mountinfo: mountinfoWithSelf()}
@@ -827,9 +977,9 @@ func preRunExitHelper(t *testing.T, helperCase string) {
 	// The client factory prints the Docker host it connects to and whether its
 	// wait for the daemon has a deadline. It fails with clientErr when a case
 	// sets it.
-	newClient = func(ctx context.Context, _ *zerolog.Logger, _ containerClient.ClientOptions) (containerClient.Client, error) {
+	newClient = func(ctx context.Context, _ *zerolog.Logger, opts containerClient.ClientOptions) (DockerClient, error) {
 		_, bounded := ctx.Deadline()
-		fmt.Fprintf(os.Stderr, "newClient DOCKER_HOST=%s bounded=%t\n", os.Getenv("DOCKER_HOST"), bounded)
+		fmt.Fprintf(os.Stderr, "newClient host=%s bounded=%t\n", opts.Docker.Host, bounded)
 
 		if clientErr != nil {
 			return nil, clientErr

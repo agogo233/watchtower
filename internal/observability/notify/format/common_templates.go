@@ -32,9 +32,14 @@ var commonTemplates = map[string]string{
 	// (an exit could not keep the runtime from starting Watchtower again),
 	// "Failed to build run configuration", "Rolling restart compatibility validation failed",
 	// "API setup failed" and "Could not schedule updates" (Watchtower exited on the error),
+	// "Recovered orphaned Watchtower container" (an old instance started the replacement a self-update left created),
+	// "Could not start orphaned Watchtower container" (an old instance could not start that replacement),
+	// "Starting Watchtower ephemeral self-update" (an ephemeral self-update's orchestrator started),
+	// "Failed to clean up ephemeral orchestrator after start failure" (an orchestrator that did not start is left behind),
 	// "Update panicked" (an update session stopped on a panic),
 	// "Update execution failed" (an update session ended in an error),
 	// "Could not check container for updates" (a container's update check failed),
+	// "Could not pull image" (the container engine could not pull a container's image),
 	// "Could not update container. Its configuration cannot be recreated"
 	// (a stale container's configuration failed the recreation check),
 	// "Invalid pre-check timeout value, using default", "Invalid post-check timeout value, using default",
@@ -141,8 +146,18 @@ var commonTemplates = map[string]string{
     Invalid post-update timeout{{with (index $e.Data "value")}} "{{.}}"{{end}} for {{with (index $e.Data "container")}}{{.}}{{else}}container{{end}}. Using the default of 1 minute
 {{- else if eq $msg "Could not update container. Its configuration cannot be recreated" -}}
     Could not update {{with (index $e.Data "container")}}{{.}}{{else}}container{{end}}{{with (index $e.Data "error")}}: {{.}}{{end}}
+{{- else if eq $msg "Recovered orphaned Watchtower container" -}}
+    Recovered orphaned Watchtower container: {{with (index $e.Data "container")}}{{.}}{{else}}unknown{{end}} ({{with (index $e.Data "id")}}{{.}}{{else}}unknown{{end}})
+{{- else if eq $msg "Could not start orphaned Watchtower container" -}}
+    Could not start orphaned Watchtower container: {{with (index $e.Data "container")}}{{.}}{{else}}unknown{{end}} ({{with (index $e.Data "id")}}{{.}}{{else}}unknown{{end}}){{with (index $e.Data "error")}}: {{.}}{{end}}
+{{- else if eq $msg "Starting Watchtower ephemeral self-update" -}}
+    Starting Watchtower ephemeral self-update
+{{- else if eq $msg "Failed to clean up ephemeral orchestrator after start failure" -}}
+    Could not remove ephemeral orchestrator {{with (index $e.Data "orchestrator_id")}}{{.}}{{else}}unknown{{end}} after it failed to start{{with (index $e.Data "error")}}: {{.}}{{end}}
 {{- else if eq $msg "Could not check container for updates" -}}
     Could not check {{with (index $e.Data "container")}}{{.}}{{else}}container{{end}} for updates{{with (index $e.Data "error")}}: {{.}}{{end}}
+{{- else if eq $msg "Could not pull image" -}}
+    {{with (index $e.Data "engine")}}{{.}}{{else}}The container engine{{end}} could not pull {{with (index $e.Data "image")}}{{.}}{{else}}the image{{end}} for {{with (index $e.Data "container")}}{{.}}{{else}}a container{{end}}{{with (index $e.Data "error")}}: {{.}}{{end}}
 {{- else if or (eq $msg "Could not identify Watchtower's own container. Self-updates are disabled and old instances will not be removed") (eq $msg "Could not inspect Watchtower's own container. Self-updates are disabled") (eq $msg "Could not inspect Watchtower's own container to read its scope label. Exiting rather than running without a scope") (eq $msg "Could not disable Watchtower's restart policy. The runtime may start it again") (eq $msg "Failed to build run configuration") (eq $msg "Rolling restart compatibility validation failed") (eq $msg "API setup failed") (eq $msg "Could not schedule updates") (eq $msg "Update panicked") (eq $msg "Update execution failed") -}}
     {{$msg}}{{with (index $e.Data "error")}}: {{.}}{{end}}
 {{- else if $e.Data -}}
@@ -227,6 +242,6 @@ var commonTemplates = map[string]string{
 
 	// "porcelain.json" template outputs the update report as a stable JSON document with per-container details.
 	// It omits log entries and focuses on the report: name, image, image_id, latest_image_id, state, update_available, and error.
-	// Expects .Report with an All() method returning []ContainerReport.
+	// Expects .Report with an All() method returning the report's containers.
 	`porcelain.json`: `{{ .Report | ToPorcelainJSON }}`,
 }

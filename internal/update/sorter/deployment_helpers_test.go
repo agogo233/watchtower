@@ -3,19 +3,25 @@ package sorter
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"maps"
 	"slices"
 
 	dockerContainer "github.com/moby/moby/api/types/container"
 
+	composeLabels "github.com/nicholas-fedor/watchtower/internal/compose/labels"
 	"github.com/nicholas-fedor/watchtower/internal/container"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
+	containerLabels "github.com/nicholas-fedor/watchtower/internal/container/labels"
 )
 
 // deployed describes a container of a test deployment, with every input that
 // Container.Links reads dependencies from.
 type deployed struct {
+	// labels are further labels, such as Compose's config hash.
+	labels map[string]string
 	// name is the container name, without the leading slash.
 	name string
+	// id is the container ID. Empty means a stable ID derived from the name.
+	id string
 	// project is the Compose project label. Empty means unset.
 	project string
 	// service is the Compose service label. Empty means unset.
@@ -44,15 +50,16 @@ func dockerID(name string) string {
 }
 
 // container builds the container the description stands for.
-func (d deployed) container() types.Container {
+func (d deployed) container() *container.Container {
 	labels := map[string]string{}
+	maps.Copy(labels, d.labels)
 
 	for key, value := range map[string]string{
-		"com.docker.compose.project":                d.project,
-		"com.docker.compose.service":                d.service,
-		"com.docker.compose.container-number":       d.number,
-		"com.docker.compose.depends_on":             d.composeDependsOn,
-		"com.centurylinklabs.watchtower.depends-on": d.dependsOn,
+		composeLabels.ComposeProjectLabel:    d.project,
+		composeLabels.ComposeServiceLabel:    d.service,
+		composeLabels.ComposeContainerNumber: d.number,
+		composeLabels.ComposeDependsOnLabel:  d.composeDependsOn,
+		containerLabels.DependsOn:            d.dependsOn,
 	} {
 		if value != "" {
 			labels[key] = value
@@ -60,11 +67,16 @@ func (d deployed) container() types.Container {
 	}
 
 	if d.watchtower {
-		labels["com.centurylinklabs.watchtower"] = "true"
+		labels[containerLabels.Watchtower] = "true"
+	}
+
+	id := d.id
+	if id == "" {
+		id = dockerID(d.name)
 	}
 
 	return container.NewContainer(nil, &dockerContainer.InspectResponse{
-		ID:   dockerID(d.name),
+		ID:   id,
 		Name: "/" + d.name,
 		HostConfig: &dockerContainer.HostConfig{
 			Links:       d.links,
@@ -76,8 +88,8 @@ func (d deployed) container() types.Container {
 }
 
 // deploy builds the containers of a test deployment.
-func deploy(specs ...deployed) []types.Container {
-	containers := make([]types.Container, 0, len(specs))
+func deploy(specs ...deployed) []*container.Container {
+	containers := make([]*container.Container, 0, len(specs))
 	for _, spec := range specs {
 		containers = append(containers, spec.container())
 	}
@@ -87,11 +99,11 @@ func deploy(specs ...deployed) []types.Container {
 
 // pick returns the containers of a deployment with the given names, in the
 // order named.
-func pick(containers []types.Container, names ...string) []types.Container {
-	picked := make([]types.Container, 0, len(names))
+func pick(containers []*container.Container, names ...string) []*container.Container {
+	picked := make([]*container.Container, 0, len(names))
 
 	for _, name := range names {
-		i := slices.IndexFunc(containers, func(c types.Container) bool { return c.Name() == name })
+		i := slices.IndexFunc(containers, func(c *container.Container) bool { return c.Name() == name })
 		if i >= 0 {
 			picked = append(picked, containers[i])
 		}
@@ -101,7 +113,7 @@ func pick(containers []types.Container, names ...string) []types.Container {
 }
 
 // containerNames returns the names of containers, in order.
-func containerNames(containers []types.Container) []string {
+func containerNames(containers []*container.Container) []string {
 	names := make([]string, 0, len(containers))
 	for _, c := range containers {
 		names = append(names, c.Name())

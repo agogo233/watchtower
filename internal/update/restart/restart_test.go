@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -16,15 +17,15 @@ import (
 	dockerContainer "github.com/moby/moby/api/types/container"
 	dockerNetwork "github.com/moby/moby/api/types/network"
 
-	mockContainerClient "github.com/nicholas-fedor/watchtower/internal/container/client/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/container"
 	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/logcapture"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/reportfixture"
 	"github.com/nicholas-fedor/watchtower/internal/update/cleanup"
 	mockUpdate "github.com/nicholas-fedor/watchtower/internal/update/mocks"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
+	mockRestart "github.com/nicholas-fedor/watchtower/internal/update/restart/mocks"
 	"github.com/nicholas-fedor/watchtower/internal/update/state"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // stopContainersTestCase represents a test case for stopContainersInReversedOrder cancellation.
@@ -66,6 +67,23 @@ func newTestLogger(t *testing.T) *zerolog.Logger {
 	return new(zerolog.New(w))
 }
 
+// newWatchtowerContainer returns a running Watchtower container named
+// "watchtower", so a self-update renames it or hands it to an orchestrator.
+//
+// Returns:
+//   - *container.Container: A Watchtower container with the ID "watchtower".
+func newWatchtowerContainer() *container.Container {
+	return mockUpdate.CreateMockContainerWithConfig(
+		"watchtower",
+		"/watchtower",
+		"watchtower:latest",
+		true,
+		false,
+		time.Now(),
+		&dockerContainer.Config{Labels: map[string]string{"com.centurylinklabs.watchtower": "true"}},
+	)
+}
+
 // Test_restartStaleContainer verifies when restarting a stale Watchtower
 // container renames it first, including run-once mode, an existing old name,
 // and an ephemeral self-update handoff.
@@ -75,9 +93,9 @@ func Test_restartStaleContainer(t *testing.T) {
 	t.Run("should not rename Watchtower container in run-once mode", func(t *testing.T) {
 		t.Parallel()
 
-		client := mockUpdate.CreateMockClient(
+		client := mockUpdate.CreateFakeClient(
 			&mockUpdate.TestData{
-				Containers: []types.Container{
+				Containers: []*container.Container{
 					mockUpdate.CreateMockContainerWithConfig(
 						"watchtower",
 						"/watchtower",
@@ -113,9 +131,9 @@ func Test_restartStaleContainer(t *testing.T) {
 	t.Run("should rename Watchtower container when not in run-once mode", func(t *testing.T) {
 		t.Parallel()
 
-		client := mockUpdate.CreateMockClient(
+		client := mockUpdate.CreateFakeClient(
 			&mockUpdate.TestData{
-				Containers: []types.Container{
+				Containers: []*container.Container{
 					mockUpdate.CreateMockContainerWithConfig(
 						"watchtower",
 						"/watchtower",
@@ -151,9 +169,9 @@ func Test_restartStaleContainer(t *testing.T) {
 	t.Run("should skip rename if source container is already named with the target old name", func(t *testing.T) {
 		t.Parallel()
 
-		client := mockUpdate.CreateMockClient(
+		client := mockUpdate.CreateFakeClient(
 			&mockUpdate.TestData{
-				Containers: []types.Container{
+				Containers: []*container.Container{
 					mockUpdate.CreateMockContainerWithConfig(
 						"abc123def456",
 						"/watchtower-old-abc123def456",
@@ -189,9 +207,9 @@ func Test_restartStaleContainer(t *testing.T) {
 	t.Run("should treat ephemeral self-update as a completed handoff", func(t *testing.T) {
 		t.Parallel()
 
-		client := mockUpdate.CreateMockClient(
+		client := mockUpdate.CreateFakeClient(
 			&mockUpdate.TestData{
-				Containers: []types.Container{
+				Containers: []*container.Container{
 					mockUpdate.CreateMockContainerWithConfig(
 						"watchtower",
 						"/watchtower",
@@ -276,11 +294,11 @@ func TestDetachedContext(t *testing.T) {
 			t.Run(tc.name, func(t *testing.T) {
 				t.Parallel()
 
-				// Create a mock client with a Watchtower container that will trigger
+				// Create a fake client with a Watchtower container that will trigger
 				// the restart policy update path where the detached context is used.
-				client := mockUpdate.CreateMockClient(
+				client := mockUpdate.CreateFakeClient(
 					&mockUpdate.TestData{
-						Containers: []types.Container{
+						Containers: []*container.Container{
 							mockUpdate.CreateMockContainerWithConfig(
 								"watchtower",
 								"/watchtower",
@@ -361,9 +379,9 @@ func TestDetachedContext(t *testing.T) {
 		t.Run("renames the source back to the original name when create fails", func(t *testing.T) {
 			t.Parallel()
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainerWithConfig(
 							"watchtower-source-id",
 							"/watchtower",
@@ -454,12 +472,12 @@ func TestDetachedContext(t *testing.T) {
 	t.Run("Watchtower self-update start failure cleanup", func(t *testing.T) {
 		t.Parallel()
 
-		t.Run("removes the newly created container, not the renamed source", func(t *testing.T) {
+		t.Run("removes the newly created container and renames the source back", func(t *testing.T) {
 			t.Parallel()
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainerWithConfig(
 							"watchtower-source-id",
 							"/watchtower",
@@ -525,8 +543,24 @@ func TestDetachedContext(t *testing.T) {
 			wg.Wait()
 
 			require.EqualError(t, err, "simulated start failure")
-			assert.True(t, renamed)
+			assert.False(t, renamed, "name should be restored after start failure")
 			assert.Equal(t, int32(1), client.TestData.CreateContainerCount.Load())
+
+			// The removed replacement held the original name, so the source can
+			// take it back only after the removal.
+			assert.Equal(t,
+				[]string{testContainer.OldName(), "watchtower"},
+				client.TestData.RenameTargets,
+			)
+
+			handoff := slices.DeleteFunc(slices.Clone(client.TestData.OperationOrder), func(op string) bool {
+				return op != "RenameContainer" && op != "StopAndRemoveContainer"
+			})
+			assert.Equal(t,
+				[]string{"RenameContainer", "StopAndRemoveContainer", "RenameContainer"},
+				handoff,
+				"the rename back follows the replacement's removal",
+			)
 			assert.NotEmpty(t, client.TestData.LastCreatedContainerID)
 			assert.Equal(t, int32(1), client.TestData.StopAndRemoveContainerCount.Load())
 			assert.Equal(t, int32(1), client.TestData.RemoveContainerCount.Load())
@@ -586,9 +620,9 @@ func TestDetachedContext(t *testing.T) {
 				t.Run(tt.name, func(t *testing.T) {
 					t.Parallel()
 
-					client := mockUpdate.CreateMockClient(
+					client := mockUpdate.CreateFakeClient(
 						&mockUpdate.TestData{
-							Containers: []types.Container{
+							Containers: []*container.Container{
 								mockUpdate.CreateMockContainerWithConfig(
 									"watchtower-source-id",
 									"/watchtower",
@@ -647,12 +681,12 @@ func TestDetachedContext(t *testing.T) {
 			// Create a parent context that we will cancel while restartStaleContainer is running.
 			parentCtx, parentCancel := context.WithCancel(t.Context())
 
-			// Create a mock client with a Watchtower container.
+			// Create a fake client with a Watchtower container.
 			// Configure StartContainerByIDError to trigger the cleanup path.
 			// Add simulated latency to allow time for operations to complete.
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainerWithConfig(
 							"watchtower",
 							"/watchtower",
@@ -725,7 +759,7 @@ func TestDetachedContext(t *testing.T) {
 			// cleanup (StopAndRemoveContainer) should have been attempted
 			// using the detached context, which survives parent cancellation.
 			require.EqualError(t, err, "simulated start failure")
-			assert.True(t, renamed)
+			assert.False(t, renamed, "the source takes its original name back")
 
 			// Verify that RemoveContainer was called during cleanup.
 			// This demonstrates that the detached context allowed the cleanup
@@ -740,10 +774,10 @@ func TestDetachedContext(t *testing.T) {
 			parentCtx, parentCancel := context.WithCancel(t.Context())
 			parentCancel() // Cancel immediately before calling restartStaleContainer
 
-			// Create a mock client with a Watchtower container.
-			client := mockUpdate.CreateMockClient(
+			// Create a fake client with a Watchtower container.
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainerWithConfig(
 							"watchtower",
 							"/watchtower",
@@ -783,8 +817,7 @@ func TestDetachedContext(t *testing.T) {
 			)
 
 			// The operation should fail at RenameContainer due to parent context cancellation.
-			require.Error(t, err)
-			assert.Contains(t, err.Error(), "failed to rename Watchtower container")
+			require.ErrorIs(t, err, context.Canceled)
 			assert.False(t, renamed)
 
 			// RenameContainer should have been attempted but failed due to context cancellation.
@@ -800,10 +833,10 @@ func TestDetachedContext(t *testing.T) {
 			// verify that SetRestartPolicy is called after a successful start,
 			// demonstrating the detached context is properly created and used.
 
-			// Create a mock client with a Watchtower container that succeeds.
-			client := mockUpdate.CreateMockClient(
+			// Create a fake client with a Watchtower container that succeeds.
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{
+					Containers: []*container.Container{
 						mockUpdate.CreateMockContainerWithConfig(
 							"watchtower",
 							"/watchtower",
@@ -935,7 +968,7 @@ func Test_stopContainersInReversedOrder(t *testing.T) {
 				t.Log(tc.description)
 
 				// Create mock containers with ToRestart set to true.
-				containers := make([]types.Container, tc.numContainers)
+				containers := make([]*container.Container, tc.numContainers)
 				for i := range tc.numContainers {
 					containerID := fmt.Sprintf("container-%d", i)
 					containerName := fmt.Sprintf("/container-%d", i)
@@ -958,8 +991,8 @@ func Test_stopContainersInReversedOrder(t *testing.T) {
 					containers[i] = c
 				}
 
-				// Create mock client.
-				client := mockUpdate.CreateMockClient(
+				// Create a fake client.
+				client := mockUpdate.CreateFakeClient(
 					&mockUpdate.TestData{
 						Containers: containers,
 						Staleness:  make(map[string]bool),
@@ -1030,7 +1063,7 @@ func Test_stopContainersInReversedOrder(t *testing.T) {
 			// - At i=3, ctx.Err() != nil, so container 3 is added to failed
 			// - Then containers 2,1,0 are also added to failed
 			// - All 4 containers are properly tracked as failed
-			containers := make([]types.Container, 4)
+			containers := make([]*container.Container, 4)
 
 			for i := range 4 {
 				containerID := fmt.Sprintf("container-%d", i)
@@ -1053,7 +1086,7 @@ func Test_stopContainersInReversedOrder(t *testing.T) {
 				containers[i] = c
 			}
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
 					Containers: containers,
 					Staleness: map[string]bool{
@@ -1085,7 +1118,7 @@ func Test_stopContainersInReversedOrder(t *testing.T) {
 
 			// Verify all containers 0, 1, 2, 3 are in failed map with wrapped error.
 			for i := range 4 {
-				containerID := types.ContainerID(fmt.Sprintf("container-%d", i))
+				containerID := container.ContainerID(fmt.Sprintf("container-%d", i))
 				err, exists := failed[containerID]
 				require.True(t, exists, "Container %d should be in failed map", i)
 
@@ -1105,7 +1138,7 @@ func Test_stopContainersInReversedOrder(t *testing.T) {
 			// - At i=2, ctx.Err() != nil, so container 2 is logged and added to failed
 			// - Then containers 1,0 are also logged and added to failed
 			// - All 3 containers are properly logged
-			containers := make([]types.Container, 3)
+			containers := make([]*container.Container, 3)
 			expectedNames := []string{"container-0", "container-1", "container-2"} // All 3 are logged
 
 			for i := range 3 {
@@ -1125,7 +1158,7 @@ func Test_stopContainersInReversedOrder(t *testing.T) {
 				containers[i] = c
 			}
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
 					Containers: containers,
 					Staleness: map[string]bool{
@@ -1187,7 +1220,7 @@ func Test_stopContainersInReversedOrder(t *testing.T) {
 			t.Parallel()
 
 			// Create containers.
-			containers := make([]types.Container, 3)
+			containers := make([]*container.Container, 3)
 
 			for i := range 3 {
 				c := mockUpdate.CreateMockContainerWithConfig(
@@ -1206,7 +1239,7 @@ func Test_stopContainersInReversedOrder(t *testing.T) {
 				containers[i] = c
 			}
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
 					Containers: containers,
 					Staleness: map[string]bool{
@@ -1248,7 +1281,7 @@ func Test_stopContainersInReversedOrder(t *testing.T) {
 			t.Parallel()
 
 			// Create containers.
-			containers := make([]types.Container, 3)
+			containers := make([]*container.Container, 3)
 
 			for i := range 3 {
 				c := mockUpdate.CreateMockContainerWithConfig(
@@ -1267,7 +1300,7 @@ func Test_stopContainersInReversedOrder(t *testing.T) {
 				containers[i] = c
 			}
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
 					Containers: containers,
 					Staleness: map[string]bool{
@@ -1306,7 +1339,7 @@ func TestRestartContainersInSortedOrderCancelRecovery(t *testing.T) {
 	t.Run("still recreates containers that were already stopped when parent ctx is canceled", func(t *testing.T) {
 		t.Parallel()
 
-		containers := make([]types.Container, 3)
+		containers := make([]*container.Container, 3)
 
 		for i := range 3 {
 			c := mockUpdate.CreateMockContainerWithConfig(
@@ -1325,7 +1358,7 @@ func TestRestartContainersInSortedOrderCancelRecovery(t *testing.T) {
 			containers[i] = c
 		}
 
-		client := mockUpdate.CreateMockClient(
+		client := mockUpdate.CreateFakeClient(
 			&mockUpdate.TestData{
 				Containers: containers,
 				Staleness: map[string]bool{
@@ -1360,7 +1393,6 @@ func TestRestartContainersInSortedOrderCancelRecovery(t *testing.T) {
 			stoppedImages,
 			&cleanup,
 			&progress,
-			nil,
 		)
 
 		assert.Empty(t, failed, "stopped containers must still be recreated after cancel")
@@ -1444,7 +1476,7 @@ func Test_performRollingRestart(t *testing.T) {
 				t.Log(tc.description)
 
 				// Create mock containers with ToRestart set to true.
-				containers := make([]types.Container, tc.numContainers)
+				containers := make([]*container.Container, tc.numContainers)
 				for i := range tc.numContainers {
 					containerID := fmt.Sprintf("container-%d", i)
 					containerName := fmt.Sprintf("/container-%d", i)
@@ -1467,8 +1499,8 @@ func Test_performRollingRestart(t *testing.T) {
 					containers[i] = c
 				}
 
-				// Create mock client.
-				client := mockUpdate.CreateMockClient(
+				// Create a fake client.
+				client := mockUpdate.CreateFakeClient(
 					&mockUpdate.TestData{
 						Containers: containers,
 						Staleness:  make(map[string]bool),
@@ -1505,7 +1537,6 @@ func Test_performRollingRestart(t *testing.T) {
 					updateParams.Params{},
 					&cleanupImageInfos,
 					nil, // progress is not needed for this test
-					nil,
 				)
 
 				// Verify the number of failed containers.
@@ -1549,7 +1580,7 @@ func Test_performRollingRestart(t *testing.T) {
 			// - At i=0, ctx.Done() is triggered, so container 0 is added to failed
 			// - Then containers 1,2,3 are also added to failed
 			// - All 4 containers are properly tracked as failed
-			containers := make([]types.Container, 4)
+			containers := make([]*container.Container, 4)
 
 			for i := range 4 {
 				containerID := fmt.Sprintf("container-%d", i)
@@ -1572,7 +1603,7 @@ func Test_performRollingRestart(t *testing.T) {
 				containers[i] = c
 			}
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
 					Containers: containers,
 					Staleness: map[string]bool{
@@ -1600,7 +1631,6 @@ func Test_performRollingRestart(t *testing.T) {
 				updateParams.Params{},
 				&cleanupImageInfos,
 				nil,
-				nil,
 			)
 
 			// All 4 containers should be in failed map (containers 0, 1, 2, 3).
@@ -1612,7 +1642,7 @@ func Test_performRollingRestart(t *testing.T) {
 
 			// Verify all containers 0, 1, 2, 3 are in failed map with wrapped error.
 			for i := range 4 {
-				containerID := types.ContainerID(fmt.Sprintf("container-%d", i))
+				containerID := container.ContainerID(fmt.Sprintf("container-%d", i))
 				containerErr, exists := failed[containerID]
 				require.True(t, exists, "Container %d should be in failed map", i)
 
@@ -1632,7 +1662,7 @@ func Test_performRollingRestart(t *testing.T) {
 			// - At i=0, ctx.Done() is triggered, so container 0 is logged and added to failed
 			// - Then containers 1,2 are also logged and added to failed
 			// - All 3 containers are properly logged
-			containers := make([]types.Container, 3)
+			containers := make([]*container.Container, 3)
 			expectedNames := []string{"container-0", "container-1", "container-2"} // All 3 are logged
 
 			for i := range 3 {
@@ -1652,7 +1682,7 @@ func Test_performRollingRestart(t *testing.T) {
 				containers[i] = c
 			}
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
 					Containers: containers,
 					Staleness: map[string]bool{
@@ -1681,7 +1711,6 @@ func Test_performRollingRestart(t *testing.T) {
 				client,
 				updateParams.Params{},
 				&cleanupImageInfos,
-				nil,
 				nil,
 			)
 
@@ -1719,7 +1748,7 @@ func Test_performRollingRestart(t *testing.T) {
 			t.Parallel()
 
 			// Create containers.
-			containers := make([]types.Container, 3)
+			containers := make([]*container.Container, 3)
 
 			for i := range 3 {
 				c := mockUpdate.CreateMockContainerWithConfig(
@@ -1738,7 +1767,7 @@ func Test_performRollingRestart(t *testing.T) {
 				containers[i] = c
 			}
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
 					Containers: containers,
 					Staleness: map[string]bool{
@@ -1764,7 +1793,6 @@ func Test_performRollingRestart(t *testing.T) {
 				updateParams.Params{},
 				&cleanupImageInfos,
 				nil,
-				nil,
 			)
 
 			// All containers should be processed, none failed due to cancellation.
@@ -1785,7 +1813,7 @@ func Test_performRollingRestart(t *testing.T) {
 			t.Parallel()
 
 			// Create containers.
-			containers := make([]types.Container, 3)
+			containers := make([]*container.Container, 3)
 
 			for i := range 3 {
 				c := mockUpdate.CreateMockContainerWithConfig(
@@ -1804,7 +1832,7 @@ func Test_performRollingRestart(t *testing.T) {
 				containers[i] = c
 			}
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
 					Containers: containers,
 					Staleness: map[string]bool{
@@ -1829,7 +1857,6 @@ func Test_performRollingRestart(t *testing.T) {
 				client,
 				updateParams.Params{},
 				&cleanupImageInfos,
-				nil,
 				nil,
 			)
 
@@ -1864,9 +1891,9 @@ func Test_performRollingRestart(t *testing.T) {
 			)
 			watchtower.SetStale(true)
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{watchtower},
+					Containers: []*container.Container{watchtower},
 					Staleness:  map[string]bool{"watchtower": true},
 				},
 				false,
@@ -1879,11 +1906,10 @@ func Test_performRollingRestart(t *testing.T) {
 
 			failed, err := performRollingRestart(log,
 				t.Context(),
-				[]types.Container{watchtower},
+				[]*container.Container{watchtower},
 				client,
 				updateParams.Params{RollingRestart: true, EphemeralSelfUpdate: true},
 				&cleanupImageInfos,
-				nil,
 				nil,
 			)
 
@@ -1904,7 +1930,7 @@ func Test_performRollingRestart(t *testing.T) {
 			t.Parallel()
 
 			// Create a single container.
-			containers := []types.Container{
+			containers := []*container.Container{
 				mockUpdate.CreateMockContainerWithConfig(
 					"container-0",
 					"/container-0",
@@ -1920,7 +1946,7 @@ func Test_performRollingRestart(t *testing.T) {
 			}
 			containers[0].SetStale(true)
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
 					Containers: containers,
 					Staleness:  map[string]bool{"container-0": true},
@@ -1943,7 +1969,6 @@ func Test_performRollingRestart(t *testing.T) {
 				updateParams.Params{},
 				&cleanupImageInfos,
 				nil,
-				nil,
 			)
 
 			// Verify error is returned.
@@ -1957,7 +1982,7 @@ func Test_performRollingRestart(t *testing.T) {
 
 			// Verify failed container error also wraps context.Canceled.
 			require.Len(t, failed, 1)
-			containerErr := failed[types.ContainerID("container-0")]
+			containerErr := failed[container.ContainerID("container-0")]
 			require.ErrorIs(t, containerErr, context.Canceled, "Container error should wrap context.Canceled")
 			assert.Contains(t, containerErr.Error(), "restart skipped")
 		})
@@ -1966,7 +1991,7 @@ func Test_performRollingRestart(t *testing.T) {
 			t.Parallel()
 
 			// Create a single container.
-			containers := []types.Container{
+			containers := []*container.Container{
 				mockUpdate.CreateMockContainerWithConfig(
 					"container-0",
 					"/container-0",
@@ -1982,7 +2007,7 @@ func Test_performRollingRestart(t *testing.T) {
 			}
 			containers[0].SetStale(true)
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
 					Containers: containers,
 					Staleness:  map[string]bool{"container-0": true},
@@ -2005,7 +2030,6 @@ func Test_performRollingRestart(t *testing.T) {
 				updateParams.Params{},
 				&cleanupImageInfos,
 				nil,
-				nil,
 			)
 
 			// Verify error is returned.
@@ -2019,7 +2043,7 @@ func Test_performRollingRestart(t *testing.T) {
 
 			// Verify failed container error also wraps context.DeadlineExceeded.
 			require.Len(t, failed, 1)
-			containerErr := failed[types.ContainerID("container-0")]
+			containerErr := failed[container.ContainerID("container-0")]
 			require.ErrorIs(t, containerErr, context.DeadlineExceeded, "Container error should wrap context.DeadlineExceeded")
 			assert.Contains(t, containerErr.Error(), "restart skipped")
 		})
@@ -2061,9 +2085,9 @@ func TestRun(t *testing.T) {
 			)
 			c.SetStale(true)
 
-			client := mockUpdate.CreateMockClient(
+			client := mockUpdate.CreateFakeClient(
 				&mockUpdate.TestData{
-					Containers: []types.Container{c},
+					Containers: []*container.Container{c},
 					Staleness:  map[string]bool{"container-0": true},
 				},
 				false,
@@ -2079,7 +2103,7 @@ func TestRun(t *testing.T) {
 
 			var cleanupImageInfos []cleanup.RemovedImageInfo
 
-			err := Run(log, ctx, []types.Container{c}, client, config, &cleanupImageInfos, &progress, nil)
+			err := Run(log, ctx, []*container.Container{c}, client, config, &cleanupImageInfos, &progress)
 			if tt.wantErr {
 				require.ErrorIs(t, err, context.Canceled)
 			} else {
@@ -2096,9 +2120,10 @@ func TestRun(t *testing.T) {
 	}
 }
 
-// TestClientErrorsNamedOnce verifies that a failed stop, remove, create or
-// start reports the container client's error as it is. The client's error
-// already names the step, so the restart adds no second prefix.
+// TestClientErrorsNamedOnce verifies that a failed stop, remove, create,
+// start or Watchtower rename, or a failed ephemeral self-update orchestrator,
+// reports the container client's error as it is. The client's error already
+// names the step, so the restart adds no second prefix.
 func TestClientErrorsNamedOnce(t *testing.T) {
 	t.Parallel()
 
@@ -2114,10 +2139,12 @@ func TestClientErrorsNamedOnce(t *testing.T) {
 
 				clientErr := errors.New(text)
 				source := staleMockContainer()
-				client := mockContainerClient.NewMockClient(t)
+				client := mockRestart.NewMockClient(t)
+				client.EXPECT().SnapshotCopyFiles(mock.Anything, source).Return(nil)
 				client.EXPECT().
 					StopAndRemoveContainer(mock.Anything, source, time.Second).
 					Return(clientErr)
+				client.EXPECT().DiscardCopyFiles(source.ID())
 
 				stopped, err := stopStaleContainer(
 					newTestLogger(t),
@@ -2136,10 +2163,10 @@ func TestClientErrorsNamedOnce(t *testing.T) {
 	t.Run("create", func(t *testing.T) {
 		t.Parallel()
 
-		text := "create replacement container: failed to create container: daemon unavailable"
+		text := "failed to create container: daemon unavailable"
 		clientErr := errors.New(text)
 		source := staleMockContainer()
-		client := mockContainerClient.NewMockClient(t)
+		client := mockRestart.NewMockClient(t)
 		client.EXPECT().
 			CreateContainer(mock.Anything, source).
 			Return("", clientErr)
@@ -2155,12 +2182,12 @@ func TestClientErrorsNamedOnce(t *testing.T) {
 		text := "failed to start container abc123: daemon unavailable"
 		clientErr := errors.New(text)
 		source := staleMockContainer()
-		client := mockContainerClient.NewMockClient(t)
+		client := mockRestart.NewMockClient(t)
 		client.EXPECT().
 			CreateContainer(mock.Anything, source).
-			Return(types.ContainerID("abc123"), nil)
+			Return(container.ContainerID("abc123"), nil)
 		client.EXPECT().
-			StartContainerByID(mock.Anything, types.ContainerID("abc123")).
+			StartContainerByID(mock.Anything, container.ContainerID("abc123")).
 			Return(clientErr)
 
 		_, _, err := restartStaleContainer(
@@ -2173,6 +2200,80 @@ func TestClientErrorsNamedOnce(t *testing.T) {
 		require.Same(t, clientErr, err)
 		require.EqualError(t, err, text)
 	})
+
+	t.Run("Watchtower rename", func(t *testing.T) {
+		t.Parallel()
+
+		text := "failed to rename container: daemon unavailable"
+		clientErr := errors.New(text)
+		source := newWatchtowerContainer()
+		client := mockRestart.NewMockClient(t)
+		client.EXPECT().
+			RenameContainer(mock.Anything, source, source.OldName()).
+			Return(clientErr)
+
+		_, renamed, err := restartStaleContainer(newTestLogger(t), t.Context(), source, client, updateParams.Params{})
+		require.Same(t, clientErr, err)
+		require.EqualError(t, err, text)
+		assert.False(t, renamed)
+	})
+
+	t.Run("ephemeral self-update orchestrator", func(t *testing.T) {
+		t.Parallel()
+
+		text := "failed to start ephemeral orchestrator container: daemon unavailable"
+		clientErr := errors.New(text)
+		source := newWatchtowerContainer()
+		client := mockRestart.NewMockClient(t)
+		client.EXPECT().
+			CreateEphemeralOrchestrator(mock.Anything, source, mock.Anything, mock.Anything, mock.Anything).
+			Return("", clientErr)
+
+		_, _, err := restartStaleContainer(
+			newTestLogger(t),
+			t.Context(),
+			source,
+			client,
+			updateParams.Params{EphemeralSelfUpdate: true},
+		)
+		require.Same(t, clientErr, err)
+		require.EqualError(t, err, text)
+	})
+}
+
+// TestRestartStaleContainer_AlreadyRenamedStartFails verifies that a failed
+// start of a replacement for a Watchtower already under its "watchtower-old-"
+// name removes the replacement and leaves the source's name alone.
+//
+// This restart did not rename the source, so it has no original name to give
+// back. The mock fails the test on any rename.
+func TestRestartStaleContainer_AlreadyRenamedStartFails(t *testing.T) {
+	t.Parallel()
+
+	const newID = container.ContainerID("replacement-id")
+
+	startErr := errors.New("failed to start container replacement-id: daemon unavailable")
+	source := mockUpdate.CreateMockContainerWithConfig(
+		"abc123def456",
+		"/watchtower-old-abc123def456",
+		"watchtower:latest",
+		true,
+		false,
+		time.Now(),
+		&dockerContainer.Config{Labels: map[string]string{"com.centurylinklabs.watchtower": "true"}},
+	)
+	failed := mockUpdate.CreateMockContainer(string(newID), "/watchtower-old-abc123def456", "watchtower:latest", time.Now())
+
+	client := mockRestart.NewMockClient(t)
+	client.EXPECT().CreateContainer(mock.Anything, source).Return(newID, nil).Once()
+	client.EXPECT().StartContainerByID(mock.Anything, newID).Return(startErr).Once()
+	client.EXPECT().GetContainer(mock.Anything, newID).Return(failed, nil).Once()
+	client.EXPECT().StopAndRemoveContainer(mock.Anything, failed, time.Duration(0)).Return(nil).Once()
+
+	newContainerID, renamed, err := restartStaleContainer(newTestLogger(t), t.Context(), source, client, updateParams.Params{})
+	require.Same(t, startErr, err)
+	assert.Empty(t, newContainerID)
+	assert.True(t, renamed, "the source keeps its old name")
 }
 
 // TestRecordRestartOutcomes verifies that each failed restart is recorded and reported once.
@@ -2189,7 +2290,7 @@ func TestRecordRestartOutcomes(t *testing.T) {
 	const failures = 5
 
 	progress := state.Progress{}
-	outcomes := make(map[types.ContainerID]error, failures+1)
+	outcomes := make(map[container.ContainerID]error, failures+1)
 	wantNames := make([]string, 0, failures)
 
 	for index := range failures {

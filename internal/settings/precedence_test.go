@@ -1,18 +1,15 @@
 package settings
 
 import (
-	"io"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/rs/zerolog"
-	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/nicholas-fedor/watchtower/internal/git/semver"
-	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
 )
 
 // newTestLogger returns a logger that writes each event to the test's log, so a
@@ -44,8 +41,7 @@ func newLoadedCommand(t *testing.T, env map[string]string, args ...string) Confi
 }
 
 // loadWithEnv loads the configuration from env and args on a command with
-// every flag registered. It applies the environment, flag aliases and secret
-// files the way startup does before it calls Load.
+// every flag registered, as startup does.
 //
 // Parameters:
 //   - t: Test that owns the environment.
@@ -62,36 +58,29 @@ func loadWithEnv(t *testing.T, env map[string]string, args ...string) (Config, e
 		t.Setenv(k, v)
 	}
 
-	cmd := &cobra.Command{Use: "watchtower"}
+	cfg, _, err := Load(newTestLogger(t), newParsedCommand(t, args...), nil)
 
-	RegisterAll(cmd)
-	require.NoError(t, cmd.ParseFlags(args))
-
-	flagSet := cmd.PersistentFlags()
-	require.NoError(t, ApplyEnvToFlags(flagSet, AllSpecs()))
-
-	log := logging.New(io.Discard, logging.InfoLevel)
-	require.NoError(t, ProcessFlagAliases(log, flagSet))
-	require.NoError(t, GetSecretsFromFiles(log, cmd))
-
-	return Load(newTestLogger(t), cmd, nil)
+	return cfg, err
 }
 
 func TestLoad_FlagOverridesEnv(t *testing.T) {
 	cfg := newLoadedCommand(t,
 		map[string]string{
-			"WATCHTOWER_CLEANUP":      "false",
-			"WATCHTOWER_MONITOR_ONLY": "true",
-			"WATCHTOWER_TIMEOUT":      "30",
+			"WATCHTOWER_CLEANUP":            "false",
+			"WATCHTOWER_MONITOR_ONLY":       "true",
+			"WATCHTOWER_TIMEOUT":            "30",
+			"WATCHTOWER_DISABLE_CONTAINERS": "db",
 		},
 		"--cleanup",
 		"--monitor-only=false",
 		"--stop-timeout", "10s",
+		"--disable-containers", "web",
 	)
 
 	assert.True(t, cfg.Update.Cleanup, "flag must override env for cleanup")
 	assert.False(t, cfg.Update.MonitorOnly, "flag must override env for monitor-only")
 	assert.Equal(t, 10*time.Second, cfg.Update.StopTimeout, "flag must override env for timeout")
+	assert.Equal(t, []string{"web"}, cfg.Filter.DisableContainers, "flag must override env for a list")
 }
 
 func TestLoad_EnvOverridesDefault(t *testing.T) {
@@ -106,6 +95,20 @@ func TestLoad_EnvOverridesDefault(t *testing.T) {
 	assert.True(t, cfg.Update.NoPull)
 	assert.Equal(t, 45*time.Second, cfg.Update.StopTimeout, "bare-second env duration")
 	assert.Equal(t, 120, cfg.Schedule.IntervalSeconds)
+}
+
+// TestLoad_integerFromEnv verifies that an integer setting from the
+// environment loads as the decimal value with surrounding spaces dropped, so a
+// leading zero is not octal and the value reaches the derived schedule.
+func TestLoad_integerFromEnv(t *testing.T) {
+	cfg := newLoadedCommand(t, map[string]string{
+		"WATCHTOWER_POLL_INTERVAL":       " 010 ",
+		"WATCHTOWER_HTTP_API_RATE_LIMIT": " 7 ",
+	})
+
+	assert.Equal(t, 10, cfg.Schedule.IntervalSeconds)
+	assert.Equal(t, "@every 10s", cfg.Schedule.Spec)
+	assert.Equal(t, 7, cfg.API.RateLimit)
 }
 
 func TestLoad_DefaultWhenUnset(t *testing.T) {
@@ -192,7 +195,7 @@ func TestLoad_APIChangedReflectsCLIOnly(t *testing.T) {
 		assert.False(t, cfg.API.CheckTimeoutChanged)
 		assert.False(t, cfg.API.UpdateTimeoutChanged)
 
-		run, err := cfg.BuildRunConfig(RunConfigInput{})
+		run, err := cfg.BuildRunConfig()
 		require.NoError(t, err)
 		assert.False(t, AnyHTTPAPIConfig(run),
 			"env-only host/port/rate/timeouts must not trip the no-endpoint warning")
@@ -209,7 +212,7 @@ func TestLoad_APIChangedReflectsCLIOnly(t *testing.T) {
 		assert.True(t, cfg.API.PortChanged)
 		assert.True(t, cfg.API.RateLimitChanged)
 
-		run, err := cfg.BuildRunConfig(RunConfigInput{})
+		run, err := cfg.BuildRunConfig()
 		require.NoError(t, err)
 		assert.True(t, AnyHTTPAPIConfig(run),
 			"CLI host/port/rate-limit should still trip the no-endpoint warning")

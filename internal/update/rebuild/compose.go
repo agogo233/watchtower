@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/url"
+	"maps"
 	"strings"
 
 	"github.com/rs/zerolog"
@@ -20,7 +20,6 @@ import (
 	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/internal/update/state"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // composeServices is a batch's members grouped by Compose service, ready to
@@ -62,7 +61,7 @@ func (s *Session) applyCompose(
 	batch *composeBatch,
 	params updateParams.Params,
 	progress *state.Progress,
-	failed map[types.ContainerID]error,
+	failed map[container.ContainerID]error,
 ) {
 	if batch == nil || len(batch.members) == 0 {
 		return
@@ -132,7 +131,7 @@ func groupComposeServices(
 	log *zerolog.Logger,
 	batch *composeBatch,
 	params updateParams.Params,
-	failed map[types.ContainerID]error,
+	failed map[container.ContainerID]error,
 ) composeServices {
 	services := composeServices{
 		names:   make([]string, 0, len(batch.members)),
@@ -187,7 +186,7 @@ func (s *Session) checkoutCompose(
 	batch *composeBatch,
 	commit string,
 	params updateParams.Params,
-	failed map[types.ContainerID]error,
+	failed map[container.ContainerID]error,
 ) bool {
 	checkout := s.checkout
 	if checkout == nil {
@@ -265,15 +264,10 @@ func (s *Session) runComposeApply(
 	services composeServices,
 	params updateParams.Params,
 	progress *state.Progress,
-	failed map[types.ContainerID]error,
+	failed map[container.ContainerID]error,
 ) ([]composeApply.Container, bool) {
-	applier := s.apply
-	if applier == nil {
-		applier = composeApply.NewClient()
-	}
-
 	applyCtx, cancelApply := context.WithTimeout(ctx, rebuildTimeout)
-	applied, err := applier.Apply(applyCtx, composeApply.Request{
+	applied, err := s.apply.Apply(applyCtx, composeApply.Request{
 		Ref:       batch.ref,
 		Services:  services.names,
 		Labels:    services.labels,
@@ -316,7 +310,7 @@ func (s *Session) recordComposeResults(
 	applied []composeApply.Container,
 	params updateParams.Params,
 	progress *state.Progress,
-	failed map[types.ContainerID]error,
+	failed map[container.ContainerID]error,
 ) {
 	appliedByService := make(map[string][]composeApply.Container, len(applied))
 	for _, item := range applied {
@@ -349,7 +343,7 @@ func (s *Session) recordComposeResults(
 			}
 		}
 
-		matched := make(map[types.ContainerID]struct{}, len(items))
+		matched := make(map[container.ContainerID]struct{}, len(items))
 
 		for _, member := range members {
 			c := member.container
@@ -384,7 +378,7 @@ func (s *Session) recordComposeResults(
 //
 // Returns:
 //   - none.
-func logComposeReplaced(log *zerolog.Logger, c types.Container, item composeApply.Container) {
+func logComposeReplaced(log *zerolog.Logger, c *container.Container, item composeApply.Container) {
 	if log == nil || c == nil || item.ID == "" || item.ID == c.ID() {
 		return
 	}
@@ -407,14 +401,14 @@ func logComposeReplaced(log *zerolog.Logger, c types.Container, item composeAppl
 //   - c: Stale associated container.
 //   - item: Compose instance after apply.
 //   - params: Update parameters.
-//   - result: Monitor result used for stamps.
+//   - result: Monitor result whose commit and tag the report shows.
 //   - progress: Session progress, or nil.
 //   - log: Process logger.
 //
 // Returns:
 //   - none.
 func (s *Session) recordCompose(
-	c types.Container,
+	c *container.Container,
 	item composeApply.Container,
 	params updateParams.Params,
 	result git.CheckResult,
@@ -425,18 +419,12 @@ func (s *Session) recordCompose(
 		return
 	}
 
-	assoc, _ := provenance.ResolveAssociation(c, params.Git)
-	if concrete, ok := c.(*container.Container); ok {
-		provenance.ApplyGitAssociation(concrete, assoc, provenance.PersistWatch(c))
-		provenance.ApplyGitStamp(concrete, result.Commit, result.Tag)
-	}
-
 	s.mu.Lock()
 	if params.NoRestart {
 		if item.ImageID != "" {
 			s.built[c.ID()] = item.ImageID
 		} else {
-			s.built[c.ID()] = types.ImageID("git:" + result.Commit)
+			s.built[c.ID()] = container.ImageID("git:" + result.Commit)
 		}
 	} else {
 		s.applied[c.ID()] = struct{}{}
@@ -454,29 +442,14 @@ func (s *Session) recordCompose(
 		return
 	}
 
-	if item.ImageID != "" {
-		progress.SetLatestImage(log, c.ID(), item.ImageID)
-	}
-
-	// A Git rebuild has no pulled image, so no latest image annotations are
-	// passed and LatestImageVersion stays empty.
-	meta := progress.SetLatestImageMeta(log, c, params, provenance.ChangelogVars{
-		Tag:    result.Tag,
-		Commit: result.Commit,
-	}, oci.Annotations{})
-
+	meta := reportGitImage(log, progress, c, item.ImageID, result, params)
 	provenance.LogChangelog(log, c, params.Policy, meta)
 
 	if item.ID == "" {
 		return
 	}
 
-	status, ok := (*progress)[c.ID()]
-	if !ok || status == nil {
-		return
-	}
-
-	status.SetNewContainerID(item.ID)
+	progress.SetNewContainerID(log, c.ID(), item.ID)
 
 	if !params.NoRestart {
 		progress.MarkForUpdate(log, c.ID())
@@ -496,7 +469,7 @@ func (s *Session) recordCompose(
 func markComposeResultFailures(
 	items []composeApply.Container,
 	progress *state.Progress,
-	failed map[types.ContainerID]error,
+	failed map[container.ContainerID]error,
 	err error,
 ) {
 	if progress == nil {
@@ -544,14 +517,14 @@ func (s *Session) recordComposeReplicas(
 	params updateParams.Params,
 	progress *state.Progress,
 	log *zerolog.Logger,
-	matched map[types.ContainerID]struct{},
+	matched map[container.ContainerID]struct{},
 ) {
 	if len(members) == 0 {
 		return
 	}
 
 	if matched == nil {
-		matched = make(map[types.ContainerID]struct{}, len(items))
+		matched = make(map[container.ContainerID]struct{}, len(items))
 	}
 
 	statuses := make(map[string]*state.ContainerStatus)
@@ -564,7 +537,13 @@ func (s *Session) recordComposeReplicas(
 		}
 	}
 
+	// Every replica shares the representative's Git rebuild, which has no
+	// pulled image annotations.
 	representative := members[0]
+	meta := provenance.ResolveReportMeta(representative.container, params.Git, provenance.ChangelogVars{
+		Tag:    representative.result.Tag,
+		Commit: representative.result.Commit,
+	}, oci.Annotations{})
 
 	for _, item := range items {
 		if item.Name == "" || item.ID == "" {
@@ -590,7 +569,7 @@ func (s *Session) recordComposeReplicas(
 			if item.ImageID != "" {
 				s.built[status.ID()] = item.ImageID
 			} else {
-				s.built[status.ID()] = types.ImageID("git:" + representative.result.Commit)
+				s.built[status.ID()] = container.ImageID("git:" + representative.result.Commit)
 			}
 		} else {
 			s.applied[status.ID()] = struct{}{}
@@ -604,14 +583,10 @@ func (s *Session) recordComposeReplicas(
 			progress.SetLatestImage(log, status.ID(), item.ImageID)
 		}
 
-		meta := provenance.ResolveReportMeta(representative.container, params.Git, provenance.ChangelogVars{
-			Tag:    representative.result.Tag,
-			Commit: representative.result.Commit,
-		}, oci.Annotations{})
-		status.SetGitMetadata(meta)
+		progress.SetReportMeta(log, status.ID(), meta)
 
 		if !params.NoRestart {
-			status.SetNewContainerID(item.ID)
+			progress.SetNewContainerID(log, status.ID(), item.ID)
 			progress.MarkForUpdate(log, status.ID())
 		}
 
@@ -630,7 +605,7 @@ func (s *Session) recordComposeReplicas(
 //
 // Returns:
 //   - none.
-func (s *Session) acceptComposeApply(batch *composeBatch, failed map[types.ContainerID]error) {
+func (s *Session) acceptComposeApply(batch *composeBatch, failed map[container.ContainerID]error) {
 	if s == nil || s.client == nil || batch == nil {
 		return
 	}
@@ -706,7 +681,7 @@ func failComposeBatch(
 	log *zerolog.Logger,
 	batch *composeBatch,
 	params updateParams.Params,
-	failed map[types.ContainerID]error,
+	failed map[container.ContainerID]error,
 	err error,
 ) {
 	failComposeBatchWithRuntime(log, batch, params, failed, err, false)
@@ -728,7 +703,7 @@ func failComposeBatchWithRuntime(
 	log *zerolog.Logger,
 	batch *composeBatch,
 	params updateParams.Params,
-	failed map[types.ContainerID]error,
+	failed map[container.ContainerID]error,
 	err error,
 	runtimeMayHaveChanged bool,
 ) {
@@ -772,7 +747,7 @@ func failComposeBatchWithRuntime(
 //   - composeApply.Container: Matched instance.
 //   - bool: False when the replica cannot be identified.
 func matchedComposeInstance(
-	c types.Container,
+	c *container.Container,
 	members []composeMember,
 	items []composeApply.Container,
 	byName map[string]composeApply.Container,
@@ -832,7 +807,7 @@ func sharedComposeCommit(members []composeMember) (string, error) {
 //
 // Returns:
 //   - map[string]string: Label map.
-func containerLabels(c types.Container) map[string]string {
+func containerLabels(c *container.Container) map[string]string {
 	if c == nil {
 		return nil
 	}
@@ -845,42 +820,6 @@ func containerLabels(c types.Container) map[string]string {
 	return info.Config.Labels
 }
 
-// safeComposeAPIOrigin returns a credential-free API origin or an empty string for invalid input.
-//
-// Parameters:
-//   - raw: API origin to normalize and redact.
-//
-// Returns:
-//   - string: Normalized origin without credentials, query parameters, or a fragment.
-func safeComposeAPIOrigin(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return ""
-	}
-
-	parseRaw := raw
-	if !strings.Contains(parseRaw, "://") {
-		parseRaw = "https://" + parseRaw
-	}
-
-	parsed, err := url.Parse(parseRaw)
-	if err != nil || parsed.Hostname() == "" {
-		return ""
-	}
-
-	parsed.User = nil
-	parsed.RawQuery = ""
-	parsed.ForceQuery = false
-	parsed.Fragment = ""
-
-	origin, err := provenance.ParseAPIOrigin(parsed.String())
-	if err != nil {
-		return ""
-	}
-
-	return strings.TrimRight(origin.String(), "/")
-}
-
 // composeServiceLabels is the stamp and association labels written onto new Compose containers.
 //
 // Parameters:
@@ -890,7 +829,7 @@ func safeComposeAPIOrigin(raw string) string {
 //
 // Returns:
 //   - map[string]string: Labels merged into the compose service.
-func composeServiceLabels(c types.Container, params updateParams.Params, result git.CheckResult) map[string]string {
+func composeServiceLabels(c *container.Container, params updateParams.Params, result git.CheckResult) map[string]string {
 	// The commit is written at create time because container labels cannot be
 	// changed afterward. A failed apply rejects this stamp so the next check
 	// retries from the previous baseline.
@@ -902,41 +841,8 @@ func composeServiceLabels(c types.Container, params updateParams.Params, result 
 		out[labels.GitLastTag] = result.Tag
 	}
 
-	assoc, ok := provenance.ResolveAssociation(c, params.Git)
-	if ok && assoc.Repo != "" {
-		meta := provenance.ResolveReportMeta(c, params.Git, provenance.ChangelogVars{
-			Tag:    result.Tag,
-			Commit: result.Commit,
-		}, oci.Annotations{})
-		if meta.GitRepo != "" {
-			out[labels.GitRepo] = meta.GitRepo
-		}
-
-		if assoc.Ref != "" {
-			out[labels.GitRef] = assoc.Ref
-		}
-
-		if assoc.Policy != "" {
-			out[labels.GitSemverPolicy] = assoc.Policy
-		}
-
-		if assoc.Host != "" {
-			if origin := safeComposeAPIOrigin(assoc.Host); origin != "" {
-				out[labels.GitHost] = origin
-			}
-		}
-
-		if assoc.Dockerfile != "" {
-			out[labels.GitDockerfile] = assoc.Dockerfile
-		}
-
-		if assoc.Context != "" {
-			out[labels.GitContext] = assoc.Context
-		}
-
-		if provenance.PersistWatch(c) {
-			out[labels.GitWatch] = "true"
-		}
+	if assoc, ok := provenance.ResolveAssociation(c, params.Git); ok {
+		maps.Copy(out, assoc.Labels())
 	}
 
 	if dir, present := c.GetLabel(labels.ComposeDir); present && dir != "" {

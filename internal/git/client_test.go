@@ -16,21 +16,18 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
-	dockerspec "github.com/moby/docker-image-spec/specs-go/v1"
-	dockerImage "github.com/moby/moby/api/types/image"
-
 	composeLabels "github.com/nicholas-fedor/watchtower/internal/compose/labels"
+	"github.com/nicholas-fedor/watchtower/internal/container"
 	"github.com/nicholas-fedor/watchtower/internal/container/labels"
 	"github.com/nicholas-fedor/watchtower/internal/container/oci"
 	"github.com/nicholas-fedor/watchtower/internal/container/provenance"
 	"github.com/nicholas-fedor/watchtower/internal/git/provider"
 	"github.com/nicholas-fedor/watchtower/internal/git/semver"
 	gitConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/git"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
-	mockTypes "github.com/nicholas-fedor/watchtower/pkg/types/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/testutil/containerfixture"
+	"github.com/nicholas-fedor/watchtower/internal/testutil/modelfixture"
 )
 
 type stubLister struct {
@@ -93,10 +90,10 @@ func TestCheckContainer_RejectedComposeStampRetries(t *testing.T) {
 	assert.True(t, got.Stale)
 }
 
-func labeledComposeMember(t *testing.T, project, service, number, dir, files, commit string) types.Container {
+func labeledComposeMember(t *testing.T, project, service, number, dir, files, commit string) *container.Container {
 	t.Helper()
 
-	return labeledContainer(t, map[string]string{
+	return labeledContainer(map[string]string{
 		labels.GitRepo:                        "https://example.com/org/app.git",
 		labels.GitRef:                         "main",
 		labels.GitLastCommit:                  commit,
@@ -106,6 +103,39 @@ func labeledComposeMember(t *testing.T, project, service, number, dir, files, co
 		composeLabels.ComposeContainerNumber:  number,
 		composeLabels.ComposeConfigFilesLabel: files,
 	})
+}
+
+// TestClient_UnrestartedBuild checks that a recorded no-restart build is found
+// only for the same container and commit.
+func TestClient_UnrestartedBuild(t *testing.T) {
+	t.Parallel()
+
+	const (
+		commit = "0123456789abcdef0123456789abcdef01234567"
+		image  = container.ImageID("sha256:built")
+	)
+
+	client := testClient(t, nil)
+	assert.Empty(t, client.UnrestartedBuild("app", commit), "nothing recorded yet")
+
+	client.RecordUnrestartedBuild("app", commit, image)
+
+	assert.Equal(t, image, client.UnrestartedBuild("app", commit))
+	assert.Equal(t, image, client.UnrestartedBuild("app", "0123456789AB"), "a short or uppercase SHA names the same commit")
+	assert.Empty(t, client.UnrestartedBuild("app", "fedcba9876543210fedcba9876543210fedcba98"), "the remote advanced")
+	assert.Empty(t, client.UnrestartedBuild("other", commit), "another container")
+	assert.Empty(t, client.UnrestartedBuild("app", ""))
+
+	client.RecordUnrestartedBuild("app", "fedcba9876543210fedcba9876543210fedcba98", "sha256:newer")
+	assert.Empty(t, client.UnrestartedBuild("app", commit), "a newer build replaces the record")
+
+	client.RecordUnrestartedBuild("skipped", commit, "")
+	assert.Empty(t, client.UnrestartedBuild("skipped", commit), "an empty image is not recorded")
+
+	var nilClient *Client
+
+	nilClient.RecordUnrestartedBuild("app", commit, image)
+	assert.Empty(t, nilClient.UnrestartedBuild("app", commit))
 }
 
 func TestCheck_NoStampIsNotStale(t *testing.T) {
@@ -798,9 +828,7 @@ func TestCheckContainer(t *testing.T) {
 	t.Run("not associated", func(t *testing.T) {
 		t.Parallel()
 
-		c := mockTypes.NewMockContainer(t)
-		c.EXPECT().GetLabel(mock.Anything).Return("", false)
-		c.EXPECT().ImageName().Return("nginx:latest")
+		c := modelfixture.ContainerWithoutImageInfo(containerfixture.WithImageName("nginx:latest"))
 
 		got, err := CheckContainer(t.Context(), testClient(t, nil), c, gitConfig.Defaults{})
 		require.NoError(t, err)
@@ -810,7 +838,7 @@ func TestCheckContainer(t *testing.T) {
 	t.Run("uses repo label and stamp", func(t *testing.T) {
 		t.Parallel()
 
-		c := labeledContainer(t, map[string]string{
+		c := labeledContainer(map[string]string{
 			labels.GitRepo:       "https://example.com/org/app.git",
 			labels.GitRef:        "main",
 			labels.GitLastCommit: "old",
@@ -826,7 +854,7 @@ func TestCheckContainer(t *testing.T) {
 	t.Run("invalid policy is fail-closed", func(t *testing.T) {
 		t.Parallel()
 
-		c := labeledContainer(t, map[string]string{
+		c := labeledContainer(map[string]string{
 			labels.GitRepo:         "https://example.com/org/app.git",
 			labels.GitSemverPolicy: "nightly",
 		})
@@ -840,7 +868,7 @@ func TestCheckContainer(t *testing.T) {
 	t.Run("invalid policy label on a mapped image is fail-closed", func(t *testing.T) {
 		t.Parallel()
 
-		c := labeledContainer(t, map[string]string{labels.GitSemverPolicy: "nightly"})
+		c := labeledContainer(map[string]string{labels.GitSemverPolicy: "nightly"})
 		defaults := gitConfig.Defaults{
 			Images: map[string]gitConfig.Image{
 				"app:latest": {Repo: "https://example.com/org/app.git", Policy: semver.PolicyPatch},
@@ -856,7 +884,7 @@ func TestCheckContainer(t *testing.T) {
 		t.Parallel()
 
 		rawHost := "https://user:secret@git.example.com?token=secret=bad"
-		c := labeledContainer(t, map[string]string{
+		c := labeledContainer(map[string]string{
 			labels.GitRepo: "https://example.com/org/app.git",
 			labels.GitHost: rawHost,
 		})
@@ -872,7 +900,7 @@ func TestCheckContainer(t *testing.T) {
 	t.Run("no stamp is not stale and is remembered", func(t *testing.T) {
 		t.Parallel()
 
-		c := labeledContainer(t, map[string]string{
+		c := labeledContainer(map[string]string{
 			labels.GitRepo: "https://example.com/org/app.git",
 			labels.GitRef:  "main",
 		})
@@ -900,10 +928,10 @@ func TestCheckContainer(t *testing.T) {
 	t.Run("oci revision is a baseline", func(t *testing.T) {
 		t.Parallel()
 
-		c := labeledImageContainer(t, map[string]string{
+		c := labeledImageContainer(map[string]string{
 			labels.GitRepo: "https://example.com/org/app.git",
 			labels.GitRef:  "main",
-		}, "app:latest", ociImage("aaa111", ""))
+		}, "app:latest", ociImageLabels("aaa111", ""))
 
 		client := testClient(t, []RemoteRef{{Name: "refs/heads/main", Hash: "aaa111"}})
 		got, err := CheckContainer(t.Context(), client, c, gitConfig.Defaults{})
@@ -920,7 +948,7 @@ func TestCheckContainer(t *testing.T) {
 	t.Run("git shortsha image tag is a baseline", func(t *testing.T) {
 		t.Parallel()
 
-		c := labeledImageContainer(t, map[string]string{
+		c := labeledImageContainer(map[string]string{
 			labels.GitRepo: "https://example.com/org/app.git",
 			labels.GitRef:  "main",
 		}, "app:git-aaa111bbbbcc", nil)
@@ -929,6 +957,12 @@ func TestCheckContainer(t *testing.T) {
 		got, err := CheckContainer(t.Context(), client, c, gitConfig.Defaults{})
 		require.NoError(t, err)
 		assert.False(t, got.Stale)
+
+		staleClient := testClient(t, []RemoteRef{{Name: "refs/heads/main", Hash: "bbb222cccc"}})
+		stale, err := CheckContainer(t.Context(), staleClient, c, gitConfig.Defaults{})
+		require.NoError(t, err)
+		assert.True(t, stale.Stale)
+		assert.Equal(t, "bbb222cccc", stale.Commit)
 	})
 }
 
@@ -940,75 +974,67 @@ func (m *mutableLister) List(context.Context, string) ([]RemoteRef, error) {
 	return m.refs, nil
 }
 
-// labeledContainer returns a container whose GetLabel values come from labels.
+// labeledContainer returns a container with the given labels that runs
+// app:latest. Its image info is missing, so no OCI annotations apply.
 //
 // Parameters:
-//   - t: Test handle.
-//   - labels: Label key to value map.
+//   - containerLabels: Label key to value map.
 //
 // Returns:
-//   - types.Container: Mock container.
-func labeledContainer(t *testing.T, labels map[string]string) types.Container {
-	t.Helper()
-
-	return labeledImageContainer(t, labels, "app:latest", nil)
+//   - *container.Container: Container built from inspect data.
+func labeledContainer(containerLabels map[string]string) *container.Container {
+	return labeledImageContainer(containerLabels, "app:latest", nil)
 }
 
-// labeledImageContainer returns a container with labels, image name, and optional inspect data.
+// labeledImageContainer returns a container with labels and an image name.
 //
 // Parameters:
-//   - t: Test handle.
-//   - labels: Label key to value map.
-//   - imageName: ImageName() result.
-//   - info: Image inspect response, or nil when image metadata is absent.
+//   - containerLabels: Label key to value map.
+//   - imageName: Image reference the container runs.
+//   - imageLabels: The image's config labels, or nil when its image info is
+//     missing.
 //
 // Returns:
-//   - types.Container: Mock container.
+//   - *container.Container: Container built from inspect data.
 func labeledImageContainer(
-	t *testing.T,
-	labels map[string]string,
+	containerLabels map[string]string,
 	imageName string,
-	info *dockerImage.InspectResponse,
-) types.Container {
-	t.Helper()
-
-	c := mockTypes.NewMockContainer(t)
-	c.EXPECT().GetLabel(mock.Anything).RunAndReturn(func(key string) (string, bool) {
-		value, ok := labels[key]
-
-		return value, ok
-	}).Maybe()
-	c.EXPECT().ImageName().Return(imageName).Maybe()
-	c.EXPECT().HasImageInfo().Return(info != nil).Maybe()
-
-	if info != nil {
-		c.EXPECT().ImageInfo().Return(info).Maybe()
+	imageLabels map[string]string,
+) *container.Container {
+	if imageLabels == nil {
+		return modelfixture.ContainerWithoutImageInfo(
+			containerfixture.WithLabels(containerLabels),
+			containerfixture.WithImageName(imageName),
+		)
 	}
 
-	return c
+	return modelfixture.Container(
+		containerfixture.WithLabels(containerLabels),
+		containerfixture.WithImageName(imageName),
+		containerfixture.WithImageLabels(imageLabels),
+	)
 }
 
-// ociImage returns image inspect data with optional OCI revision and version labels.
+// ociImageLabels returns image labels with optional OCI revision and version
+// annotations.
 //
 // Parameters:
 //   - revision: org.opencontainers.image.revision value, or empty.
 //   - version: org.opencontainers.image.version value, or empty.
 //
 // Returns:
-//   - *dockerImage.InspectResponse: Inspect payload with those labels.
-func ociImage(revision, version string) *dockerImage.InspectResponse {
-	cfg := &dockerspec.DockerOCIImageConfig{}
-
-	cfg.Labels = map[string]string{}
+//   - map[string]string: Image config labels with those annotations.
+func ociImageLabels(revision, version string) map[string]string {
+	imageLabels := map[string]string{}
 	if revision != "" {
-		cfg.Labels[oci.RevisionLabel] = revision
+		imageLabels[oci.RevisionLabel] = revision
 	}
 
 	if version != "" {
-		cfg.Labels[oci.VersionLabel] = version
+		imageLabels[oci.VersionLabel] = version
 	}
 
-	return &dockerImage.InspectResponse{Config: cfg}
+	return imageLabels
 }
 
 func TestGitHubAPIWithRewrittenClient(t *testing.T) {

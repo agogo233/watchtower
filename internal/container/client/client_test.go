@@ -2,16 +2,9 @@ package client
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
-	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -41,12 +34,14 @@ import (
 	containerImage "github.com/nicholas-fedor/watchtower/internal/container/image"
 	mockContainer "github.com/nicholas-fedor/watchtower/internal/container/mocks"
 	"github.com/nicholas-fedor/watchtower/internal/container/oci"
+	"github.com/nicholas-fedor/watchtower/internal/registry/ratelimit"
+	dockerConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/docker"
+	registryConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/registry"
 	updateConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/update"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/containerfixture"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/httpstub"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/logcapture"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/modelfixture"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // mockContainerID is the ID of a container built by modelfixture.Container.
@@ -251,51 +246,6 @@ func newTLSStubClient(t *testing.T) (*httpstub.Server, *dockerClient.Client) {
 	return server, api
 }
 
-// writeDockerCerts writes the ca.pem, cert.pem, and key.pem files the Docker
-// SDK reads from DOCKER_CERT_PATH. The CA is the stub server's certificate, so
-// the client trusts the server, and the client certificate is self-signed.
-//
-// Parameters:
-//   - t: Test the files belong to.
-//   - server: TLS stub server the client connects to.
-//
-// Returns:
-//   - string: Directory to set DOCKER_CERT_PATH to.
-func writeDockerCerts(t *testing.T, server *httpstub.Server) string {
-	t.Helper()
-
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-
-	template := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "watchtower-test-client"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
-	}
-
-	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
-	require.NoError(t, err)
-
-	keyDER, err := x509.MarshalECPrivateKey(key)
-	require.NoError(t, err)
-
-	dir := t.TempDir()
-	files := map[string]*pem.Block{
-		"ca.pem":   {Type: "CERTIFICATE", Bytes: server.TestServer().Certificate().Raw},
-		"cert.pem": {Type: "CERTIFICATE", Bytes: certDER},
-		"key.pem":  {Type: "EC PRIVATE KEY", Bytes: keyDER},
-	}
-
-	for name, block := range files {
-		require.NoError(t, os.WriteFile(filepath.Join(dir, name), pem.EncodeToMemory(block), 0o600))
-	}
-
-	return dir
-}
-
 // respondToPing answers a ping with status, reporting apiVersion as the
 // daemon's API version.
 //
@@ -321,20 +271,24 @@ func respondToPing(t *testing.T, method string, status int, apiVersion string) h
 	)
 }
 
-// useDockerTLS points the Docker environment variables at a TLS connection to
-// server, with certificates the client trusts.
+// dockerTLS returns Docker settings for a TLS connection to server, with
+// certificates the client trusts.
 //
 // Parameters:
-//   - t: Test whose environment is changed.
+//   - t: Test the certificate files belong to.
 //   - server: Server the client connects to.
 //   - certServer: TLS server whose certificate the client trusts.
-func useDockerTLS(t *testing.T, server, certServer *httpstub.Server) {
+//
+// Returns:
+//   - dockerConfig.Docker: Settings with TLS verification on.
+func dockerTLS(t *testing.T, server, certServer *httpstub.Server) dockerConfig.Docker {
 	t.Helper()
 
-	t.Setenv("DOCKER_HOST", "tcp://"+server.Addr())
-	t.Setenv("DOCKER_TLS_VERIFY", "1")
-	t.Setenv("DOCKER_CERT_PATH", writeDockerCerts(t, certServer))
-	t.Setenv("DOCKER_API_VERSION", "")
+	return dockerConfig.Docker{
+		Host:      "tcp://" + server.Addr(),
+		TLSVerify: true,
+		CertPath:  certServer.WriteDockerCerts(t),
+	}
 }
 
 // TestClient verifies the Docker client's container lifecycle, listing,
@@ -363,7 +317,7 @@ func TestClient(t *testing.T) {
 				api.EXPECT().ContainerRemove(mock.Anything, mockContainerID, dockerClient.ContainerRemoveOptions{Force: true}).
 					Return(dockerClient.ContainerRemoveResult{}, nil).Once()
 
-				err := (&client{log: log, api: api}).StopAndRemoveContainer(t.Context(), running(), time.Second)
+				err := (&Client{log: log, api: api}).StopAndRemoveContainer(t.Context(), running(), time.Second)
 				require.NoError(t, err)
 				assert.Contains(t, logOutput.String(), "Container removed successfully")
 			})
@@ -380,7 +334,7 @@ func TestClient(t *testing.T) {
 				api.EXPECT().ContainerRemove(mock.Anything, mockContainerID, dockerClient.ContainerRemoveOptions{Force: true}).
 					Return(dockerClient.ContainerRemoveResult{}, notFoundError("No such container: "+mockContainerID)).Once()
 
-				err := (&client{log: newTestLogger(t), api: api}).StopAndRemoveContainer(t.Context(), running(), time.Second)
+				err := (&Client{log: newTestLogger(t), api: api}).StopAndRemoveContainer(t.Context(), running(), time.Second)
 				require.NoError(t, err)
 			})
 		})
@@ -394,7 +348,7 @@ func TestClient(t *testing.T) {
 				api := newDockerAPI(t)
 				expectStop(api, mockContainerID, 1, daemonError("server error"))
 
-				err := (&client{log: newTestLogger(t), api: api}).StopContainer(t.Context(), running(), time.Second)
+				err := (&Client{log: newTestLogger(t), api: api}).StopContainer(t.Context(), running(), time.Second)
 				require.ErrorContains(t, err, "failed to stop container: Error response from daemon: server error")
 			})
 		})
@@ -408,7 +362,7 @@ func TestClient(t *testing.T) {
 				api := newDockerAPI(t)
 				expectStop(api, mockContainerID, 1, daemonError("stop error"))
 
-				err := (&client{log: newTestLogger(t), api: api}).StopAndRemoveContainer(t.Context(), running(), time.Second)
+				err := (&Client{log: newTestLogger(t), api: api}).StopAndRemoveContainer(t.Context(), running(), time.Second)
 				require.ErrorContains(t, err, "failed to stop container: Error response from daemon: stop error")
 			})
 		})
@@ -424,7 +378,7 @@ func TestClient(t *testing.T) {
 				api.EXPECT().ContainerRemove(mock.Anything, mockContainerID, dockerClient.ContainerRemoveOptions{Force: true}).
 					Return(dockerClient.ContainerRemoveResult{}, daemonError("server error")).Once()
 
-				err := (&client{log: newTestLogger(t), api: api}).StopAndRemoveContainer(t.Context(), running(), time.Second)
+				err := (&Client{log: newTestLogger(t), api: api}).StopAndRemoveContainer(t.Context(), running(), time.Second)
 				require.ErrorContains(t, err, "failed to remove container: Error response from daemon: server error")
 			})
 		})
@@ -441,7 +395,7 @@ func TestClient(t *testing.T) {
 
 				stopped := modelfixture.Container(containerfixture.WithContainerState(dockerContainer.State{Running: false}))
 
-				err := (&client{log: newTestLogger(t), api: api}).StopAndRemoveContainer(t.Context(), stopped, time.Second)
+				err := (&Client{log: newTestLogger(t), api: api}).StopAndRemoveContainer(t.Context(), stopped, time.Second)
 				require.NoError(t, err)
 			})
 		})
@@ -462,7 +416,7 @@ func TestClient(t *testing.T) {
 					containerfixture.WithAutoRemove(true),
 				)
 
-				err := (&client{log: newTestLogger(t), api: api}).StopAndRemoveContainer(t.Context(), source, time.Second)
+				err := (&Client{log: newTestLogger(t), api: api}).StopAndRemoveContainer(t.Context(), source, time.Second)
 				require.NoError(t, err)
 			})
 
@@ -479,7 +433,7 @@ func TestClient(t *testing.T) {
 					containerfixture.WithAutoRemove(true),
 				)
 
-				err := (&client{log: newTestLogger(t), api: api}).StopAndRemoveContainer(t.Context(), source, time.Second)
+				err := (&Client{log: newTestLogger(t), api: api}).StopAndRemoveContainer(t.Context(), source, time.Second)
 				require.NoError(t, err)
 			})
 		})
@@ -499,7 +453,7 @@ func TestClient(t *testing.T) {
 
 				source := modelfixture.Container(containerfixture.WithContainerState(dockerContainer.State{Running: true}))
 
-				err := (&client{log: newTestLogger(t), api: api}).StopContainer(t.Context(), source, time.Second)
+				err := (&Client{log: newTestLogger(t), api: api}).StopContainer(t.Context(), source, time.Second)
 				require.NoError(t, err)
 			})
 		})
@@ -514,7 +468,7 @@ func TestClient(t *testing.T) {
 				api := mockContainer.NewMockAPIClient(t)
 				source := modelfixture.Container(containerfixture.WithContainerState(dockerContainer.State{Running: false}))
 
-				err := (&client{log: newTestLogger(t), api: api}).StopContainer(t.Context(), source, time.Second)
+				err := (&Client{log: newTestLogger(t), api: api}).StopContainer(t.Context(), source, time.Second)
 				require.NoError(t, err)
 			})
 		})
@@ -533,7 +487,7 @@ func TestClient(t *testing.T) {
 				api.EXPECT().ContainerRemove(mock.Anything, mockContainerID, dockerClient.ContainerRemoveOptions{Force: true}).
 					Return(dockerClient.ContainerRemoveResult{}, nil).Once()
 
-				err := (&client{log: newTestLogger(t), api: api}).RemoveContainer(t.Context(), modelfixture.Container())
+				err := (&Client{log: newTestLogger(t), api: api}).RemoveContainer(t.Context(), modelfixture.Container())
 				require.NoError(t, err)
 			})
 		})
@@ -548,7 +502,7 @@ func TestClient(t *testing.T) {
 				api.EXPECT().ContainerRemove(mock.Anything, mockContainerID, dockerClient.ContainerRemoveOptions{Force: true}).
 					Return(dockerClient.ContainerRemoveResult{}, notFoundError("No such container: "+mockContainerID)).Once()
 
-				err := (&client{log: newTestLogger(t), api: api}).RemoveContainer(t.Context(), modelfixture.Container())
+				err := (&Client{log: newTestLogger(t), api: api}).RemoveContainer(t.Context(), modelfixture.Container())
 				require.NoError(t, err)
 			})
 		})
@@ -563,7 +517,7 @@ func TestClient(t *testing.T) {
 				api.EXPECT().ContainerRemove(mock.Anything, mockContainerID, dockerClient.ContainerRemoveOptions{Force: true}).
 					Return(dockerClient.ContainerRemoveResult{}, daemonError("server error")).Once()
 
-				err := (&client{log: newTestLogger(t), api: api}).RemoveContainer(t.Context(), modelfixture.Container())
+				err := (&Client{log: newTestLogger(t), api: api}).RemoveContainer(t.Context(), modelfixture.Container())
 				require.ErrorContains(t, err, "failed to remove container")
 			})
 		})
@@ -590,7 +544,7 @@ func TestClient(t *testing.T) {
 			t.Run("should return all available containers", func(t *testing.T) {
 				t.Parallel()
 
-				c := &client{log: newTestLogger(t), api: newRunningAPI(t)}
+				c := &Client{log: newTestLogger(t), api: newRunningAPI(t)}
 
 				containers, err := c.ListContainers(t.Context(), filters.NoFilter)
 				require.NoError(t, err)
@@ -604,7 +558,7 @@ func TestClient(t *testing.T) {
 			t.Run("should return an empty array", func(t *testing.T) {
 				t.Parallel()
 
-				c := &client{log: newTestLogger(t), api: newRunningAPI(t)}
+				c := &Client{log: newTestLogger(t), api: newRunningAPI(t)}
 				filter := filters.FilterByNames(newTestLogger(t), []string{"lollercoaster"}, filters.NoFilter)
 
 				containers, err := c.ListContainers(t.Context(), filter)
@@ -619,7 +573,7 @@ func TestClient(t *testing.T) {
 			t.Run("should return only the watchtower container", func(t *testing.T) {
 				t.Parallel()
 
-				c := &client{log: newTestLogger(t), api: newRunningAPI(t)}
+				c := &Client{log: newTestLogger(t), api: newRunningAPI(t)}
 
 				containers, err := c.ListContainers(t.Context(), filters.WatchtowerContainersFilter)
 				require.NoError(t, err)
@@ -638,12 +592,12 @@ func TestClient(t *testing.T) {
 				expectContainerList(t, api, "running", "exited", "created")
 				expectContainerFixtures(t, api, fixtureStopped, fixtureWatchtower, fixtureRunning)
 
-				c := &client{log: newTestLogger(t), api: api, IncludeStopped: true}
+				c := &Client{log: newTestLogger(t), api: api, IncludeStopped: true}
 
 				containers, err := c.ListContainers(t.Context(), filters.NoFilter)
 				require.NoError(t, err)
-				assert.True(t, slices.ContainsFunc(containers, func(container types.Container) bool {
-					return !container.ContainerInfo().State.Running
+				assert.True(t, slices.ContainsFunc(containers, func(c *container.Container) bool {
+					return !c.ContainerInfo().State.Running
 				}), "a stopped container is listed")
 			})
 		})
@@ -661,7 +615,7 @@ func TestClient(t *testing.T) {
 				// A Docker marker resolves the runtime without an API call.
 				fsys := fstest.MapFS{".dockerenv": {}}
 
-				c := &client{
+				c := &Client{
 					log:               newTestLogger(t),
 					api:               api,
 					IncludeRestarting: true, Fs: fsys,
@@ -669,8 +623,8 @@ func TestClient(t *testing.T) {
 
 				containers, err := c.ListContainers(t.Context(), filters.NoFilter)
 				require.NoError(t, err)
-				assert.True(t, slices.ContainsFunc(containers, func(container types.Container) bool {
-					return container.ContainerInfo().State.Restarting
+				assert.True(t, slices.ContainsFunc(containers, func(c *container.Container) bool {
+					return c.ContainerInfo().State.Restarting
 				}), "a restarting container is listed")
 			})
 		})
@@ -681,12 +635,12 @@ func TestClient(t *testing.T) {
 			t.Run("should not return restarting containers", func(t *testing.T) {
 				t.Parallel()
 
-				c := &client{log: newTestLogger(t), api: newRunningAPI(t)}
+				c := &Client{log: newTestLogger(t), api: newRunningAPI(t)}
 
 				containers, err := c.ListContainers(t.Context(), filters.NoFilter)
 				require.NoError(t, err)
-				assert.False(t, slices.ContainsFunc(containers, func(container types.Container) bool {
-					return container.ContainerInfo().State.Restarting
+				assert.False(t, slices.ContainsFunc(containers, func(c *container.Container) bool {
+					return c.ContainerInfo().State.Restarting
 				}), "no restarting container is listed")
 			})
 		})
@@ -697,7 +651,7 @@ func TestClient(t *testing.T) {
 			t.Run("should combine filters with logical AND", func(t *testing.T) {
 				t.Parallel()
 
-				c := &client{log: newTestLogger(t), api: newRunningAPI(t)}
+				c := &Client{log: newTestLogger(t), api: newRunningAPI(t)}
 				nameFilter := filters.FilterByNames(newTestLogger(t), []string{"portainer"}, filters.NoFilter)
 
 				containers, err := c.ListContainers(t.Context(), nameFilter, filters.NoFilter)
@@ -709,7 +663,7 @@ func TestClient(t *testing.T) {
 			t.Run("should return empty when filters are mutually exclusive", func(t *testing.T) {
 				t.Parallel()
 
-				c := &client{log: newTestLogger(t), api: newRunningAPI(t)}
+				c := &Client{log: newTestLogger(t), api: newRunningAPI(t)}
 				portainerFilter := filters.FilterByNames(newTestLogger(t), []string{"portainer"}, filters.NoFilter)
 				watchtowerFilter := filters.FilterByNames(newTestLogger(t), []string{"watchtower-running"}, filters.NoFilter)
 
@@ -732,11 +686,11 @@ func TestClient(t *testing.T) {
 				expectMissingImage(api, testContainerID)
 
 				log, logOutput := logcapture.New(zerolog.WarnLevel)
-				c := &client{log: log, api: api}
+				c := &Client{log: log, api: api}
 
-				container, err := c.GetContainer(t.Context(), types.ContainerID(testContainerID))
+				got, err := c.GetContainer(t.Context(), container.ContainerID(testContainerID))
 				require.NoError(t, err)
-				assert.False(t, container.HasImageInfo())
+				assert.False(t, got.HasImageInfo())
 
 				logged := logOutput.String()
 				assert.Contains(t, logged, "Failed to retrieve image info")
@@ -757,10 +711,10 @@ func TestClient(t *testing.T) {
 					api := newDockerAPI(t)
 					expectContainerFixtures(t, api, fixtureNetConsumer)
 
-					container, err := (&client{log: newTestLogger(t), api: api}).GetContainer(t.Context(), fixtureNetConsumer.id)
+					c, err := (&Client{log: newTestLogger(t), api: api}).GetContainer(t.Context(), fixtureNetConsumer.id)
 					require.NoError(t, err)
 
-					networkMode := container.ContainerInfo().HostConfig.NetworkMode
+					networkMode := c.ContainerInfo().HostConfig.NetworkMode
 					assert.Equal(t, fixtureNetSupplierContainerName, networkMode.ConnectedContainer())
 				})
 			})
@@ -774,11 +728,11 @@ func TestClient(t *testing.T) {
 					api := newDockerAPI(t)
 					expectContainerFixtures(t, api, fixtureNetConsumerMissingSupplier)
 
-					container, err := (&client{log: newTestLogger(t), api: api}).
+					c, err := (&Client{log: newTestLogger(t), api: api}).
 						GetContainer(t.Context(), fixtureNetConsumerMissingSupplier.id)
 					require.NoError(t, err)
 
-					networkMode := container.ContainerInfo().HostConfig.NetworkMode
+					networkMode := c.ContainerInfo().HostConfig.NetworkMode
 					assert.Equal(t, fixtureNetSupplierNotFoundID, networkMode.ConnectedContainer())
 				})
 			})
@@ -798,7 +752,7 @@ func TestClient(t *testing.T) {
 					api := newDockerAPI(t)
 					expectHealth(api, "")
 
-					err := (&client{log: newTestLogger(t), api: api}).
+					err := (&Client{log: newTestLogger(t), api: api}).
 						WaitForContainerHealthy(t.Context(), mockContainerID, 5*time.Second)
 					require.NoError(t, err)
 				})
@@ -828,7 +782,7 @@ func TestClient(t *testing.T) {
 						api := newDockerAPI(t)
 						expectHealthcheck(api, tt.health, disabled)
 
-						err := (&client{log: newTestLogger(t), api: api}).
+						err := (&Client{log: newTestLogger(t), api: api}).
 							WaitForContainerHealthy(t.Context(), mockContainerID, 5*time.Second)
 						require.NoError(t, err)
 					})
@@ -849,7 +803,7 @@ func TestClient(t *testing.T) {
 					expectHealthcheck(api, &dockerContainer.Health{}, configured)
 					expectHealthcheck(api, &dockerContainer.Health{Status: dockerContainer.Healthy}, configured)
 
-					err := (&client{log: newTestLogger(t), api: api}).
+					err := (&Client{log: newTestLogger(t), api: api}).
 						WaitForContainerHealthy(t.Context(), mockContainerID, 5*time.Second)
 					require.NoError(t, err)
 				})
@@ -868,7 +822,7 @@ func TestClient(t *testing.T) {
 					expectHealth(api, dockerContainer.Starting)
 					expectHealth(api, dockerContainer.Healthy)
 
-					err := (&client{log: newTestLogger(t), api: api}).
+					err := (&Client{log: newTestLogger(t), api: api}).
 						WaitForContainerHealthy(t.Context(), mockContainerID, 5*time.Second)
 					require.NoError(t, err)
 				})
@@ -885,7 +839,7 @@ func TestClient(t *testing.T) {
 					api := newDockerAPI(t)
 					expectHealth(api, dockerContainer.Unhealthy)
 
-					err := (&client{log: newTestLogger(t), api: api}).
+					err := (&Client{log: newTestLogger(t), api: api}).
 						WaitForContainerHealthy(t.Context(), mockContainerID, 5*time.Second)
 					require.ErrorContains(t, err, "health check failed")
 				})
@@ -893,7 +847,7 @@ func TestClient(t *testing.T) {
 		})
 	})
 
-	t.Run("getRuntime", func(t *testing.T) {
+	t.Run("isPodmanRuntime", func(t *testing.T) {
 		t.Parallel()
 
 		t.Run("CPUCopyMode is auto", func(t *testing.T) {
@@ -904,12 +858,12 @@ func TestClient(t *testing.T) {
 
 				memFs := fstest.MapFS{"run/.containerenv": {}}
 
-				testClient := &client{
+				testClient := &Client{
 					log:         newTestLogger(t),
 					api:         mockContainer.NewMockAPIClient(t),
 					CPUCopyMode: cpuCopyModeAuto, Fs: memFs,
 				}
-				assert.True(t, testClient.getRuntime(t.Context()))
+				assert.True(t, testClient.isPodmanRuntime(t.Context()))
 			})
 
 			t.Run("should detect Docker via marker file", func(t *testing.T) {
@@ -917,12 +871,12 @@ func TestClient(t *testing.T) {
 
 				memFs := fstest.MapFS{".dockerenv": {}}
 
-				testClient := &client{
+				testClient := &Client{
 					log:         newTestLogger(t),
 					api:         mockContainer.NewMockAPIClient(t),
 					CPUCopyMode: cpuCopyModeAuto, Fs: memFs,
 				}
-				assert.False(t, testClient.getRuntime(t.Context()))
+				assert.False(t, testClient.isPodmanRuntime(t.Context()))
 			})
 		})
 	})
@@ -940,12 +894,12 @@ func TestClient(t *testing.T) {
 				expectExec(t, api, execCase{containerID: "ex-cont-id", execID: "ex-exec-id", cmd: "exec-cmd"})
 
 				log, logOutput := logcapture.New(zerolog.DebugLevel)
-				c := &client{log: log, api: api}
+				c := &Client{log: log, api: api}
 
-				container, err := c.GetContainer(t.Context(), "ex-cont-id")
+				got, err := c.GetContainer(t.Context(), "ex-cont-id")
 				require.NoError(t, err)
 
-				_, err = c.ExecuteCommand(t.Context(), container, "exec-cmd", 1, 0, 0)
+				_, err = c.ExecuteCommand(t.Context(), got, "exec-cmd", 1, 0, 0)
 				require.NoError(t, err)
 				assert.Contains(t, logOutput.String(), "container_id=ex-cont-id")
 			})
@@ -957,12 +911,12 @@ func TestClient(t *testing.T) {
 				expectExec(t, api, execCase{containerID: "ex-cont-id", execID: "ex-exec-id", cmd: "exec-cmd", exitCode: 75})
 
 				log, logOutput := logcapture.New(zerolog.DebugLevel)
-				c := &client{log: log, api: api}
+				c := &Client{log: log, api: api}
 
-				container, err := c.GetContainer(t.Context(), "ex-cont-id")
+				got, err := c.GetContainer(t.Context(), "ex-cont-id")
 				require.NoError(t, err)
 
-				skipUpdate, err := c.ExecuteCommand(t.Context(), container, "exec-cmd", 1, 0, 0)
+				skipUpdate, err := c.ExecuteCommand(t.Context(), got, "exec-cmd", 1, 0, 0)
 				require.NoError(t, err)
 				assert.True(t, skipUpdate)
 				assert.Contains(t, logOutput.String(), "container_id=ex-cont-id")
@@ -981,12 +935,12 @@ func TestClient(t *testing.T) {
 			api := newDockerAPI(t)
 			expectExec(t, api, tc)
 
-			c := &client{log: newTestLogger(t), api: api}
+			c := &Client{log: newTestLogger(t), api: api}
 
-			container, err := c.GetContainer(t.Context(), types.ContainerID(tc.containerID))
+			got, err := c.GetContainer(t.Context(), container.ContainerID(tc.containerID))
 			require.NoError(t, err)
 
-			return c.ExecuteCommand(t.Context(), container, tc.cmd, 1, uid, gid)
+			return c.ExecuteCommand(t.Context(), got, tc.cmd, 1, uid, gid)
 		}
 
 		t.Run("command exits with code 0", func(t *testing.T) {
@@ -1233,7 +1187,7 @@ func TestClient(t *testing.T) {
 
 			log, logOutput := logcapture.New(zerolog.WarnLevel)
 
-			containers, err := (&client{log: log, api: api}).ListContainers(t.Context(), filters.NoFilter)
+			containers, err := (&Client{log: log, api: api}).ListContainers(t.Context(), filters.NoFilter)
 			require.NoError(t, err)
 			assert.Empty(t, containers)
 			assert.Contains(t, logOutput.String(), "Docker API returned 404 for container list")
@@ -1250,7 +1204,7 @@ func TestClient(t *testing.T) {
 			api.EXPECT().ContainerList(mock.Anything, mock.Anything).
 				Return(dockerClient.ContainerListResult{}, daemonError("server error")).Once()
 
-			containers, err := (&client{log: newTestLogger(t), api: api}).ListContainers(t.Context(), filters.NoFilter)
+			containers, err := (&Client{log: newTestLogger(t), api: api}).ListContainers(t.Context(), filters.NoFilter)
 			require.Error(t, err)
 			assert.Nil(t, containers)
 		})
@@ -1266,8 +1220,28 @@ func TestClient(t *testing.T) {
 			api.EXPECT().ContainerList(mock.Anything, mock.Anything).
 				Return(dockerClient.ContainerListResult{}, fmt.Errorf("unauthorized: %w", cerrdefs.ErrUnauthenticated)).Once()
 
-			containers, err := (&client{log: newTestLogger(t), api: api}).ListContainers(t.Context(), filters.NoFilter)
+			containers, err := (&Client{log: newTestLogger(t), api: api}).ListContainers(t.Context(), filters.NoFilter)
 			require.Error(t, err)
+			assert.Nil(t, containers)
+		})
+	})
+
+	t.Run("listing containers canceled before a retry", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("should return a listing error", func(t *testing.T) {
+			t.Parallel()
+
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+
+			api := newDockerAPI(t)
+			api.EXPECT().ContainerList(mock.Anything, mock.Anything).
+				Return(dockerClient.ContainerListResult{}, errors.New("connection refused")).Once()
+
+			containers, err := (&Client{log: newTestLogger(t), api: api}).ListContainers(ctx, filters.NoFilter)
+			require.EqualError(t, err, "failed to list containers: context canceled")
+			require.ErrorIs(t, err, context.Canceled)
 			assert.Nil(t, containers)
 		})
 	})
@@ -1286,7 +1260,7 @@ func TestClient(t *testing.T) {
 			api.EXPECT().ContainerInspect(mock.Anything, "container1", dockerClient.ContainerInspectOptions{}).
 				Return(dockerClient.ContainerInspectResult{}, daemonError("inspect error")).Once()
 
-			containers, err := (&client{log: newTestLogger(t), api: api}).ListContainers(t.Context(), filters.NoFilter)
+			containers, err := (&Client{log: newTestLogger(t), api: api}).ListContainers(t.Context(), filters.NoFilter)
 			require.Error(t, err)
 			assert.Nil(t, containers)
 		})
@@ -1337,12 +1311,12 @@ func TestClient(t *testing.T) {
 
 				log, logOutput := logcapture.New(zerolog.DebugLevel)
 
-				containers, err := (&client{log: log, api: api}).ListContainers(t.Context())
+				containers, err := (&Client{log: log, api: api}).ListContainers(t.Context())
 				require.NoError(t, err)
 				require.Len(t, containers, 2)
 
-				containerIDs := []types.ContainerID{containers[0].ID(), containers[1].ID()}
-				assert.ElementsMatch(t, []types.ContainerID{valid1ID, valid2ID}, containerIDs)
+				containerIDs := []container.ContainerID{containers[0].ID(), containers[1].ID()}
+				assert.ElementsMatch(t, []container.ContainerID{valid1ID, valid2ID}, containerIDs)
 				assert.Contains(t, logOutput.String(), ghostID)
 			})
 		})
@@ -1363,7 +1337,7 @@ func TestClient(t *testing.T) {
 					ActiveCount: 1,
 				}}, nil).Once()
 
-			usage, err := (&client{log: newTestLogger(t), api: api}).GetImageDiskUsage(t.Context())
+			usage, err := (&Client{log: newTestLogger(t), api: api}).GetImageDiskUsage(t.Context())
 			require.NoError(t, err)
 			assert.Equal(t, int64(4096), usage.TotalSize)
 			assert.Equal(t, int64(1024), usage.Reclaimable)
@@ -1378,7 +1352,7 @@ func TestClient(t *testing.T) {
 			api.EXPECT().DiskUsage(mock.Anything, dockerClient.DiskUsageOptions{Images: true}).
 				Return(dockerClient.DiskUsageResult{}, daemonError("df failed")).Once()
 
-			_, err := (&client{log: newTestLogger(t), api: api}).GetImageDiskUsage(t.Context())
+			_, err := (&Client{log: newTestLogger(t), api: api}).GetImageDiskUsage(t.Context())
 			require.ErrorContains(t, err, "failed to get image disk usage")
 		})
 	})
@@ -1391,72 +1365,34 @@ func TestClient(t *testing.T) {
 
 			_, api := newTLSStubClient(t)
 
-			version := (&client{log: newTestLogger(t), api: api}).GetVersion()
+			version := (&Client{log: newTestLogger(t), api: api}).GetVersion()
 			assert.Regexp(t, `^\d+\.\d+$`, version)
 		})
 
-		t.Run("GetInfo successfully retrieves system information over TLS", func(t *testing.T) {
+		t.Run("Ping reaches the daemon over TLS", func(t *testing.T) {
 			t.Parallel()
 
 			server, api := newTLSStubClient(t)
-			server.AppendHandlers(httpstub.CombineHandlers(
-				httpstub.VerifyRequest(t, http.MethodGet, httpstub.PathRegexp(`^/v[0-9.]+/info$`)),
-				httpstub.RespondWithJSONEncoded(t, http.StatusOK, map[string]any{
-					"Name":            "docker-server",
-					"ServerVersion":   "24.0.0",
-					"OSType":          "linux",
-					"OperatingSystem": "Ubuntu 20.04",
-					"Driver":          "overlay2",
-				}, nil),
-			))
 
-			info, err := (&client{log: newTestLogger(t), api: api}).GetInfo(t.Context())
-			require.NoError(t, err)
-			assert.Equal(t, "docker-server", info.Name)
-		})
-
-		t.Run("GetInfo returns expected system info fields over TLS", func(t *testing.T) {
-			t.Parallel()
-
-			server, api := newTLSStubClient(t)
-			server.AppendHandlers(httpstub.CombineHandlers(
-				httpstub.VerifyRequest(t, http.MethodGet, httpstub.PathRegexp(`^/v[0-9.]+/info$`)),
-				httpstub.RespondWithJSONEncoded(t, http.StatusOK, map[string]any{
-					"Name":            "test-docker",
-					"ServerVersion":   "25.0.0",
-					"OSType":          "linux",
-					"OperatingSystem": "Alpine Linux",
-					"Driver":          "btrfs",
-				}, nil),
-			))
-
-			info, err := (&client{log: newTestLogger(t), api: api}).GetInfo(t.Context())
-			require.NoError(t, err)
-			assert.Equal(t, types.SystemInfo{
-				Name:            "test-docker",
-				ServerVersion:   "25.0.0",
-				OSType:          "linux",
-				OperatingSystem: "Alpine Linux",
-				Driver:          "btrfs",
-			}, info)
+			require.NoError(t, (&Client{log: newTestLogger(t), api: api}).Ping(t.Context()))
+			assert.NotEmpty(t, server.ReceivedRequests())
 		})
 	})
 }
 
 // TestClientEnvironment verifies the client behavior that depends on
-// environment variables: runtime detection by the container variables, and
-// client construction from the DOCKER_* variables.
+// environment variables, which is runtime detection by the container variables.
 //
 // The test sets environment variables, so it does not run in parallel.
 func TestClientEnvironment(t *testing.T) {
-	t.Run("getRuntime", func(t *testing.T) {
+	t.Run("isPodmanRuntime", func(t *testing.T) {
 		t.Run("CPUCopyMode is auto", func(t *testing.T) {
 			// newAutoClient returns a client in auto CPU copy mode with no
 			// runtime marker files.
-			newAutoClient := func(t *testing.T, api dockerClient.APIClient) *client {
+			newAutoClient := func(t *testing.T, api dockerClient.APIClient) *Client {
 				t.Helper()
 
-				return &client{
+				return &Client{
 					log:         newTestLogger(t),
 					api:         api,
 					CPUCopyMode: cpuCopyModeAuto, Fs: fstest.MapFS{},
@@ -1466,7 +1402,7 @@ func TestClientEnvironment(t *testing.T) {
 			t.Run("should detect Podman via CONTAINER environment variable", func(t *testing.T) {
 				t.Setenv("CONTAINER", "podman")
 
-				assert.True(t, newAutoClient(t, mockContainer.NewMockAPIClient(t)).getRuntime(t.Context()))
+				assert.True(t, newAutoClient(t, mockContainer.NewMockAPIClient(t)).isPodmanRuntime(t.Context()))
 			})
 
 			t.Run("should detect Podman via API Name field", func(t *testing.T) {
@@ -1477,7 +1413,7 @@ func TestClientEnvironment(t *testing.T) {
 				api := newDockerAPI(t)
 				expectInfo(api, dockerSystem.Info{Name: "podman"})
 
-				assert.True(t, newAutoClient(t, api).getRuntime(t.Context()))
+				assert.True(t, newAutoClient(t, api).isPodmanRuntime(t.Context()))
 			})
 
 			t.Run("should detect Podman via API ServerVersion field", func(t *testing.T) {
@@ -1487,7 +1423,7 @@ func TestClientEnvironment(t *testing.T) {
 				api := newDockerAPI(t)
 				expectInfo(api, dockerSystem.Info{ServerVersion: "podman/4.0.0"})
 
-				assert.True(t, newAutoClient(t, api).getRuntime(t.Context()))
+				assert.True(t, newAutoClient(t, api).isPodmanRuntime(t.Context()))
 			})
 
 			t.Run("should fall back to Docker when detection fails", func(t *testing.T) {
@@ -1502,118 +1438,121 @@ func TestClientEnvironment(t *testing.T) {
 				testClient := newAutoClient(t, api)
 				testClient.log = log
 
-				assert.False(t, testClient.getRuntime(t.Context()))
+				assert.False(t, testClient.isPodmanRuntime(t.Context()))
 				assert.Contains(t, logOutput.String(), "Failed to detect container runtime, falling back to Docker")
 			})
 		})
 	})
+}
 
-	t.Run("TLS client methods", func(t *testing.T) {
-		t.Run("GetInfo handles TLS connection failures gracefully", func(t *testing.T) {
-			// The client requires TLS, but the server speaks plain HTTP, so
-			// no request reaches a handler.
-			server := httpstub.New(t)
-			useDockerTLS(t, server, httpstub.NewTLS(t))
+// TestNewClient verifies that the client connects with its Docker settings:
+// over TLS with the configured certificates, with a fixed or negotiated API
+// version, and with a fallback to negotiation when the fixed version is
+// unsupported.
+func TestNewClient(t *testing.T) {
+	t.Parallel()
 
-			client, err := NewClient(t.Context(), newTestLogger(t), ClientOptions{})
-			require.NoError(t, err)
+	t.Run("should return an error when the host cannot be parsed", func(t *testing.T) {
+		t.Parallel()
 
-			_, err = client.GetInfo(t.Context())
-			require.ErrorContains(t, err, "failed to get system info")
-			assert.Empty(t, server.ReceivedRequests())
-		})
+		client, err := NewClient(t.Context(), newTestLogger(t), ClientOptions{Docker: dockerConfig.Docker{Host: "tcp://[::1"}})
+		require.ErrorContains(t, err, "create Docker client")
+		assert.Nil(t, client)
 	})
 
-	t.Run("NewClient", func(t *testing.T) {
-		t.Run("should return an error when DOCKER_HOST cannot be parsed", func(t *testing.T) {
-			t.Setenv("DOCKER_HOST", "tcp://[::1")
-			t.Setenv("DOCKER_TLS_VERIFY", "")
-			t.Setenv("DOCKER_API_VERSION", "")
+	t.Run("should successfully connect with TLS when TLS verification is on and the host is a TLS server", func(t *testing.T) {
+		t.Parallel()
 
-			client, err := NewClient(t.Context(), newTestLogger(t), ClientOptions{})
-			require.ErrorContains(t, err, "create Docker client")
-			assert.Nil(t, client)
-		})
+		server := httpstub.NewTLS(t)
+		server.AppendHandlers(respondToPing(t, http.MethodHead, http.StatusOK, "1.45"))
 
-		t.Run("should successfully connect with TLS when DOCKER_TLS_VERIFY=1 and DOCKER_HOST points to TLS server", func(t *testing.T) {
-			server := httpstub.NewTLS(t)
-			server.AppendHandlers(respondToPing(t, http.MethodHead, http.StatusOK, "1.45"))
-			useDockerTLS(t, server, server)
+		client, err := NewClient(t.Context(), newTestLogger(t), ClientOptions{Docker: dockerTLS(t, server, server)})
+		require.NoError(t, err)
+		require.NotNil(t, client)
 
-			client, err := NewClient(t.Context(), newTestLogger(t), ClientOptions{})
-			require.NoError(t, err)
-			require.NotNil(t, client)
+		requests := server.ReceivedRequests()
+		require.Len(t, requests, 1)
+		assert.NotNil(t, requests[0].TLS, "the ping is sent over TLS")
+	})
 
-			requests := server.ReceivedRequests()
-			require.Len(t, requests, 1)
-			assert.NotNil(t, requests[0].TLS, "the ping is sent over TLS")
-		})
+	t.Run("should send no plain HTTP request when TLS is required but the server is HTTP-only", func(t *testing.T) {
+		t.Parallel()
 
-		t.Run("should fail when TLS is required but server is HTTP-only", func(t *testing.T) {
-			server := httpstub.New(t)
-			useDockerTLS(t, server, httpstub.NewTLS(t))
+		// The client requires TLS, but the server speaks plain HTTP, so
+		// no request reaches a handler and pings fail.
+		server := httpstub.New(t)
 
-			assert.NotPanics(t, func() { _, _ = NewClient(t.Context(), newTestLogger(t), ClientOptions{}) })
-			assert.Empty(t, server.ReceivedRequests(), "no plain HTTP request is sent")
-		})
+		client, err := NewClient(t.Context(), newTestLogger(t), ClientOptions{Docker: dockerTLS(t, server, httpstub.NewTLS(t))})
+		require.NoError(t, err)
 
-		t.Run("should negotiate API version with TLS", func(t *testing.T) {
-			server := httpstub.NewTLS(t)
-			server.AppendHandlers(respondToPing(t, http.MethodHead, http.StatusOK, "1.45"))
-			useDockerTLS(t, server, server)
+		err = client.Ping(t.Context())
+		require.ErrorContains(t, err, "ping failed")
+		assert.Empty(t, server.ReceivedRequests())
+	})
 
-			client, err := NewClient(t.Context(), newTestLogger(t), ClientOptions{})
-			require.NoError(t, err)
-			assert.Equal(t, "1.45", client.GetVersion())
-		})
+	t.Run("should negotiate API version with TLS", func(t *testing.T) {
+		t.Parallel()
 
-		t.Run("should use forced API version with TLS", func(t *testing.T) {
-			// A forced version skips negotiation, so the daemon's newer
-			// version is not adopted.
-			server := httpstub.NewTLS(t)
-			server.AppendHandlers(respondToPing(t, http.MethodHead, http.StatusOK, "1.47"))
-			useDockerTLS(t, server, server)
-			t.Setenv("DOCKER_API_VERSION", "1.44")
+		server := httpstub.NewTLS(t)
+		server.AppendHandlers(respondToPing(t, http.MethodHead, http.StatusOK, "1.45"))
 
-			client, err := NewClient(t.Context(), newTestLogger(t), ClientOptions{})
-			require.NoError(t, err)
-			assert.Equal(t, "1.44", client.GetVersion())
-		})
+		client, err := NewClient(t.Context(), newTestLogger(t), ClientOptions{Docker: dockerTLS(t, server, server)})
+		require.NoError(t, err)
+		assert.Equal(t, "1.45", client.GetVersion())
+	})
 
-		t.Run("should fall back to negotiation when the forced API version is newer than the daemon's", func(t *testing.T) {
-			// The daemon answers the unversioned ping, so only the API
-			// version it reports shows the forced version is unsupported.
-			server := httpstub.NewTLS(t)
-			server.AppendHandlers(
-				respondToPing(t, http.MethodHead, http.StatusOK, "1.45"),
-				respondToPing(t, http.MethodHead, http.StatusOK, "1.45"),
-			)
-			useDockerTLS(t, server, server)
-			t.Setenv("DOCKER_API_VERSION", "1.47")
+	t.Run("should use forced API version with TLS", func(t *testing.T) {
+		t.Parallel()
 
-			client, err := NewClient(t.Context(), newTestLogger(t), ClientOptions{})
-			require.NoError(t, err)
-			assert.Equal(t, "1.45", client.GetVersion())
-			assert.Len(t, server.ReceivedRequests(), 2)
-		})
+		// A forced version skips negotiation, so the daemon's newer
+		// version is not adopted.
+		server := httpstub.NewTLS(t)
+		server.AppendHandlers(respondToPing(t, http.MethodHead, http.StatusOK, "1.47"))
+		docker := dockerTLS(t, server, server)
+		docker.APIVersion = "1.44"
 
-		t.Run("should handle invalid API version with TLS and fall back to negotiation", func(t *testing.T) {
-			// The pings at the forced version fail with 404, HEAD and then
-			// GET, so the client is recreated and negotiates.
-			server := httpstub.NewTLS(t)
-			server.AppendHandlers(
-				respondToPing(t, http.MethodHead, http.StatusNotFound, ""),
-				respondToPing(t, http.MethodGet, http.StatusNotFound, ""),
-				respondToPing(t, http.MethodHead, http.StatusOK, "1.45"),
-			)
-			useDockerTLS(t, server, server)
-			t.Setenv("DOCKER_API_VERSION", "1.99")
+		client, err := NewClient(t.Context(), newTestLogger(t), ClientOptions{Docker: docker})
+		require.NoError(t, err)
+		assert.Equal(t, "1.44", client.GetVersion())
+	})
 
-			client, err := NewClient(t.Context(), newTestLogger(t), ClientOptions{})
-			require.NoError(t, err)
-			assert.Equal(t, "1.45", client.GetVersion())
-			assert.Len(t, server.ReceivedRequests(), 3)
-		})
+	t.Run("should fall back to negotiation when the forced API version is newer than the daemon's", func(t *testing.T) {
+		t.Parallel()
+
+		// The daemon answers the unversioned ping, so only the API
+		// version it reports shows the forced version is unsupported.
+		server := httpstub.NewTLS(t)
+		server.AppendHandlers(
+			respondToPing(t, http.MethodHead, http.StatusOK, "1.45"),
+			respondToPing(t, http.MethodHead, http.StatusOK, "1.45"),
+		)
+		docker := dockerTLS(t, server, server)
+		docker.APIVersion = "1.47"
+
+		client, err := NewClient(t.Context(), newTestLogger(t), ClientOptions{Docker: docker})
+		require.NoError(t, err)
+		assert.Equal(t, "1.45", client.GetVersion())
+		assert.Len(t, server.ReceivedRequests(), 2)
+	})
+
+	t.Run("should handle invalid API version with TLS and fall back to negotiation", func(t *testing.T) {
+		t.Parallel()
+
+		// The pings at the forced version fail with 404, HEAD and then
+		// GET, so the client is recreated and negotiates.
+		server := httpstub.NewTLS(t)
+		server.AppendHandlers(
+			respondToPing(t, http.MethodHead, http.StatusNotFound, ""),
+			respondToPing(t, http.MethodGet, http.StatusNotFound, ""),
+			respondToPing(t, http.MethodHead, http.StatusOK, "1.45"),
+		)
+		docker := dockerTLS(t, server, server)
+		docker.APIVersion = "1.99"
+
+		client, err := NewClient(t.Context(), newTestLogger(t), ClientOptions{Docker: docker})
+		require.NoError(t, err)
+		assert.Equal(t, "1.45", client.GetVersion())
+		assert.Len(t, server.ReceivedRequests(), 3)
 	})
 }
 
@@ -1686,7 +1625,7 @@ func TestClientSetRestartPolicy(t *testing.T) {
 			t.Parallel()
 
 			// The mock has no expectations, so any Docker call fails the test.
-			c := &client{log: newTestLogger(t), api: mockContainer.NewMockAPIClient(t)}
+			c := &Client{log: newTestLogger(t), api: mockContainer.NewMockAPIClient(t)}
 			require.NoError(t, c.SetRestartPolicy(t.Context(), "", dockerContainer.RestartPolicy{}))
 		})
 	})
@@ -1700,7 +1639,7 @@ func TestClientSetRestartPolicy(t *testing.T) {
 			api := newDockerAPI(t)
 			expectUpdate(api, dockerContainer.RestartPolicy{Name: dockerContainer.RestartPolicyDisabled}, nil)
 
-			err := (&client{log: newTestLogger(t), api: api}).
+			err := (&Client{log: newTestLogger(t), api: api}).
 				SetRestartPolicy(t.Context(), cid, dockerContainer.RestartPolicy{})
 			require.NoError(t, err)
 		})
@@ -1711,7 +1650,7 @@ func TestClientSetRestartPolicy(t *testing.T) {
 			api := newDockerAPI(t)
 			expectUpdate(api, dockerContainer.RestartPolicy{Name: dockerContainer.RestartPolicyDisabled}, nil)
 
-			err := (&client{log: newTestLogger(t), api: api}).
+			err := (&Client{log: newTestLogger(t), api: api}).
 				SetRestartPolicy(t.Context(), cid, dockerContainer.RestartPolicy{MaximumRetryCount: 5})
 			require.NoError(t, err)
 		})
@@ -1726,7 +1665,7 @@ func TestClientSetRestartPolicy(t *testing.T) {
 			api := newDockerAPI(t)
 			expectUpdate(api, dockerContainer.RestartPolicy{Name: dockerContainer.RestartPolicyAlways}, nil)
 
-			err := (&client{log: newTestLogger(t), api: api}).SetRestartPolicy(
+			err := (&Client{log: newTestLogger(t), api: api}).SetRestartPolicy(
 				t.Context(), cid, dockerContainer.RestartPolicy{Name: dockerContainer.RestartPolicyAlways},
 			)
 			require.NoError(t, err)
@@ -1742,7 +1681,7 @@ func TestClientSetRestartPolicy(t *testing.T) {
 			api := newDockerAPI(t)
 			expectUpdate(api, dockerContainer.RestartPolicy{Name: dockerContainer.RestartPolicyDisabled}, daemonError("update failed"))
 
-			err := (&client{log: newTestLogger(t), api: api}).SetRestartPolicy(
+			err := (&Client{log: newTestLogger(t), api: api}).SetRestartPolicy(
 				t.Context(), cid, dockerContainer.RestartPolicy{Name: dockerContainer.RestartPolicyDisabled},
 			)
 			require.ErrorIs(t, err, errSetRestartPolicyFailed)
@@ -1779,7 +1718,7 @@ func TestListContainers_RestartingFilterFollowsRuntime(t *testing.T) {
 
 				fsys := fstest.MapFS{tt.marker: {}}
 
-				c := &client{
+				c := &Client{
 					log:               newTestLogger(t),
 					api:               api,
 					CPUCopyMode:       mode,
@@ -1794,10 +1733,10 @@ func TestListContainers_RestartingFilterFollowsRuntime(t *testing.T) {
 	}
 }
 
-// TestGetRuntime_RetriesFailedDetection verifies that a failed detection is
+// TestIsPodmanRuntime_RetriesFailedDetection verifies that a failed detection is
 // not cached, so a later call detects the runtime, and that a successful
 // detection is cached. It sets environment variables, so it runs sequentially.
-func TestGetRuntime_RetriesFailedDetection(t *testing.T) {
+func TestIsPodmanRuntime_RetriesFailedDetection(t *testing.T) {
 	t.Setenv("container", "")
 	t.Setenv("CONTAINER", "")
 
@@ -1808,22 +1747,22 @@ func TestGetRuntime_RetriesFailedDetection(t *testing.T) {
 		Return(dockerClient.SystemInfoResult{}, daemonError("server error")).Once()
 	expectInfo(api, dockerSystem.Info{Name: "podman"})
 
-	c := &client{
+	c := &Client{
 		log:         newTestLogger(t),
 		api:         api,
 		CPUCopyMode: cpuCopyModeAuto, Fs: fstest.MapFS{},
 	}
 
-	assert.False(t, c.getRuntime(t.Context()), "a failed detection falls back to Docker")
-	assert.True(t, c.getRuntime(t.Context()), "the next call detects Podman")
-	assert.True(t, c.getRuntime(t.Context()), "the detection is cached")
+	assert.False(t, c.isPodmanRuntime(t.Context()), "a failed detection falls back to Docker")
+	assert.True(t, c.isPodmanRuntime(t.Context()), "the next call detects Podman")
+	assert.True(t, c.isPodmanRuntime(t.Context()), "the detection is cached")
 }
 
-// TestGetRuntime_NoFilesystem verifies that a client built without a
+// TestIsPodmanRuntime_NoFilesystem verifies that a client built without a
 // filesystem detects the runtime from the host's filesystem instead of
 // panicking. The host's marker files decide the result, so only the absence of
 // a panic is checked. It sets environment variables, so it runs sequentially.
-func TestGetRuntime_NoFilesystem(t *testing.T) {
+func TestIsPodmanRuntime_NoFilesystem(t *testing.T) {
 	t.Setenv("CONTAINER", "")
 	t.Setenv("container", "")
 
@@ -1834,9 +1773,9 @@ func TestGetRuntime_NoFilesystem(t *testing.T) {
 	api.EXPECT().ServerVersion(mock.Anything, dockerClient.ServerVersionOptions{}).
 		Return(dockerClient.ServerVersionResult{}, nil).Maybe()
 
-	c := &client{log: newTestLogger(t), api: api, CPUCopyMode: cpuCopyModeAuto}
+	c := &Client{log: newTestLogger(t), api: api, CPUCopyMode: cpuCopyModeAuto}
 
-	assert.NotPanics(t, func() { c.getRuntime(t.Context()) })
+	assert.NotPanics(t, func() { c.isPodmanRuntime(t.Context()) })
 }
 
 // TestStartContainer_StartsCreatedContainer verifies that StartContainer starts
@@ -1859,9 +1798,141 @@ func TestStartContainer_StartsCreatedContainer(t *testing.T) {
 	api.EXPECT().ContainerStart(mock.Anything, createdID, dockerClient.ContainerStartOptions{}).
 		Return(dockerClient.ContainerStartResult{}, nil).Once()
 
-	newID, err := (&client{log: newTestLogger(t), api: api}).StartContainer(t.Context(), source)
+	newID, err := (&Client{log: newTestLogger(t), api: api}).StartContainer(t.Context(), source)
 	require.NoError(t, err)
-	assert.Equal(t, types.ContainerID(createdID), newID)
+	assert.Equal(t, container.ContainerID(createdID), newID)
+}
+
+// TestListLabeledContainers verifies that a labeled listing asks Docker for
+// the containers whose label is "true" in every state except removing and
+// dead. A stopped or never-started container is listed even when stopped
+// containers are otherwise left out. Podman rejects the restarting status, so
+// a Podman listing leaves it out.
+func TestListLabeledContainers(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		// podman is the detected runtime.
+		podman bool
+		// statuses are the states the listing asks for.
+		statuses map[string]bool
+	}{
+		{
+			name:     "Docker",
+			statuses: map[string]bool{"created": true, "running": true, "paused": true, "exited": true, "restarting": true},
+		},
+		{
+			name:     "Podman",
+			podman:   true,
+			statuses: map[string]bool{"created": true, "running": true, "paused": true, "exited": true},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			api := newDockerAPI(t)
+			api.EXPECT().ContainerList(mock.Anything, dockerClient.ContainerListOptions{
+				All: true,
+				Filters: dockerClient.Filters{
+					"label":  {"com.centurylinklabs.watchtower.ephemeral-orchestrator=true": true},
+					"status": tt.statuses,
+				},
+			}).Return(dockerClient.ContainerListResult{Items: []dockerContainer.Summary{
+				{ID: string(fixtureStopped.id)},
+			}}, nil).Once()
+			expectContainerFixtures(t, api, fixtureStopped)
+
+			client := &Client{log: newTestLogger(t), api: api, runtimeDetected: true, podmanRuntime: tt.podman}
+
+			labeled, err := client.ListLabeledContainers(t.Context(), "com.centurylinklabs.watchtower.ephemeral-orchestrator")
+			require.NoError(t, err)
+			require.Len(t, labeled, 1)
+			assert.Equal(t, fixtureStopped.id, labeled[0].ID())
+		})
+	}
+}
+
+// TestCreateFailureNamedOnce verifies that a failed create, through
+// CreateContainer or StartContainer, returns the recreation's error without a
+// second prefix and is logged once, by the recreation.
+func TestCreateFailureNamedOnce(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		create func(c *Client, ctx context.Context, source *container.Container) (container.ContainerID, error)
+	}{
+		{name: "CreateContainer", create: (*Client).CreateContainer},
+		{name: "StartContainer", create: (*Client).StartContainer},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			api := newDockerAPI(t)
+			api.EXPECT().ContainerCreate(mock.Anything, mock.Anything).
+				Return(dockerClient.ContainerCreateResult{}, daemonError("create failed")).Once()
+
+			log, logOutput := logcapture.New(zerolog.DebugLevel)
+			source := modelfixture.Container(containerfixture.WithNetworkMode("bridge"))
+
+			newID, err := tt.create(&Client{log: log, api: api}, t.Context(), source)
+			require.EqualError(t, err, "failed to create container: Error response from daemon: create failed")
+			assert.Empty(t, newID)
+			assert.Equal(t, 1, strings.Count(logOutput.String(), "create failed"), "one log line carries the failure")
+		})
+	}
+}
+
+// TestClientIsContainerStale_NamesEngine verifies that a pull the engine
+// fails names the engine the client detects, Docker or Podman, so a
+// notification can say which one failed.
+//
+// Pulls share package-level slots per registry host, so the test does not run
+// in parallel.
+func TestClientIsContainerStale_NamesEngine(t *testing.T) {
+	tests := []struct {
+		engine string
+		marker string
+	}{
+		{engine: "Docker", marker: ".dockerenv"},
+		{engine: "Podman", marker: "run/.containerenv"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.engine, func(t *testing.T) {
+			// A registry that answers nothing, so the digest check falls back
+			// to a pull.
+			registry := httpstub.New(t)
+			registry.AllowUnhandledRequests()
+
+			image := registry.Addr() + "/app:latest"
+
+			api := newImageAPI(t)
+			api.EXPECT().ImagePull(mock.Anything, image, mock.Anything).
+				Return(nil, daemonError("pull refused")).Once()
+
+			client := &Client{
+				log:         newTestLogger(t),
+				api:         api,
+				Fs:          fstest.MapFS{tt.marker: {}},
+				Registry:    registryConfig.Registry{TLSSkip: true},
+				RateLimiter: ratelimit.New(),
+			}
+
+			c := modelfixture.Container(
+				containerfixture.WithImageName(image),
+				containerfixture.WithRepoDigests([]string{image + "@sha256:" + containerfixture.RandomID()}),
+			)
+
+			_, _, _, err := client.IsContainerStale(t.Context(), c, updateConfig.Policy{})
+			require.EqualError(t, err, tt.engine+" could not pull "+image+": Error response from daemon: pull refused")
+		})
+	}
 }
 
 // TestClientWrappers verifies that the client methods delegating to the image
@@ -1879,12 +1950,12 @@ func TestClientWrappers(t *testing.T) {
 		api := newImageAPI(t)
 		api.EXPECT().ImageInspect(mock.Anything, "test-image:latest").Return(inspected(newImageID), nil).Once()
 
-		stale, latestID, _, err := (&client{log: newTestLogger(t), api: api}).IsContainerStale(
+		stale, latestID, _, err := (&Client{log: newTestLogger(t), api: api}).IsContainerStale(
 			t.Context(), runningImage(currentImageID), updateConfig.Policy{NoPull: true},
 		)
 		require.NoError(t, err)
 		assert.True(t, stale)
-		assert.Equal(t, types.ImageID(newImageID), latestID)
+		assert.Equal(t, container.ImageID(newImageID), latestID)
 	})
 
 	// The image client's error names the failure. The update session's warning
@@ -1896,7 +1967,7 @@ func TestClientWrappers(t *testing.T) {
 		api.EXPECT().ImageInspect(mock.Anything, "test-image:latest").
 			Return(dockerClient.ImageInspectResult{}, daemonError("inspect failed")).Once()
 
-		_, _, _, err := (&client{log: newTestLogger(t), api: api}).IsContainerStale(
+		_, _, _, err := (&Client{log: newTestLogger(t), api: api}).IsContainerStale(
 			t.Context(), runningImage("sha256:"+containerfixture.RandomID()), updateConfig.Policy{NoPull: true},
 		)
 		require.EqualError(t, err, "failed to inspect image: test-image:latest: Error response from daemon: inspect failed")
@@ -1910,12 +1981,12 @@ func TestClientWrappers(t *testing.T) {
 		api := newImageAPI(t)
 		api.EXPECT().ImageInspect(mock.Anything, "test-image:latest").Return(inspected(currentImageID), nil).Once()
 
-		available, latestID, _, err := (&client{log: newTestLogger(t), api: api}).CheckContainerUpdate(
+		available, latestID, _, err := (&Client{log: newTestLogger(t), api: api}).CheckContainerUpdate(
 			t.Context(), runningImage(currentImageID), updateConfig.Policy{NoPull: true},
 		)
 		require.NoError(t, err)
 		assert.False(t, available)
-		assert.Equal(t, types.ImageID(currentImageID), latestID)
+		assert.Equal(t, container.ImageID(currentImageID), latestID)
 	})
 
 	t.Run("CheckContainerUpdate reports a failed check", func(t *testing.T) {
@@ -1925,7 +1996,7 @@ func TestClientWrappers(t *testing.T) {
 		api.EXPECT().ImageInspect(mock.Anything, "test-image:latest").
 			Return(dockerClient.ImageInspectResult{}, daemonError("inspect failed")).Once()
 
-		_, _, _, err := (&client{log: newTestLogger(t), api: api}).CheckContainerUpdate(
+		_, _, _, err := (&Client{log: newTestLogger(t), api: api}).CheckContainerUpdate(
 			t.Context(), runningImage("sha256:"+containerfixture.RandomID()), updateConfig.Policy{NoPull: true},
 		)
 		require.Error(t, err)
@@ -1934,7 +2005,7 @@ func TestClientWrappers(t *testing.T) {
 	t.Run("RemoveImageByID removes an unused image", func(t *testing.T) {
 		t.Parallel()
 
-		imageID := types.ImageID("sha256:" + containerfixture.RandomID())
+		imageID := container.ImageID("sha256:" + containerfixture.RandomID())
 
 		api := newDockerAPI(t)
 		api.EXPECT().ContainerList(mock.Anything, dockerClient.ContainerListOptions{All: true}).
@@ -1942,14 +2013,14 @@ func TestClientWrappers(t *testing.T) {
 		api.EXPECT().ImageRemove(mock.Anything, string(imageID), dockerClient.ImageRemoveOptions{Force: true, PruneChildren: true}).
 			Return(dockerClient.ImageRemoveResult{Items: []dockerImage.DeleteResponse{{Deleted: string(imageID)}}}, nil).Once()
 
-		err := (&client{log: newTestLogger(t), api: api}).RemoveImageByID(t.Context(), imageID, "test-image:latest")
+		err := (&Client{log: newTestLogger(t), api: api}).RemoveImageByID(t.Context(), imageID, "test-image:latest")
 		require.NoError(t, err)
 	})
 
 	t.Run("RemoveImageByID reports an image still in use", func(t *testing.T) {
 		t.Parallel()
 
-		imageID := types.ImageID("sha256:" + containerfixture.RandomID())
+		imageID := container.ImageID("sha256:" + containerfixture.RandomID())
 
 		api := newDockerAPI(t)
 		api.EXPECT().ContainerList(mock.Anything, dockerClient.ContainerListOptions{All: true}).
@@ -1957,7 +2028,7 @@ func TestClientWrappers(t *testing.T) {
 				{ID: "user", ImageID: string(imageID), State: dockerContainer.StateRunning},
 			}}, nil).Once()
 
-		err := (&client{log: newTestLogger(t), api: api}).RemoveImageByID(t.Context(), imageID, "test-image:latest")
+		err := (&Client{log: newTestLogger(t), api: api}).RemoveImageByID(t.Context(), imageID, "test-image:latest")
 		require.ErrorIs(t, err, containerImage.ErrImageInUse)
 	})
 
@@ -1968,7 +2039,7 @@ func TestClientWrappers(t *testing.T) {
 		api.EXPECT().ContainerStart(mock.Anything, mockContainerID, dockerClient.ContainerStartOptions{}).
 			Return(dockerClient.ContainerStartResult{}, nil).Once()
 
-		require.NoError(t, (&client{log: newTestLogger(t), api: api}).StartContainerByID(t.Context(), mockContainerID))
+		require.NoError(t, (&Client{log: newTestLogger(t), api: api}).StartContainerByID(t.Context(), mockContainerID))
 	})
 
 	t.Run("StartContainerByID reports a failed start", func(t *testing.T) {
@@ -1978,29 +2049,33 @@ func TestClientWrappers(t *testing.T) {
 		api.EXPECT().ContainerStart(mock.Anything, mockContainerID, dockerClient.ContainerStartOptions{}).
 			Return(dockerClient.ContainerStartResult{}, daemonError("start failed")).Once()
 
-		err := (&client{log: newTestLogger(t), api: api}).StartContainerByID(t.Context(), mockContainerID)
+		err := (&Client{log: newTestLogger(t), api: api}).StartContainerByID(t.Context(), mockContainerID)
 		require.ErrorContains(t, err, "start failed")
 	})
 
 	t.Run("RenameContainer renames the container", func(t *testing.T) {
 		t.Parallel()
 
+		log, logOutput := logcapture.New(zerolog.DebugLevel)
 		api := newDockerAPI(t)
 		api.EXPECT().ContainerRename(mock.Anything, mockContainerID, dockerClient.ContainerRenameOptions{NewName: "new-name"}).
 			Return(dockerClient.ContainerRenameResult{}, nil).Once()
 
-		require.NoError(t, (&client{log: newTestLogger(t), api: api}).RenameContainer(t.Context(), modelfixture.Container(), "new-name"))
+		require.NoError(t, (&Client{log: log, api: api}).RenameContainer(t.Context(), modelfixture.Container(), "new-name"))
+		assert.Contains(t, logOutput.String(), "Renamed container successfully")
 	})
 
-	t.Run("RenameContainer reports a failed rename", func(t *testing.T) {
+	t.Run("RenameContainer names a failed rename once", func(t *testing.T) {
 		t.Parallel()
 
+		log, logOutput := logcapture.New(zerolog.DebugLevel)
 		api := newDockerAPI(t)
 		api.EXPECT().ContainerRename(mock.Anything, mockContainerID, dockerClient.ContainerRenameOptions{NewName: "new-name"}).
 			Return(dockerClient.ContainerRenameResult{}, daemonError("rename failed")).Once()
 
-		err := (&client{log: newTestLogger(t), api: api}).RenameContainer(t.Context(), modelfixture.Container(), "new-name")
-		require.ErrorContains(t, err, "rename failed")
+		err := (&Client{log: log, api: api}).RenameContainer(t.Context(), modelfixture.Container(), "new-name")
+		require.EqualError(t, err, "failed to rename container: Error response from daemon: rename failed")
+		assert.Equal(t, 1, strings.Count(logOutput.String(), "Failed to rename container"), "one log line carries the failure")
 	})
 
 	t.Run("Ping pings the daemon without negotiating the API version", func(t *testing.T) {
@@ -2010,7 +2085,7 @@ func TestClientWrappers(t *testing.T) {
 		api.EXPECT().Ping(mock.Anything, dockerClient.PingOptions{NegotiateAPIVersion: false}).
 			Return(dockerClient.PingResult{}, nil).Once()
 
-		require.NoError(t, (&client{log: newTestLogger(t), api: api}).Ping(t.Context()))
+		require.NoError(t, (&Client{log: newTestLogger(t), api: api}).Ping(t.Context()))
 	})
 
 	t.Run("Ping reports an unreachable daemon", func(t *testing.T) {
@@ -2020,7 +2095,7 @@ func TestClientWrappers(t *testing.T) {
 		api.EXPECT().Ping(mock.Anything, dockerClient.PingOptions{NegotiateAPIVersion: false}).
 			Return(dockerClient.PingResult{}, errors.New("connection refused")).Once()
 
-		err := (&client{log: newTestLogger(t), api: api}).Ping(t.Context())
+		err := (&Client{log: newTestLogger(t), api: api}).Ping(t.Context())
 		require.ErrorContains(t, err, "ping failed")
 	})
 
@@ -2030,10 +2105,10 @@ func TestClientWrappers(t *testing.T) {
 		api := newDockerAPI(t)
 		expectInspect(api, testContainerID, sourceInspect("/watchtower", true, &dockerContainer.HostConfig{}), nil)
 
-		container, err := (&client{log: newTestLogger(t), api: api}).GetCurrentWatchtowerContainer(t.Context(), testContainerID)
+		c, err := (&Client{log: newTestLogger(t), api: api}).GetCurrentWatchtowerContainer(t.Context(), testContainerID)
 		require.NoError(t, err)
-		assert.Equal(t, types.ContainerID(testContainerID), container.ID())
-		assert.False(t, container.HasImageInfo())
+		assert.Equal(t, container.ContainerID(testContainerID), c.ID())
+		assert.False(t, c.HasImageInfo())
 	})
 
 	t.Run("GetCurrentWatchtowerContainer reports a failed inspect", func(t *testing.T) {
@@ -2042,7 +2117,7 @@ func TestClientWrappers(t *testing.T) {
 		api := newDockerAPI(t)
 		expectInspect(api, testContainerID, dockerContainer.InspectResponse{}, notFoundError("No such container"))
 
-		_, err := (&client{log: newTestLogger(t), api: api}).GetCurrentWatchtowerContainer(t.Context(), testContainerID)
+		_, err := (&Client{log: newTestLogger(t), api: api}).GetCurrentWatchtowerContainer(t.Context(), testContainerID)
 		require.ErrorContains(t, err, "failed to inspect container")
 	})
 
@@ -2058,10 +2133,10 @@ func TestClientWrappers(t *testing.T) {
 
 		source := modelfixture.Container(containerfixture.WithID("source123"), containerfixture.WithName("watchtower-source"), containerfixture.WithImageName("watchtower:latest"))
 
-		id, err := (&client{log: newTestLogger(t), api: api}).
+		id, err := (&Client{log: newTestLogger(t), api: api}).
 			CreateEphemeralOrchestrator(t.Context(), source, "watchtower:v2", "chain1", false)
 		require.NoError(t, err)
-		assert.Equal(t, types.ContainerID("orchestrator-id"), id)
+		assert.Equal(t, container.ContainerID("orchestrator-id"), id)
 	})
 
 	t.Run("CreateEphemeralOrchestrator says which step failed", func(t *testing.T) {
@@ -2073,9 +2148,9 @@ func TestClientWrappers(t *testing.T) {
 
 		source := modelfixture.Container(containerfixture.WithID("source123"), containerfixture.WithName("watchtower-source"), containerfixture.WithImageName("watchtower:latest"))
 
-		id, err := (&client{log: newTestLogger(t), api: api}).
+		id, err := (&Client{log: newTestLogger(t), api: api}).
 			CreateEphemeralOrchestrator(t.Context(), source, "watchtower:v2", "chain1", false)
-		require.ErrorContains(t, err, "create ephemeral orchestrator: failed to create ephemeral orchestrator container")
+		require.EqualError(t, err, "failed to create ephemeral orchestrator container: Error response from daemon: no such image")
 		assert.Empty(t, id)
 	})
 }
@@ -2089,7 +2164,7 @@ func TestClientThroughDockerSDK(t *testing.T) {
 
 	// newSDKClient returns a client using a real SDK client for server, with
 	// the API version fixed so no negotiation ping is sent.
-	newSDKClient := func(t *testing.T, server *httpstub.Server) *client {
+	newSDKClient := func(t *testing.T, server *httpstub.Server) *Client {
 		t.Helper()
 
 		api, err := dockerClient.New(
@@ -2099,7 +2174,7 @@ func TestClientThroughDockerSDK(t *testing.T) {
 		)
 		require.NoError(t, err)
 
-		return &client{log: newTestLogger(t), api: api}
+		return &Client{log: newTestLogger(t), api: api}
 	}
 
 	// respondWithFixture answers with the testdata file name.
@@ -2151,8 +2226,8 @@ func TestClientThroughDockerSDK(t *testing.T) {
 		containers, err := newSDKClient(t, server).ListContainers(t.Context(), filters.NoFilter)
 		require.NoError(t, err)
 		require.Len(t, containers, 2)
-		assert.ElementsMatch(t, []types.ContainerID{fixtureWatchtower.id, fixtureRunning.id},
-			[]types.ContainerID{containers[0].ID(), containers[1].ID()})
+		assert.ElementsMatch(t, []container.ContainerID{fixtureWatchtower.id, fixtureRunning.id},
+			[]container.ContainerID{containers[0].ID(), containers[1].ID()})
 		assert.True(t, containers[0].HasImageInfo())
 	})
 
@@ -2192,11 +2267,11 @@ func TestClientLogger(t *testing.T) {
 	t.Parallel()
 
 	log := newTestLogger(t)
-	assert.Same(t, log, (&client{log: log}).logger())
+	assert.Same(t, log, (&Client{log: log}).logger())
 
-	assert.NotNil(t, (&client{}).logger())
+	assert.NotNil(t, (&Client{}).logger())
 
-	var nilClient *client
+	var nilClient *Client
 	assert.NotNil(t, nilClient.logger())
 }
 
@@ -2211,7 +2286,7 @@ func TestClientImageAnnotationsDelegates(t *testing.T) {
 			Labels: map[string]string{oci.VersionLabel: "1.2.3"},
 		}}, nil).Once()
 
-	got := (&client{api: api, log: newTestLogger(t)}).
+	got := (&Client{api: api, log: newTestLogger(t)}).
 		GetImageAnnotations(t.Context(), "app:latest")
 
 	assert.Equal(t, "1.2.3", got.Version)
@@ -2345,9 +2420,23 @@ func TestPingUntilServing(t *testing.T) {
 			wantRequests: 11,
 		},
 		{
-			name:           "proxy that answers 503 is retried",
+			name:           "proxy that responds with 502 is retried",
+			ready:          20 * time.Second,
+			notReadyStatus: http.StatusBadGateway,
+			wantWait:       25 * time.Second,
+			wantRequests:   11,
+		},
+		{
+			name:           "proxy that responds with 503 is retried",
 			ready:          20 * time.Second,
 			notReadyStatus: http.StatusServiceUnavailable,
+			wantWait:       25 * time.Second,
+			wantRequests:   11,
+		},
+		{
+			name:           "proxy that responds with 504 is retried",
+			ready:          20 * time.Second,
+			notReadyStatus: http.StatusGatewayTimeout,
 			wantWait:       25 * time.Second,
 			wantRequests:   11,
 		},
@@ -2381,6 +2470,12 @@ func TestPingUntilServing(t *testing.T) {
 		{
 			name:         "daemon that rejects the ping ends the wait at once",
 			status:       http.StatusForbidden,
+			wantRequests: 2,
+			wantErr:      true,
+		},
+		{
+			name:         "daemon that does not implement the ping ends the wait at once",
+			status:       http.StatusNotImplemented,
 			wantRequests: 2,
 			wantErr:      true,
 		},
@@ -2444,7 +2539,7 @@ func TestNegotiateDockerAPI_WaitsForDaemon(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		daemon := &startingDaemon{ready: time.Now().Add(75 * time.Second)}
 
-		cli, result, err := negotiateDockerAPI(t.Context(), newTestLogger(t), newStartingDaemonClient(t, daemon))
+		cli, result, err := negotiateDockerAPI(t.Context(), newTestLogger(t), newStartingDaemonClient(t, daemon), nil)
 		require.NoError(t, err)
 		assert.Equal(t, "1.45", result.APIVersion)
 		assert.Equal(t, "1.45", cli.ClientVersion())
@@ -2454,7 +2549,8 @@ func TestNegotiateDockerAPI_WaitsForDaemon(t *testing.T) {
 // TestGetCurrentWatchtowerContainer_Retries verifies how the inspect of the
 // running Watchtower container retries. A transient error is tried again
 // after 2 seconds, up to three attempts or until the caller's context ends.
-// Other errors and a container that does not exist end the lookup at once.
+// Other errors and a container that does not exist end the lookup at once. A
+// caller's context that has already ended allows one attempt and no wait.
 // Each case runs in a synctest bubble, so the delays take no real time.
 func TestGetCurrentWatchtowerContainer_Retries(t *testing.T) {
 	t.Parallel()
@@ -2465,6 +2561,11 @@ func TestGetCurrentWatchtowerContainer_Retries(t *testing.T) {
 		name string
 		// deadline bounds the caller's context. Zero leaves it unbounded.
 		deadline time.Duration
+		// ended is how the caller's context has already ended when the lookup
+		// starts, context.Canceled or context.DeadlineExceeded. The inspect then
+		// fails with its context's error, as the Docker client does. Nil leaves
+		// the context running.
+		ended error
 		// results are the inspect results in order. A nil error answers with
 		// the container.
 		results      []error
@@ -2500,6 +2601,18 @@ func TestGetCurrentWatchtowerContainer_Retries(t *testing.T) {
 			wantWait:     currentContainerInspectRetryDelay + time.Second,
 		},
 		{
+			name:         "caller context already canceled",
+			ended:        context.Canceled,
+			wantErr:      context.Canceled,
+			wantAttempts: 1,
+		},
+		{
+			name:         "caller deadline already passed",
+			ended:        context.DeadlineExceeded,
+			wantErr:      context.DeadlineExceeded,
+			wantAttempts: 1,
+		},
+		{
 			name:         "container that does not exist is not tried again",
 			results:      []error{notFoundError("No such container")},
 			wantErr:      cerrdefs.ErrNotFound,
@@ -2530,18 +2643,33 @@ func TestGetCurrentWatchtowerContainer_Retries(t *testing.T) {
 						Return(inspect, result).Once()
 				}
 
+				if tt.ended != nil {
+					api.EXPECT().ContainerInspect(mock.Anything, testContainerID, dockerClient.ContainerInspectOptions{}).
+						RunAndReturn(func(ctx context.Context, _ string, _ dockerClient.ContainerInspectOptions) (dockerClient.ContainerInspectResult, error) {
+							return dockerClient.ContainerInspectResult{}, ctx.Err()
+						}).Once()
+				}
+
 				ctx := t.Context()
 
-				if tt.deadline > 0 {
-					var cancel context.CancelFunc
+				var cancel context.CancelFunc
 
+				switch {
+				case tt.deadline > 0:
 					ctx, cancel = context.WithTimeout(ctx, tt.deadline)
 					defer cancel()
+				case errors.Is(tt.ended, context.Canceled):
+					ctx, cancel = context.WithCancel(ctx)
+					cancel()
+				case errors.Is(tt.ended, context.DeadlineExceeded):
+					ctx, cancel = context.WithDeadline(ctx, time.Now())
+					defer cancel()
+				default:
 				}
 
 				start := time.Now()
 
-				current, err := (&client{log: newTestLogger(t), api: api}).GetCurrentWatchtowerContainer(ctx, testContainerID)
+				current, err := (&Client{log: newTestLogger(t), api: api}).GetCurrentWatchtowerContainer(ctx, testContainerID)
 
 				assert.Equal(t, tt.wantWait, time.Since(start))
 				assert.Len(t, api.Calls, tt.wantAttempts)
@@ -2554,7 +2682,7 @@ func TestGetCurrentWatchtowerContainer_Retries(t *testing.T) {
 				}
 
 				require.NoError(t, err)
-				assert.Equal(t, types.ContainerID(testContainerID), current.ID())
+				assert.Equal(t, container.ContainerID(testContainerID), current.ID())
 			})
 		})
 	}

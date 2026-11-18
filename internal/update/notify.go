@@ -10,7 +10,6 @@ import (
 
 	"github.com/rs/zerolog"
 
-	containerClient "github.com/nicholas-fedor/watchtower/internal/container/client"
 	"github.com/nicholas-fedor/watchtower/internal/git"
 	"github.com/nicholas-fedor/watchtower/internal/observability/events"
 	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
@@ -19,7 +18,6 @@ import (
 	"github.com/nicholas-fedor/watchtower/internal/update/cleanup"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/internal/update/state"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // Notifier sends the notifications of an update session.
@@ -44,7 +42,7 @@ type Notifier interface {
 // process configuration.
 type RunUpdatesWithNotificationsParams struct {
 	// Client is the Docker client for container operations.
-	Client containerClient.Client
+	Client Client
 	// Notifier sends update status messages to configured channels.
 	Notifier Notifier
 	// Logger is the process logger for this update session. Required and must be non-nil.
@@ -104,6 +102,11 @@ func (e reportedError) Unwrap() error {
 // logged and sent with the session's notification batch. Subscribers get
 // scan_failed, and the returned metric marks a failed scan.
 //
+// A session that starts after the process was told to stop makes no update.
+// When ctx is already canceled, it does nothing and returns nil, so it is not
+// reported as a failed scan. A ctx past its deadline still runs and fails, since a timeout is a
+// failure the caller should see.
+//
 // Parameters:
 //   - ctx: Context for cancellation and timeouts.
 //   - params: The RunUpdatesWithNotificationsParams struct containing all configuration parameters.
@@ -111,6 +114,7 @@ func (e reportedError) Unwrap() error {
 //
 // Returns:
 //   - *metrics.Metric: A pointer to a metric object summarizing the update session (scanned, updated, failed counts).
+//     Nil when ctx was already canceled.
 //
 //nolint:nonamedreturns // The deferred recover sets the result.
 func RunUpdatesWithNotifications(
@@ -120,6 +124,12 @@ func RunUpdatesWithNotifications(
 	log := params.Logger
 
 	log.Debug().Msg("Starting RunUpdatesWithNotifications")
+
+	if errors.Is(ctx.Err(), context.Canceled) {
+		log.Debug().Err(ctx.Err()).Msg("Update skipped: shutting down")
+
+		return nil
+	}
 
 	// The session owns its batch and sends its reports through it. It ends the
 	// batch on every return. The end sends what no notification took, without
@@ -384,7 +394,7 @@ func endPanickedSession(
 func executeUpdate(
 	log *zerolog.Logger,
 	ctx context.Context,
-	client containerClient.Client,
+	client Client,
 	config updateParams.Params,
 	rateLimiter *ratelimit.Limiter,
 	gitClient *git.Client,
@@ -419,7 +429,7 @@ func executeUpdate(
 // Returns:
 //   - []cleanup.RemovedImageInfo: Slice of successfully cleaned image info.
 func performImageCleanup(log *zerolog.Logger, ctx context.Context,
-	client containerClient.Client,
+	client Client,
 	enabled bool,
 	cleanupImageInfos []cleanup.RemovedImageInfo,
 	timeout time.Duration,
@@ -536,21 +546,19 @@ func sendSplitNotifications(log *zerolog.Logger, notify func(*state.Report),
 		Msg("Split notifications: container counts by category")
 
 	// inCooldown reports whether a skipped container waits out its update cooldown.
-	inCooldown := func(r types.ContainerReport) bool {
-		status, ok := r.(*state.ContainerStatus)
-
-		return ok && status.CooldownDelay() != ""
+	inCooldown := func(status *state.ContainerStatus) bool {
+		return status.CooldownDelay() != ""
 	}
 
 	passes := []struct {
-		include  func(types.ContainerReport) bool
+		include  func(*state.ContainerStatus) bool
 		category string
-		reports  []types.ContainerReport
+		reports  []*state.ContainerStatus
 	}{
 		{include: nil, category: "updated", reports: result.Updated()},
 		{include: nil, category: "restarted", reports: result.Restarted()},
 		{include: nil, category: "failed", reports: result.Failed()},
-		{include: types.ContainerReport.IsMonitorOnly, category: "monitor-only stale", reports: result.Stale()},
+		{include: (*state.ContainerStatus).IsMonitorOnly, category: "monitor-only stale", reports: result.Stale()},
 		{include: inCooldown, category: "cooldown-skipped", reports: result.Skipped()},
 	}
 
@@ -574,9 +582,9 @@ type notifyContainersParams struct {
 	result        *state.Report
 	notify        func(*state.Report)
 	log           *zerolog.Logger
-	include       func(types.ContainerReport) bool
+	include       func(*state.ContainerStatus) bool
 	category      string
-	reports       []types.ContainerReport
+	reports       []*state.ContainerStatus
 	logBeforeSend bool
 }
 

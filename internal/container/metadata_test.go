@@ -17,7 +17,6 @@ import (
 	updateConfig "github.com/nicholas-fedor/watchtower/internal/settings/config/update"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/containerfixture"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/logcapture"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 func TestContainer_GetLifecyclePreCheckCommand(t *testing.T) {
@@ -653,6 +652,50 @@ func TestContainer_IsWatchtower(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+// TestContainer_IsEphemeralOrchestrator verifies that only the exact value
+// "true" marks an orchestrator, since cleanup removes the containers it marks.
+func TestContainer_IsEphemeralOrchestrator(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		containerLabels map[string]string
+		want            bool
+	}{
+		{name: "true", containerLabels: map[string]string{labels.EphemeralOrchestrator: "true"}, want: true},
+		{name: "false", containerLabels: map[string]string{labels.EphemeralOrchestrator: "false"}, want: false},
+		{name: "other spelling of true", containerLabels: map[string]string{labels.EphemeralOrchestrator: "TRUE"}, want: false},
+		{name: "label missing", containerLabels: map[string]string{labels.Watchtower: "true"}, want: false},
+		{name: "no labels", containerLabels: nil, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			c := &Container{containerInfo: &dockerContainer.InspectResponse{
+				Config: &dockerContainer.Config{Labels: tt.containerLabels},
+			}}
+
+			assert.Equal(t, tt.want, c.IsEphemeralOrchestrator())
+		})
+	}
+
+	t.Run("no inspect data", func(t *testing.T) {
+		t.Parallel()
+
+		assert.False(t, (&Container{}).IsEphemeralOrchestrator())
+	})
+
+	t.Run("no config", func(t *testing.T) {
+		t.Parallel()
+
+		c := &Container{containerInfo: &dockerContainer.InspectResponse{}}
+
+		assert.False(t, c.IsEphemeralOrchestrator())
+	})
 }
 
 func TestContainer_StopSignal(t *testing.T) {
@@ -1376,90 +1419,90 @@ func TestContainer_GetContainerChain(t *testing.T) {
 	}
 }
 
-func TestGetEffectiveScope(t *testing.T) {
+// TestContainer_ChainIDs verifies that the chain label is read as the IDs of
+// the replaced instances in order, with whitespace trimmed and empty entries
+// left out, and that a container without a chain lists none.
+func TestContainer_ChainIDs(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
-		name          string
-		initialScope  string
-		container     *Container
-		expectedScope string
-		expectedError bool
+		name string
+		// labels are the container's labels.
+		labels map[string]string
+		want   []ContainerID
 	}{
+		{name: "no chain label", labels: map[string]string{}, want: nil},
+		{name: "empty chain label", labels: map[string]string{labels.ContainerChain: ""}, want: nil},
+		{name: "one ID", labels: map[string]string{labels.ContainerChain: "first-id"}, want: []ContainerID{"first-id"}},
 		{
-			name:          "scope already set - should return initial scope",
-			initialScope:  "preset",
-			container:     nil,
-			expectedScope: "preset",
-			expectedError: false,
+			name:   "IDs in order",
+			labels: map[string]string{labels.ContainerChain: "first-id,second-id,third-id"},
+			want:   []ContainerID{"first-id", "second-id", "third-id"},
 		},
 		{
-			name:         "container has no scope label - should return initial scope",
-			initialScope: "",
-			container: &Container{
-				containerInfo: &dockerContainer.InspectResponse{
-					Name: "/test-container",
-					Config: &dockerContainer.Config{
-						Labels: map[string]string{},
-					},
-				},
-			},
-			expectedScope: "",
-			expectedError: false,
+			name:   "spaces around commas",
+			labels: map[string]string{labels.ContainerChain: "first-id, second-id , third-id"},
+			want:   []ContainerID{"first-id", "second-id", "third-id"},
 		},
 		{
-			name:         "container has empty scope label - should return initial scope",
-			initialScope: "",
-			container: &Container{
-				containerInfo: &dockerContainer.InspectResponse{
-					Name: "/test-container",
-					Config: &dockerContainer.Config{
-						Labels: map[string]string{
-							labels.Scope: "",
-						},
-					},
-				},
-			},
-			expectedScope: "",
-			expectedError: false,
-		},
-		{
-			name:         "container has valid scope label - should return derived scope",
-			initialScope: "",
-			container: &Container{
-				containerInfo: &dockerContainer.InspectResponse{
-					Name: "/test-container",
-					Config: &dockerContainer.Config{
-						Labels: map[string]string{
-							labels.Scope: "production",
-						},
-					},
-				},
-			},
-			expectedScope: "production",
-			expectedError: false,
+			name:   "empty entries",
+			labels: map[string]string{labels.ContainerChain: ",first-id,, ,second-id,"},
+			want:   []ContainerID{"first-id", "second-id"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Execute function under test
-			result, err := GetEffectiveScope(tt.container, tt.initialScope)
+			t.Parallel()
 
-			// Assert results
-			if tt.expectedError {
-				require.Error(t, err)
-			} else {
-				require.NoError(t, err)
+			c := &Container{
+				containerInfo: &dockerContainer.InspectResponse{
+					ID:     "current-id",
+					Name:   "/watchtower",
+					Config: &dockerContainer.Config{Labels: tt.labels},
+				},
 			}
 
-			assert.Equal(t, tt.expectedScope, result)
+			assert.Equal(t, tt.want, c.ChainIDs())
 		})
 	}
 }
 
-func TestGetEffectiveScope_NilContainer(t *testing.T) {
-	_, err := GetEffectiveScope(nil, "")
-	require.Error(t, err)
-	assert.ErrorIs(t, err, errCurrentContainerNotCached)
+// TestContainer_SuccessorChain verifies that a replacement's chain lists the
+// replaced container's chain followed by that container's own ID.
+func TestContainer_SuccessorChain(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		// chain is the replaced container's chain label, or empty for none.
+		chain string
+		want  string
+	}{
+		{name: "first self-update", want: "current-id"},
+		{name: "later self-update", chain: "first-id,second-id", want: "first-id,second-id,current-id"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			containerLabels := map[string]string{}
+			if tt.chain != "" {
+				containerLabels[labels.ContainerChain] = tt.chain
+			}
+
+			c := &Container{
+				containerInfo: &dockerContainer.InspectResponse{
+					ID:     "current-id",
+					Name:   "/watchtower",
+					Config: &dockerContainer.Config{Labels: containerLabels},
+				},
+			}
+
+			assert.Equal(t, tt.want, c.SuccessorChain())
+		})
+	}
 }
 
 // cooldownTestContainer creates a test Container with the given cooldown delay label value.
@@ -1580,132 +1623,6 @@ func TestContainer_CooldownDelay(t *testing.T) {
 	}
 }
 
-func TestGetEffectiveScope_NoneScopeEdgeCases(t *testing.T) {
-	tests := []struct {
-		name          string
-		initialScope  string
-		container     *Container
-		expectedScope string
-		expectedError bool
-		description   string
-	}{
-		{
-			name:         "explicit_none_scope_inheritance",
-			initialScope: "",
-			container: &Container{
-				containerInfo: &dockerContainer.InspectResponse{
-					Name: "/test-container",
-					Config: &dockerContainer.Config{
-						Labels: map[string]string{
-							labels.Scope: "none",
-						},
-					},
-				},
-			},
-			expectedScope: "none",
-			expectedError: false,
-			description:   "container with explicit 'none' scope should inherit it when initial scope is empty",
-		},
-		{
-			name:         "explicit_none_scope_precedence",
-			initialScope: "preset",
-			container: &Container{
-				containerInfo: &dockerContainer.InspectResponse{
-					Name: "/test-container",
-					Config: &dockerContainer.Config{
-						Labels: map[string]string{
-							labels.Scope: "none",
-						},
-					},
-				},
-			},
-			expectedScope: "preset",
-			expectedError: false,
-			description:   "explicit initial scope should take precedence over container's 'none' scope",
-		},
-		{
-			name:         "implicit_unscoped_defaults_to_empty",
-			initialScope: "",
-			container: &Container{
-				containerInfo: &dockerContainer.InspectResponse{
-					Name: "/test-container",
-					Config: &dockerContainer.Config{
-						Labels: map[string]string{},
-					},
-				},
-			},
-			expectedScope: "",
-			expectedError: false,
-			description:   "truly unscoped container should return empty scope when no initial scope set",
-		},
-		{
-			name:         "explicit_empty_scope_vs_none_scope",
-			initialScope: "",
-			container: &Container{
-				containerInfo: &dockerContainer.InspectResponse{
-					Name: "/test-container",
-					Config: &dockerContainer.Config{
-						Labels: map[string]string{
-							labels.Scope: "", // explicitly empty
-						},
-					},
-				},
-			},
-			expectedScope: "",
-			expectedError: false,
-			description:   "explicitly empty scope label should not be inherited, returning initial empty scope",
-		},
-		{
-			name:         "transition_from_scoped_to_none",
-			initialScope: "",
-			container: &Container{
-				containerInfo: &dockerContainer.InspectResponse{
-					Name: "/test-container",
-					Config: &dockerContainer.Config{
-						Labels: map[string]string{
-							labels.Scope: "none", // transitioning to none
-						},
-					},
-				},
-			},
-			expectedScope: "none",
-			expectedError: false,
-			description:   "container transitioning from scoped to 'none' should inherit the 'none' scope",
-		},
-		{
-			name:         "none_scope_with_initial_scope_set",
-			initialScope: "production",
-			container: &Container{
-				containerInfo: &dockerContainer.InspectResponse{
-					Name: "/test-container",
-					Config: &dockerContainer.Config{
-						Labels: map[string]string{
-							labels.Scope: "none",
-						},
-					},
-				},
-			},
-			expectedScope: "production",
-			expectedError: false,
-			description:   "initial scope takes precedence even when container has 'none' scope",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := GetEffectiveScope(tt.container, tt.initialScope)
-
-			if tt.expectedError {
-				require.Error(t, err, tt.description)
-			} else {
-				require.NoError(t, err, tt.description)
-			}
-
-			assert.Equal(t, tt.expectedScope, result, tt.description)
-		})
-	}
-}
-
 // TestContainer_IsWatchtower_DoesNotLog verifies that checking whether a
 // container is Watchtower writes no log entries, even at debug level, since
 // a scan checks every container many times.
@@ -1743,110 +1660,21 @@ func TestContainer_IsWatchtower_DoesNotLog(t *testing.T) {
 	}
 }
 
-func TestIsWatchtowerParent(t *testing.T) {
-	t.Parallel()
-
-	t.Run("should return false for empty chain", func(t *testing.T) {
-		t.Parallel()
-
-		result := IsWatchtowerParent(types.ContainerID("test-id"), "")
-		assert.False(t, result)
-	})
-
-	t.Run("should return false for empty ID", func(t *testing.T) {
-		t.Parallel()
-
-		result := IsWatchtowerParent(types.ContainerID(""), "id1,id2")
-		assert.False(t, result)
-	})
-
-	t.Run("should return true when ID is at start of chain", func(t *testing.T) {
-		t.Parallel()
-
-		result := IsWatchtowerParent(types.ContainerID("test-id"), "test-id,id2,id3")
-		assert.True(t, result)
-	})
-
-	t.Run("should return true when ID is in middle of chain", func(t *testing.T) {
-		t.Parallel()
-
-		result := IsWatchtowerParent(types.ContainerID("id2"), "id1,id2,id3")
-		assert.True(t, result)
-	})
-
-	t.Run("should return true when ID is at end of chain", func(t *testing.T) {
-		t.Parallel()
-
-		result := IsWatchtowerParent(types.ContainerID("id3"), "id1,id2,id3")
-		assert.True(t, result)
-	})
-
-	t.Run("should return true for single ID chain", func(t *testing.T) {
-		t.Parallel()
-
-		result := IsWatchtowerParent(types.ContainerID("test-id"), "test-id")
-		assert.True(t, result)
-	})
-
-	t.Run("should return false when ID is not in chain", func(t *testing.T) {
-		t.Parallel()
-
-		result := IsWatchtowerParent(types.ContainerID("test-id"), "id1,id2,id3")
-		assert.False(t, result)
-	})
-
-	t.Run("should handle chains with spaces around commas", func(t *testing.T) {
-		t.Parallel()
-
-		result := IsWatchtowerParent(types.ContainerID("id2"), "id1, id2 , id3")
-		assert.True(t, result)
-	})
-}
-
-// TestIsSuperseded verifies which running Watchtower containers a self-update
-// has replaced: a predecessor renamed with the "watchtower-old-" prefix, with
-// or without the leading slash Docker reports, and a container whose chain
-// label lists it as a parent.
+// TestIsSuperseded verifies that a Watchtower container counts as replaced by
+// a self-update only when it carries the watchtower-old- name prefix.
 func TestIsSuperseded(t *testing.T) {
 	t.Parallel()
 
-	const id = "test-container-id"
-
-	withChain := func(chain string) containerfixture.Update {
-		return containerfixture.WithLabels(map[string]string{labels.ContainerChain: chain})
-	}
-
 	tests := []struct {
 		name      string
-		container types.Container
+		container *Container
 		want      bool
 	}{
 		{name: "no container", container: nil, want: false},
-		{
-			name:      "current container",
-			container: MockContainer(containerfixture.WithID(id), containerfixture.WithName("/watchtower")),
-			want:      false,
-		},
-		{
-			name: "chain without the container",
-			container: MockContainer(containerfixture.WithID(id), containerfixture.WithName("/watchtower"),
-				withChain("other-id")),
-			want: false,
-		},
-		{
-			name: "parent in the chain",
-			container: MockContainer(containerfixture.WithID(id), containerfixture.WithName("/watchtower"),
-				withChain(id+",parent-id")),
-			want: true,
-		},
+		{name: "current container", container: MockContainer(containerfixture.WithName("/watchtower")), want: false},
 		{
 			name:      "renamed predecessor",
-			container: MockContainer(containerfixture.WithID(id), containerfixture.WithName("watchtower-old-abc123")),
-			want:      true,
-		},
-		{
-			name:      "renamed predecessor with a leading slash",
-			container: MockContainer(containerfixture.WithID(id), containerfixture.WithName("/watchtower-old-def456")),
+			container: MockContainer(containerfixture.WithName("/watchtower-old-def456")),
 			want:      true,
 		},
 	}
@@ -1889,9 +1717,10 @@ func TestNormalizedScope(t *testing.T) {
 
 // TestIsOrphanedReplacement verifies which containers count as replacements
 // that an interrupted self-update left in the created state. Only a created
-// Watchtower container in the current container's scope counts, unless it is
-// the current container or a renamed predecessor. An unset scope label and an
-// empty one are the same scope.
+// Watchtower container in the given scope or with the current container in its
+// chain label counts, unless it is the current container or a renamed
+// predecessor. An unset scope label, an empty one and an empty scope are the
+// same scope.
 func TestIsOrphanedReplacement(t *testing.T) {
 	t.Parallel()
 
@@ -1906,50 +1735,82 @@ func TestIsOrphanedReplacement(t *testing.T) {
 		return containerfixture.WithLabels(containerLabels)
 	}
 
-	current := MockContainer(containerfixture.WithID("current"), containerfixture.WithName("/watchtower"), running,
-		watchtower(""))
+	const currentID = ContainerID("current")
 
 	tests := []struct {
 		name      string
-		candidate types.Container
+		candidate *Container
+		scope     string
 		want      bool
 	}{
 		{
 			name:      "created Watchtower container in the same scope",
 			candidate: MockContainer(containerfixture.WithID("new"), containerfixture.WithName("/watchtower-new"), created, watchtower("")),
+			scope:     "",
 			want:      true,
 		},
 		{
 			name: "empty scope label matches an unset one",
 			candidate: MockContainer(containerfixture.WithID("new"), containerfixture.WithName("/watchtower-new"), created,
 				containerfixture.WithLabels(map[string]string{labels.Watchtower: "true", labels.Scope: ""})),
-			want: true,
+			scope: "",
+			want:  true,
 		},
 		{
-			name:      "different scope",
+			name:      "an unscoped container is in the scope none",
+			candidate: MockContainer(containerfixture.WithID("new"), containerfixture.WithName("/watchtower-new"), created, watchtower("")),
+			scope:     labels.NoScope,
+			want:      true,
+		},
+		{
+			name:      "created Watchtower container in a named scope",
 			candidate: MockContainer(containerfixture.WithID("new"), containerfixture.WithName("/watchtower-new"), created, watchtower("prod")),
+			scope:     "prod",
+			want:      true,
+		},
+		{
+			name:      "scoped candidate outside an empty scope",
+			candidate: MockContainer(containerfixture.WithID("new"), containerfixture.WithName("/watchtower-new"), created, watchtower("prod")),
+			scope:     "",
 			want:      false,
+		},
+		{
+			name:      "unscoped candidate outside a named scope",
+			candidate: MockContainer(containerfixture.WithID("new"), containerfixture.WithName("/watchtower-new"), created, watchtower("")),
+			scope:     "prod",
+			want:      false,
+		},
+		{
+			name: "replacement of the current container outside the scope",
+			candidate: MockContainer(containerfixture.WithID("new"), containerfixture.WithName("/watchtower-new"), created,
+				containerfixture.WithLabels(map[string]string{labels.Watchtower: "true", labels.ContainerChain: "older," + string(currentID)})),
+			scope: "prod",
+			want:  true,
 		},
 		{
 			name:      "not created",
 			candidate: MockContainer(containerfixture.WithID("new"), containerfixture.WithName("/watchtower-new"), running, watchtower("")),
+			scope:     "",
 			want:      false,
 		},
 		{
 			name: "not a Watchtower container",
 			candidate: MockContainer(containerfixture.WithID("new"), containerfixture.WithName("/app"), created,
 				containerfixture.WithLabels(map[string]string{})),
-			want: false,
+			scope: "",
+			want:  false,
 		},
 		{
 			name: "renamed predecessor",
 			candidate: MockContainer(containerfixture.WithID("old"), containerfixture.WithName("/watchtower-old-abc123"), created,
 				watchtower("")),
-			want: false,
+			scope: "",
+			want:  false,
 		},
 		{
 			name:      "the current container",
-			candidate: MockContainer(containerfixture.WithID("current"), containerfixture.WithName("/watchtower"), created, watchtower("")),
+			candidate: MockContainer(containerfixture.WithID(string(currentID)), containerfixture.WithName("/watchtower"), created, watchtower("")),
+			scope:     "",
 			want:      false,
 		},
 	}
@@ -1958,7 +1819,7 @@ func TestIsOrphanedReplacement(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			assert.Equal(t, tt.want, IsOrphanedReplacement(tt.candidate, current))
+			assert.Equal(t, tt.want, IsOrphanedReplacement(tt.candidate, currentID, tt.scope))
 		})
 	}
 }

@@ -9,12 +9,14 @@ import (
 	"github.com/stretchr/testify/require"
 
 	dockerContainer "github.com/moby/moby/api/types/container"
+	dockerImage "github.com/moby/moby/api/types/image"
 
+	"github.com/nicholas-fedor/watchtower/internal/container"
+	"github.com/nicholas-fedor/watchtower/internal/testutil/containerfixture"
+	"github.com/nicholas-fedor/watchtower/internal/testutil/modelfixture"
 	mockUpdate "github.com/nicholas-fedor/watchtower/internal/update/mocks"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/internal/update/state"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
-	mockTypes "github.com/nicholas-fedor/watchtower/pkg/types/mocks"
 )
 
 // Watchtower container IDs for the self-update cases.
@@ -53,7 +55,7 @@ func TestShouldUpdate(t *testing.T) {
 		t.Parallel()
 
 		currentID := currentWatchtowerID
-		container := mockUpdate.CreateMockContainerWithConfig(
+		c := mockUpdate.CreateMockContainerWithConfig(
 			currentID,
 			"watchtower-current",
 			"watchtower:latest",
@@ -67,9 +69,9 @@ func TestShouldUpdate(t *testing.T) {
 			},
 		)
 		params := updateParams.Params{
-			CurrentContainerID: types.ContainerID(currentID),
+			CurrentContainerID: container.ContainerID(currentID),
 		}
-		result := ShouldUpdate(container, true, params)
+		result := ShouldUpdate(c, true, params)
 		assert.True(t, result)
 	})
 
@@ -78,7 +80,7 @@ func TestShouldUpdate(t *testing.T) {
 
 		currentID := currentWatchtowerID
 		otherID := otherWatchtowerID
-		container := mockUpdate.CreateMockContainerWithConfig(
+		c := mockUpdate.CreateMockContainerWithConfig(
 			otherID,
 			"watchtower-other",
 			"watchtower:latest",
@@ -92,9 +94,9 @@ func TestShouldUpdate(t *testing.T) {
 			},
 		)
 		params := updateParams.Params{
-			CurrentContainerID: types.ContainerID(currentID),
+			CurrentContainerID: container.ContainerID(currentID),
 		}
-		result := ShouldUpdate(container, true, params)
+		result := ShouldUpdate(c, true, params)
 		assert.False(t, result)
 	})
 
@@ -102,7 +104,7 @@ func TestShouldUpdate(t *testing.T) {
 		t.Parallel()
 
 		currentID := currentWatchtowerID
-		container := mockUpdate.CreateMockContainerWithConfig(
+		c := mockUpdate.CreateMockContainerWithConfig(
 			"non-watchtower-id",
 			"nginx",
 			"nginx:latest",
@@ -114,9 +116,9 @@ func TestShouldUpdate(t *testing.T) {
 			},
 		)
 		params := updateParams.Params{
-			CurrentContainerID: types.ContainerID(currentID),
+			CurrentContainerID: container.ContainerID(currentID),
 		}
-		result := ShouldUpdate(container, true, params)
+		result := ShouldUpdate(c, true, params)
 		assert.True(t, result)
 	})
 
@@ -124,7 +126,7 @@ func TestShouldUpdate(t *testing.T) {
 		t.Parallel()
 
 		currentID := currentWatchtowerID
-		container := mockUpdate.CreateMockContainerWithConfig(
+		c := mockUpdate.CreateMockContainerWithConfig(
 			currentID,
 			"watchtower-current",
 			"watchtower:latest",
@@ -139,9 +141,9 @@ func TestShouldUpdate(t *testing.T) {
 			},
 		)
 		params := updateParams.Params{
-			CurrentContainerID: types.ContainerID(currentID),
+			CurrentContainerID: container.ContainerID(currentID),
 		}
-		result := ShouldUpdate(container, true, params)
+		result := ShouldUpdate(c, true, params)
 		assert.True(t, result)
 	})
 
@@ -150,7 +152,7 @@ func TestShouldUpdate(t *testing.T) {
 
 		currentID := currentWatchtowerID
 		otherID := otherWatchtowerID
-		container := mockUpdate.CreateMockContainerWithConfig(
+		c := mockUpdate.CreateMockContainerWithConfig(
 			otherID,
 			"watchtower-other",
 			"watchtower:latest",
@@ -165,16 +167,16 @@ func TestShouldUpdate(t *testing.T) {
 			},
 		)
 		params := updateParams.Params{
-			CurrentContainerID: types.ContainerID(currentID),
+			CurrentContainerID: container.ContainerID(currentID),
 		}
-		result := ShouldUpdate(container, true, params)
+		result := ShouldUpdate(c, true, params)
 		assert.False(t, result)
 	})
 
 	t.Run("should allow update of non-Watchtower containers when NoRestart is true", func(t *testing.T) {
 		t.Parallel()
 
-		container := mockUpdate.CreateMockContainerWithConfig(
+		c := mockUpdate.CreateMockContainerWithConfig(
 			"non-watchtower-id",
 			"nginx",
 			"nginx:latest",
@@ -188,7 +190,7 @@ func TestShouldUpdate(t *testing.T) {
 		params := updateParams.Params{
 			NoRestart: true,
 		}
-		result := ShouldUpdate(container, true, params)
+		result := ShouldUpdate(c, true, params)
 		assert.True(t, result)
 	})
 
@@ -196,7 +198,7 @@ func TestShouldUpdate(t *testing.T) {
 		t.Parallel()
 
 		currentID := currentWatchtowerID
-		container := mockUpdate.CreateMockContainerWithConfig(
+		c := mockUpdate.CreateMockContainerWithConfig(
 			currentID,
 			"watchtower-current",
 			"watchtower:latest",
@@ -211,9 +213,9 @@ func TestShouldUpdate(t *testing.T) {
 		)
 		params := updateParams.Params{
 			NoRestart:          true,
-			CurrentContainerID: types.ContainerID(currentID),
+			CurrentContainerID: container.ContainerID(currentID),
 		}
-		result := ShouldUpdate(container, true, params)
+		result := ShouldUpdate(c, true, params)
 		assert.True(t, result)
 	})
 }
@@ -246,7 +248,7 @@ func TestIsPinned(t *testing.T) {
 
 				image, wantPinned := tt.image, tt.wantPinned
 
-				cont := mockUpdate.CreateMockContainer(
+				c := mockUpdate.CreateMockContainer(
 					"id1",
 					"/name",
 					image,
@@ -255,7 +257,7 @@ func TestIsPinned(t *testing.T) {
 				progress := state.Progress{}
 				params := updateParams.Params{}
 
-				pinned, err := IsPinned(newTestLogger(t), cont, &progress, params, nil)
+				pinned, err := IsPinned(newTestLogger(t), c, &progress, params, nil)
 				require.NoError(t, err)
 				assert.Equal(t, wantPinned, pinned)
 
@@ -272,7 +274,7 @@ func TestIsPinned(t *testing.T) {
 		t.Parallel()
 
 		// ImageName is a valid digest pin. Even if parse were flaky, pin must win.
-		cont := mockUpdate.CreateMockContainer(
+		c := mockUpdate.CreateMockContainer(
 			"pinned-id",
 			"/pinned-name",
 			"library/nginx@"+fullDigest,
@@ -280,7 +282,7 @@ func TestIsPinned(t *testing.T) {
 		)
 		progress := state.Progress{}
 
-		pinned, err := IsPinned(newTestLogger(t), cont, &progress, updateParams.Params{}, nil)
+		pinned, err := IsPinned(newTestLogger(t), c, &progress, updateParams.Params{}, nil)
 		require.NoError(t, err)
 		assert.True(t, pinned)
 		require.Len(t, progress, 1)
@@ -289,7 +291,7 @@ func TestIsPinned(t *testing.T) {
 	t.Run("returns error for unresolvable invalid image names", func(t *testing.T) {
 		t.Parallel()
 
-		cont := mockUpdate.CreateMockContainer(
+		c := mockUpdate.CreateMockContainer(
 			"InvalidContainer",
 			"/InvalidContainer",
 			":latest",
@@ -297,7 +299,7 @@ func TestIsPinned(t *testing.T) {
 		)
 		progress := state.Progress{}
 
-		pinned, err := IsPinned(newTestLogger(t), cont, &progress, updateParams.Params{}, nil)
+		pinned, err := IsPinned(newTestLogger(t), c, &progress, updateParams.Params{}, nil)
 		require.Error(t, err)
 		assert.False(t, pinned)
 		assert.Empty(t, progress)
@@ -308,7 +310,7 @@ func TestIsPinned(t *testing.T) {
 
 		// The image name does not parse, so IsPinned falls back to the
 		// container name. The fallback sha256:latest is a tag, not a digest.
-		cont := mockUpdate.CreateMockContainer(
+		c := mockUpdate.CreateMockContainer(
 			"sha256-name-id",
 			"/sha256",
 			"Nginx:latest",
@@ -316,7 +318,7 @@ func TestIsPinned(t *testing.T) {
 		)
 		progress := state.Progress{}
 
-		pinned, err := IsPinned(newTestLogger(t), cont, &progress, updateParams.Params{}, nil)
+		pinned, err := IsPinned(newTestLogger(t), c, &progress, updateParams.Params{}, nil)
 		require.NoError(t, err)
 		assert.False(t, pinned)
 		assert.Empty(t, progress)
@@ -325,16 +327,16 @@ func TestIsPinned(t *testing.T) {
 	t.Run("does not panic when ContainerInfo Config is nil", func(t *testing.T) {
 		t.Parallel()
 
-		cont := mockTypes.NewMockContainer(t)
-		cont.On("Name").Return("/nil-config")
-		cont.On("ImageName").Return("nginx:latest")
-		cont.On("ContainerInfo").Return(&dockerContainer.InspectResponse{
-			Config: nil,
-		})
+		c := modelfixture.Container(
+			containerfixture.WithName("/nil-config"),
+			func(c *dockerContainer.InspectResponse, _ *dockerImage.InspectResponse) {
+				c.Config = nil
+			},
+		)
 
 		progress := state.Progress{}
 
-		pinned, err := IsPinned(newTestLogger(t), cont, &progress, updateParams.Params{}, nil)
+		pinned, err := IsPinned(newTestLogger(t), c, &progress, updateParams.Params{}, nil)
 		require.NoError(t, err)
 		assert.False(t, pinned)
 	})

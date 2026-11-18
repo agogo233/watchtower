@@ -6,8 +6,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/nicholas-fedor/watchtower/internal/container"
+	"github.com/nicholas-fedor/watchtower/internal/container/provenance"
 	"github.com/nicholas-fedor/watchtower/internal/update/state"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // TestReport verifies that each state puts its container in the matching
@@ -33,7 +34,7 @@ func TestReport(t *testing.T) {
 	require.Len(t, report.Stale(), 1)
 	assert.True(t, report.Stale()[0].IsMonitorOnly())
 
-	ids := map[types.ContainerID]bool{}
+	ids := map[container.ContainerID]bool{}
 	for _, c := range report.All() {
 		assert.False(t, ids[c.ID()], "duplicate container ID %s", c.ID())
 		ids[c.ID()] = true
@@ -50,10 +51,11 @@ func TestUpdatedReport(t *testing.T) {
 
 	c, newImage := Container(0, state.UpdatedState)
 
-	report := UpdatedReport(c, newImage)
+	report := UpdatedReport(c, newImage, provenance.ReportMeta{GitRef: "v1.2.3"})
 	require.Len(t, report.Updated(), 1)
 	assert.Equal(t, c.ID(), report.Updated()[0].ID())
 	assert.Equal(t, newImage, report.Updated()[0].LatestImageID())
+	assert.Equal(t, "v1.2.3", report.Updated()[0].GitRef())
 	assert.Len(t, report.Scanned(), 1)
 }
 

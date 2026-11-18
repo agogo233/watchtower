@@ -8,12 +8,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	containerClient "github.com/nicholas-fedor/watchtower/internal/container/client"
 	"github.com/nicholas-fedor/watchtower/internal/container/filters"
 	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
 	"github.com/nicholas-fedor/watchtower/internal/registry/ratelimit"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/logcapture"
 	mockUpdate "github.com/nicholas-fedor/watchtower/internal/update/mocks"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // TestImageDiskSpaceGate verifies that an update warns about image disk usage
@@ -25,7 +25,7 @@ func TestImageDiskSpaceGate(t *testing.T) {
 	t.Run("skips the check when both thresholds are unset", func(t *testing.T) {
 		t.Parallel()
 
-		client := mockUpdate.CreateMockClient(&mockUpdate.TestData{}, false, false)
+		client := mockUpdate.CreateFakeClient(&mockUpdate.TestData{}, false, false)
 
 		_, _, err := update(
 			newTestLogger(t),
@@ -42,8 +42,8 @@ func TestImageDiskSpaceGate(t *testing.T) {
 	t.Run("continues when usage is below the warning threshold", func(t *testing.T) {
 		t.Parallel()
 
-		client := mockUpdate.CreateMockClient(&mockUpdate.TestData{
-			ImageDiskUsage: types.ImageDiskUsage{TotalSize: 1_000, TotalCount: 1},
+		client := mockUpdate.CreateFakeClient(&mockUpdate.TestData{
+			ImageDiskUsage: containerClient.ImageDiskUsage{TotalSize: 1_000, TotalCount: 1},
 		}, false, false)
 
 		params := defaultTestUpdateParams(filters.NoFilter)
@@ -59,8 +59,8 @@ func TestImageDiskSpaceGate(t *testing.T) {
 	t.Run("warns and continues when usage reaches the warning threshold", func(t *testing.T) {
 		t.Parallel()
 
-		client := mockUpdate.CreateMockClient(&mockUpdate.TestData{
-			ImageDiskUsage: types.ImageDiskUsage{TotalSize: 8_000, TotalCount: 2},
+		client := mockUpdate.CreateFakeClient(&mockUpdate.TestData{
+			ImageDiskUsage: containerClient.ImageDiskUsage{TotalSize: 8_000, TotalCount: 2},
 		}, false, false)
 
 		params := defaultTestUpdateParams(filters.NoFilter)
@@ -78,8 +78,8 @@ func TestImageDiskSpaceGate(t *testing.T) {
 	t.Run("allows warn-only mode without blocking", func(t *testing.T) {
 		t.Parallel()
 
-		client := mockUpdate.CreateMockClient(&mockUpdate.TestData{
-			ImageDiskUsage: types.ImageDiskUsage{TotalSize: 50_000, TotalCount: 3},
+		client := mockUpdate.CreateFakeClient(&mockUpdate.TestData{
+			ImageDiskUsage: containerClient.ImageDiskUsage{TotalSize: 50_000, TotalCount: 3},
 		}, false, false)
 
 		params := defaultTestUpdateParams(filters.NoFilter)
@@ -96,8 +96,8 @@ func TestImageDiskSpaceGate(t *testing.T) {
 	t.Run("blocks the session when usage reaches the maximum", func(t *testing.T) {
 		t.Parallel()
 
-		client := mockUpdate.CreateMockClient(&mockUpdate.TestData{
-			ImageDiskUsage: types.ImageDiskUsage{
+		client := mockUpdate.CreateFakeClient(&mockUpdate.TestData{
+			ImageDiskUsage: containerClient.ImageDiskUsage{
 				TotalSize:   10_000,
 				Reclaimable: 2_000,
 				TotalCount:  4,
@@ -116,7 +116,7 @@ func TestImageDiskSpaceGate(t *testing.T) {
 	t.Run("fails closed when image disk usage cannot be queried", func(t *testing.T) {
 		t.Parallel()
 
-		client := mockUpdate.CreateMockClient(&mockUpdate.TestData{
+		client := mockUpdate.CreateFakeClient(&mockUpdate.TestData{
 			GetImageDiskUsageError: errors.New("df unavailable"),
 		}, false, false)
 
@@ -148,7 +148,7 @@ func TestRunUpdatesWithNotifications_DiskSpaceAbortNotifiesOnce(t *testing.T) {
 		{
 			name: "usage reaches the maximum",
 			data: &mockUpdate.TestData{
-				ImageDiskUsage: types.ImageDiskUsage{TotalSize: 10_000, Reclaimable: 2_000, TotalCount: 4},
+				ImageDiskUsage: containerClient.ImageDiskUsage{TotalSize: 10_000, Reclaimable: 2_000, TotalCount: 4},
 			},
 			message: logging.ImageUsageExceedsMaximum,
 		},
@@ -175,7 +175,7 @@ func TestRunUpdatesWithNotifications_DiskSpaceAbortNotifiesOnce(t *testing.T) {
 
 			metric := RunUpdatesWithNotifications(t.Context(), RunUpdatesWithNotificationsParams{
 				Logger:   log,
-				Client:   mockUpdate.CreateMockClient(tt.data, false, false),
+				Client:   mockUpdate.CreateFakeClient(tt.data, false, false),
 				Notifier: notifier,
 				Update:   params,
 			})

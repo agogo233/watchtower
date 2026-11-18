@@ -17,13 +17,13 @@ import (
 
 	"github.com/nicholas-fedor/watchtower/internal/api/auth"
 	"github.com/nicholas-fedor/watchtower/internal/api/routes"
-	mockContainerClient "github.com/nicholas-fedor/watchtower/internal/container/client/mocks"
+	mockRoutes "github.com/nicholas-fedor/watchtower/internal/api/routes/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/container"
+	"github.com/nicholas-fedor/watchtower/internal/container/filters"
 	"github.com/nicholas-fedor/watchtower/internal/observability/events"
-	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
 	"github.com/nicholas-fedor/watchtower/internal/observability/metrics"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/internal/update/schedule"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 var helperMetrics = metrics.Default()
@@ -46,8 +46,8 @@ func TestIntegration_HealthProbes_ViaFullSetup(t *testing.T) {
 }
 
 func TestIntegration_HealthProbes_CustomRoute(t *testing.T) {
-	mc := mockContainerClient.NewMockClient(t)
-	mc.EXPECT().ListContainers(mock.Anything).Return([]types.Container{}, nil)
+	mc := mockRoutes.NewMockClient(t)
+	mc.EXPECT().ListContainers(mock.Anything).Return([]*container.Container{}, nil)
 
 	app := newApp(newTestLogger(t), 60, proxyConfig{}, corsConfig{}, false)
 	app.Get("/health/custom", func(c fiber.Ctx) error {
@@ -109,10 +109,10 @@ func TestIntegration_SetupAndStartAPI_AllAPIs(t *testing.T) {
 		RateLimit:           60,
 		Client:              makeListContainersMock(t),
 		Filter:              makeFilter(t),
-		RunUpdatesWithNotifications: func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
+		RunUpdatesWithNotifications: func(_ context.Context, _ filters.Filter, _ updateParams.Params) *metrics.Metric {
 			return &metrics.Metric{}
 		},
-		FilterByImage:  func(_ []string, f types.Filter) types.Filter { return f },
+		FilterByImage:  func(_ []string, f filters.Filter) filters.Filter { return f },
 		DefaultMetrics: func() *metrics.Metrics { return helperMetrics },
 		UnblockHTTPAPI: true,
 	})
@@ -134,7 +134,7 @@ func TestIntegration_SetupAndStartAPI_MissingUpdateDependencies(t *testing.T) {
 				EnableUpdateAPI:             true,
 				UpdateLock:                  schedule.NewUpdateLock(),
 				RunUpdatesWithNotifications: nil,
-				FilterByImage:               func(_ []string, f types.Filter) types.Filter { return f },
+				FilterByImage:               func(_ []string, f filters.Filter) filters.Filter { return f },
 				DefaultMetrics:              func() *metrics.Metrics { return helperMetrics },
 			},
 			errMsg: "RunUpdatesWithNotifications must be provided",
@@ -145,7 +145,7 @@ func TestIntegration_SetupAndStartAPI_MissingUpdateDependencies(t *testing.T) {
 				Token:           "test",
 				EnableUpdateAPI: true,
 				UpdateLock:      schedule.NewUpdateLock(),
-				RunUpdatesWithNotifications: func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
+				RunUpdatesWithNotifications: func(_ context.Context, _ filters.Filter, _ updateParams.Params) *metrics.Metric {
 					return &metrics.Metric{}
 				},
 				FilterByImage:  nil,
@@ -159,10 +159,10 @@ func TestIntegration_SetupAndStartAPI_MissingUpdateDependencies(t *testing.T) {
 				Token:           "test",
 				EnableUpdateAPI: true,
 				UpdateLock:      schedule.NewUpdateLock(),
-				RunUpdatesWithNotifications: func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
+				RunUpdatesWithNotifications: func(_ context.Context, _ filters.Filter, _ updateParams.Params) *metrics.Metric {
 					return &metrics.Metric{}
 				},
-				FilterByImage:  func(_ []string, f types.Filter) types.Filter { return f },
+				FilterByImage:  func(_ []string, f filters.Filter) filters.Filter { return f },
 				DefaultMetrics: nil,
 			},
 			errMsg: "DefaultMetrics must be provided",
@@ -220,10 +220,10 @@ func TestIntegration_GracefulShutdown_AllAPIs(t *testing.T) {
 			RateLimit:           60,
 			Client:              makeListContainersMock(t),
 			Filter:              makeFilter(t),
-			RunUpdatesWithNotifications: func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
+			RunUpdatesWithNotifications: func(_ context.Context, _ filters.Filter, _ updateParams.Params) *metrics.Metric {
 				return &metrics.Metric{}
 			},
-			FilterByImage:  func(_ []string, f types.Filter) types.Filter { return f },
+			FilterByImage:  func(_ []string, f filters.Filter) filters.Filter { return f },
 			DefaultMetrics: func() *metrics.Metrics { return helperMetrics },
 			UnblockHTTPAPI: true,
 		}))
@@ -255,10 +255,10 @@ func TestIntegration_GracefulShutdownTiming(t *testing.T) {
 			RateLimit:           60,
 			Client:              makeListContainersMock(t),
 			Filter:              makeFilter(t),
-			RunUpdatesWithNotifications: func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
+			RunUpdatesWithNotifications: func(_ context.Context, _ filters.Filter, _ updateParams.Params) *metrics.Metric {
 				return &metrics.Metric{}
 			},
-			FilterByImage:  func(_ []string, f types.Filter) types.Filter { return f },
+			FilterByImage:  func(_ []string, f filters.Filter) filters.Filter { return f },
 			DefaultMetrics: func() *metrics.Metrics { return helperMetrics },
 			UnblockHTTPAPI: true,
 		}))
@@ -371,10 +371,10 @@ func TestIntegration_EnablementCombinations(t *testing.T) {
 				RateLimit:           60,
 				Client:              makeListContainersMock(t),
 				Filter:              makeFilter(t),
-				RunUpdatesWithNotifications: func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
+				RunUpdatesWithNotifications: func(_ context.Context, _ filters.Filter, _ updateParams.Params) *metrics.Metric {
 					return &metrics.Metric{}
 				},
-				FilterByImage:  func(_ []string, f types.Filter) types.Filter { return f },
+				FilterByImage:  func(_ []string, f filters.Filter) filters.Filter { return f },
 				DefaultMetrics: func() *metrics.Metrics { return helperMetrics },
 				UnblockHTTPAPI: true,
 			}
@@ -463,9 +463,9 @@ func TestIntegration_ContainerDetailsAPI(t *testing.T) {
 func TestIntegration_CheckDuringUpdate(t *testing.T) {
 	testMetrics := metrics.Default()
 
-	mc := mockContainerClient.NewMockClient(t)
-	mc.EXPECT().ListContainers(mock.Anything, mock.Anything).Return([]types.Container{}, nil).Maybe()
-	mc.EXPECT().ListContainers(mock.Anything).Return([]types.Container{}, nil).Maybe()
+	mc := mockRoutes.NewMockClient(t)
+	mc.EXPECT().ListContainers(mock.Anything, mock.Anything).Return([]*container.Container{}, nil).Maybe()
+	mc.EXPECT().ListContainers(mock.Anything).Return([]*container.Container{}, nil).Maybe()
 
 	updateDone := make(chan struct{})
 
@@ -479,12 +479,12 @@ func TestIntegration_CheckDuringUpdate(t *testing.T) {
 		UnblockHTTPAPI:  true,
 		Client:          mc,
 		Filter:          makeFilter(t),
-		RunUpdatesWithNotifications: func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
+		RunUpdatesWithNotifications: func(_ context.Context, _ filters.Filter, _ updateParams.Params) *metrics.Metric {
 			<-updateDone
 
 			return &metrics.Metric{}
 		},
-		FilterByImage:  func(_ []string, f types.Filter) types.Filter { return f },
+		FilterByImage:  func(_ []string, f filters.Filter) filters.Filter { return f },
 		DefaultMetrics: func() *metrics.Metrics { return testMetrics },
 	}
 
@@ -559,10 +559,10 @@ func TestIntegration_APIAndScheduling_ConcurrentWithUnblockHTTPAPI(t *testing.T)
 		RateLimit:        60,
 		Client:           makeListContainersMock(t),
 		Filter:           makeFilter(t),
-		RunUpdatesWithNotifications: func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
+		RunUpdatesWithNotifications: func(_ context.Context, _ filters.Filter, _ updateParams.Params) *metrics.Metric {
 			return &metrics.Metric{}
 		},
-		FilterByImage:  func(_ []string, f types.Filter) types.Filter { return f },
+		FilterByImage:  func(_ []string, f filters.Filter) filters.Filter { return f },
 		DefaultMetrics: func() *metrics.Metrics { return testMetrics },
 		UnblockHTTPAPI: true, // API must return so scheduling can proceed.
 	})
@@ -584,16 +584,15 @@ func TestIntegration_APIAndScheduling_ConcurrentWithUnblockHTTPAPI(t *testing.T)
 
 	err := schedule.RunUpgradesOnSchedule(schedCtx, schedule.ScheduleDeps{
 		Logger:              newTestLogger(t),
-		Filter:              func(_ types.FilterableContainer) bool { return true },
+		Filter:              func(_ filters.FilterableContainer) bool { return true },
 		Lock:                lock,
 		ScheduleSpec:        "@every 1h",
-		WriteStartupMessage: logging.WriteStartupMessage,
-		RunUpdate: func(_ context.Context, _ types.Filter, _ updateParams.Params) *metrics.Metric {
+		WriteStartupMessage: nil,
+		RunUpdate: func(_ context.Context, _ filters.Filter, _ updateParams.Params) *metrics.Metric {
 			return &metrics.Metric{}
 		},
-		UpdateOnStart:      false,
-		SkipFirstRun:       false,
-		StartupMessageSent: true,
+		UpdateOnStart:         false,
+		ReplacedOlderInstance: false,
 		BaseParams: updateParams.Params{
 			Cleanup:             false,
 			MonitorOnly:         false,
@@ -625,12 +624,12 @@ func TestIntegration_UpdateHonorsReviveStoppedAndComposeDependsOn(t *testing.T) 
 		},
 		Client: makeListContainersMock(t),
 		Filter: makeFilter(t),
-		RunUpdatesWithNotifications: func(_ context.Context, _ types.Filter, params updateParams.Params) *metrics.Metric {
+		RunUpdatesWithNotifications: func(_ context.Context, _ filters.Filter, params updateParams.Params) *metrics.Metric {
 			captured = params
 
 			return &metrics.Metric{}
 		},
-		FilterByImage:  func(_ []string, f types.Filter) types.Filter { return f },
+		FilterByImage:  func(_ []string, f filters.Filter) filters.Filter { return f },
 		DefaultMetrics: func() *metrics.Metrics { return helperMetrics },
 	}
 

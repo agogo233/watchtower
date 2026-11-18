@@ -7,9 +7,27 @@ import (
 
 	"github.com/rs/zerolog"
 
-	containerClient "github.com/nicholas-fedor/watchtower/internal/container/client"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
+	"github.com/nicholas-fedor/watchtower/internal/container"
+	"github.com/nicholas-fedor/watchtower/internal/container/filters"
 )
+
+// Client finds containers and runs commands inside them.
+type Client interface {
+	// ListContainers returns the containers that pass every filter.
+	ListContainers(ctx context.Context, filter ...filters.Filter) ([]*container.Container, error)
+	// GetContainer returns the container with the given ID.
+	GetContainer(ctx context.Context, containerID container.ContainerID) (*container.Container, error)
+	// ExecuteCommand runs a command inside the container for up to timeout
+	// minutes. It reports whether the command asked to skip the update.
+	ExecuteCommand(
+		ctx context.Context,
+		target *container.Container,
+		command string,
+		timeout int,
+		uid int,
+		gid int,
+	) (bool, error)
+}
 
 // Errors for lifecycle hook execution.
 var (
@@ -33,10 +51,10 @@ var (
 func ExecutePreChecks(
 	log *zerolog.Logger,
 	ctx context.Context,
-	client containerClient.Client,
-	filter types.Filter,
+	client Client,
+	filter filters.Filter,
 	uid, gid int,
-	listed []types.Container,
+	listed []*container.Container,
 ) {
 	containers, ok := resolveCheckContainers(log, ctx, client, filter, listed, "pre-checks")
 	if !ok {
@@ -65,10 +83,10 @@ func ExecutePreChecks(
 func ExecutePostChecks(
 	log *zerolog.Logger,
 	ctx context.Context,
-	client containerClient.Client,
-	filter types.Filter,
+	client Client,
+	filter filters.Filter,
 	uid, gid int,
-	listed []types.Container,
+	listed []*container.Container,
 ) {
 	containers, ok := resolveCheckContainers(log, ctx, client, filter, listed, "post-checks")
 	if !ok {
@@ -92,16 +110,16 @@ func ExecutePostChecks(
 //   - phase: Log label for the pre-check or post-check phase.
 //
 // Returns:
-//   - []types.Container: Containers to run hooks against.
+//   - []*container.Container: Containers to run hooks against.
 //   - bool: False when listing fails.
 func resolveCheckContainers(
 	log *zerolog.Logger,
 	ctx context.Context,
-	client containerClient.Client,
-	filter types.Filter,
-	listed []types.Container,
+	client Client,
+	filter filters.Filter,
+	listed []*container.Container,
 	phase string,
-) ([]types.Container, bool) {
+) ([]*container.Container, bool) {
 	clogVal := log.With().
 		Str("filter", fmt.Sprintf("%v", filter)).
 		Logger()
@@ -141,19 +159,19 @@ func resolveCheckContainers(
 //   - log: Process logger.
 //   - ctx: Context for cancellation and timeout.
 //   - client: Container client for execution.
-//   - container: Container to process.
+//   - c: Container to process.
 //   - uid: Default UID to run command as.
 //   - gid: Default GID to run command as.
-func executePreCheckCommand(log *zerolog.Logger, ctx context.Context, client containerClient.Client, container types.Container, uid, gid int) {
+func executePreCheckCommand(log *zerolog.Logger, ctx context.Context, client Client, c *container.Container, uid, gid int) {
 	executeCheckCommand(
 		log,
 		ctx,
 		client,
-		container,
+		c,
 		uid,
 		gid,
-		container.GetLifecyclePreCheckCommand(),
-		container.PreCheckTimeout,
+		c.GetLifecyclePreCheckCommand(),
+		c.PreCheckTimeout,
 		"pre-check",
 	)
 }
@@ -164,19 +182,19 @@ func executePreCheckCommand(log *zerolog.Logger, ctx context.Context, client con
 //   - log: Process logger.
 //   - ctx: Context for cancellation and timeout.
 //   - client: Container client for execution.
-//   - container: Container to process.
+//   - c: Container to process.
 //   - uid: Default UID to run command as.
 //   - gid: Default GID to run command as.
-func executePostCheckCommand(log *zerolog.Logger, ctx context.Context, client containerClient.Client, container types.Container, uid, gid int) {
+func executePostCheckCommand(log *zerolog.Logger, ctx context.Context, client Client, c *container.Container, uid, gid int) {
 	executeCheckCommand(
 		log,
 		ctx,
 		client,
-		container,
+		c,
 		uid,
 		gid,
-		container.GetLifecyclePostCheckCommand(),
-		container.PostCheckTimeout,
+		c.GetLifecyclePostCheckCommand(),
+		c.PostCheckTimeout,
 		"post-check",
 	)
 }
@@ -187,7 +205,7 @@ func executePostCheckCommand(log *zerolog.Logger, ctx context.Context, client co
 //   - log: Process logger.
 //   - ctx: Context for cancellation and timeout.
 //   - client: Container client for execution.
-//   - cont: Container to process.
+//   - c: Container to process.
 //   - uid: Default UID to run command as.
 //   - gid: Default GID to run command as.
 //   - command: Command string from the container labels.
@@ -197,15 +215,15 @@ func executePostCheckCommand(log *zerolog.Logger, ctx context.Context, client co
 func executeCheckCommand(
 	log *zerolog.Logger,
 	ctx context.Context,
-	client containerClient.Client,
-	cont types.Container,
+	client Client,
+	c *container.Container,
 	uid, gid int,
 	command string,
 	timeout func() int,
 	phase string,
 ) {
 	clogVal := log.With().
-		Str("container", cont.Name()).
+		Str("container", c.Name()).
 		Logger()
 	clog := &clogVal
 
@@ -218,7 +236,7 @@ func executeCheckCommand(
 	}
 
 	// The container's lifecycle labels override the configured user.
-	effectiveUID, effectiveGID := cont.LifecycleUser(uid, gid)
+	effectiveUID, effectiveGID := c.LifecycleUser(uid, gid)
 
 	minutes := timeout()
 
@@ -227,7 +245,7 @@ func executeCheckCommand(
 		Int("timeout", minutes).
 		Msg("Executing " + phase + " command")
 
-	_, err := client.ExecuteCommand(ctx, cont, command, minutes, effectiveUID, effectiveGID)
+	_, err := client.ExecuteCommand(ctx, c, command, minutes, effectiveUID, effectiveGID)
 	if err != nil {
 		// The failure message names the phase, such as "Pre-check command failed".
 		failedMsg := "Pre-check command failed"
@@ -247,7 +265,7 @@ func executeCheckCommand(
 //   - log: Process logger.
 //   - ctx: Context for cancellation and timeout.
 //   - client: Container client for execution.
-//   - container: Container to process.
+//   - c: Container to process.
 //   - uid: UID to run command as.
 //   - gid: GID to run command as.
 //
@@ -257,14 +275,14 @@ func executeCheckCommand(
 //   - error: Non-nil if the command failed, nil otherwise.
 func ExecutePreUpdateCommand(log *zerolog.Logger,
 	ctx context.Context,
-	client containerClient.Client,
-	container types.Container,
+	client Client,
+	c *container.Container,
 	uid int,
 	gid int,
 ) (bool, error) {
-	command := container.GetLifecyclePreUpdateCommand()
+	command := c.GetLifecyclePreUpdateCommand()
 	clogVal := log.With().
-		Str("container", container.Name()).
+		Str("container", c.Name()).
 		Logger()
 	clog := &clogVal
 
@@ -275,10 +293,10 @@ func ExecutePreUpdateCommand(log *zerolog.Logger,
 		return false, nil
 	}
 
-	if !container.IsRunning() || container.IsRestarting() {
+	if !c.IsRunning() || c.IsRestarting() {
 		clog.Debug().
-			Bool("is_running", container.IsRunning()).
-			Bool("is_restarting", container.IsRestarting()).
+			Bool("is_running", c.IsRunning()).
+			Bool("is_restarting", c.IsRestarting()).
 			Msg("Container is not running. Skipping pre-update command")
 
 		return false, nil
@@ -286,18 +304,18 @@ func ExecutePreUpdateCommand(log *zerolog.Logger,
 
 	// Only a hook that runs reads its timeout label, so an invalid label on a
 	// skipped hook logs no warning.
-	timeout := container.PreUpdateTimeout()
+	timeout := c.PreUpdateTimeout()
 	clogVal = clog.With().Int("timeout", timeout).Logger()
 
 	// The container's lifecycle labels override the configured user.
-	effectiveUID, effectiveGID := container.LifecycleUser(uid, gid)
+	effectiveUID, effectiveGID := c.LifecycleUser(uid, gid)
 
 	// Execute command with configured timeout.
 	clog.Debug().
 		Str("command", command).
 		Msg("Executing pre-update command")
 
-	success, err := client.ExecuteCommand(ctx, container, command, timeout, effectiveUID, effectiveGID)
+	success, err := client.ExecuteCommand(ctx, c, command, timeout, effectiveUID, effectiveGID)
 	if err != nil {
 		clog.Debug().
 			Err(err).
@@ -325,8 +343,8 @@ func ExecutePreUpdateCommand(log *zerolog.Logger,
 //   - gid: GID to run command as.
 func ExecutePostUpdateCommand(log *zerolog.Logger,
 	ctx context.Context,
-	client containerClient.Client,
-	newContainerID types.ContainerID,
+	client Client,
+	newContainerID container.ContainerID,
 	uid int,
 	gid int,
 ) {

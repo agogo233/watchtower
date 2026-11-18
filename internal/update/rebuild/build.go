@@ -11,16 +11,20 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/nicholas-fedor/watchtower/internal/container"
-	containerClient "github.com/nicholas-fedor/watchtower/internal/container/client"
-	"github.com/nicholas-fedor/watchtower/internal/container/oci"
 	"github.com/nicholas-fedor/watchtower/internal/container/provenance"
 	"github.com/nicholas-fedor/watchtower/internal/git"
 	"github.com/nicholas-fedor/watchtower/internal/git/apply"
 	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/internal/update/state"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
+
+// ImageBuilder builds images from a remote Git build context.
+type ImageBuilder interface {
+	// BuildRemoteImage builds the Dockerfile at the remote context and tags the
+	// result with every given tag.
+	BuildRemoteImage(ctx context.Context, remote, dockerfile string, tags []string) (container.ImageID, error)
+}
 
 // rebuildTimeout bounds one remote image build or one Compose apply. Both run
 // Dockerfile steps and pulls that can take minutes, so they are not held to the
@@ -51,8 +55,8 @@ var (
 func (s *Session) build(
 	log *zerolog.Logger,
 	ctx context.Context,
-	docker containerClient.Client,
-	c types.Container,
+	docker ImageBuilder,
+	c *container.Container,
 	result git.CheckResult,
 	params updateParams.Params,
 	progress *state.Progress,
@@ -101,29 +105,16 @@ func (s *Session) build(
 		return fmt.Errorf("build git image: %w", err)
 	}
 
-	if concrete, ok := c.(*container.Container); ok {
-		provenance.ApplyGitAssociation(concrete, assoc, provenance.PersistWatch(c))
-
-		concrete.SetImageName(tag)
-		provenance.ApplyGitStamp(concrete, result.Commit, result.Tag)
-	}
+	provenance.ApplyGitAssociation(c, assoc)
+	c.SetImageName(tag)
+	provenance.ApplyGitStamp(c, result.Commit, result.Tag)
 
 	s.mu.Lock()
 	s.built[c.ID()] = imageID
 	s.mu.Unlock()
 
-	if progress != nil {
-		progress.SetLatestImage(log, c.ID(), imageID)
-		// A Git rebuild has no pulled image, so no latest image annotations are
-		// passed and LatestImageVersion stays empty. The resolved Git tag is the
-		// only new version available for this path.
-		meta := progress.SetLatestImageMeta(log, c, params, provenance.ChangelogVars{
-			Tag:    result.Tag,
-			Commit: result.Commit,
-		}, oci.Annotations{})
-
-		provenance.LogChangelog(log, c, params.Policy, meta)
-	}
+	meta := reportGitImage(log, progress, c, imageID, result, params)
+	provenance.LogChangelog(log, c, params.Policy, meta)
 
 	withGitMeta(log.Info().
 		Str("container", c.Name()).

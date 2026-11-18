@@ -27,112 +27,55 @@ import (
 	"github.com/nicholas-fedor/watchtower/internal/testutil/modelfixture"
 )
 
+// TestCooldownError verifies the two kinds of cooldown error. A deferral has no
+// cause and matches ErrImageCooldown. A failed age lookup carries its cause and
+// reads as it. It matches the cause instead of ErrImageCooldown.
 func TestCooldownError(t *testing.T) {
 	t.Parallel()
 
-	t.Run("Error()", func(t *testing.T) {
+	cause := errors.New("registry unreachable")
+	deferral := &CooldownError{Age: "2 hours", Delay: "1 day", Remaining: "22 hours"}
+	failedLookup := &CooldownError{Delay: "1 day", Cause: cause}
+
+	t.Run("a deferral reads as ErrImageCooldown", func(t *testing.T) {
 		t.Parallel()
 
-		t.Run("the wrapped error is non-nil", func(t *testing.T) {
-			t.Parallel()
-
-			t.Run("returns the wrapped error message", func(t *testing.T) {
-				t.Parallel()
-
-				inner := errors.New("inner failure")
-				e := &CooldownError{Age: "1h", Delay: "2h", err: inner}
-				assert.Equal(t, "inner failure", e.Error())
-			})
-		})
-
-		t.Run("the wrapped error is nil", func(t *testing.T) {
-			t.Parallel()
-
-			t.Run("returns the ErrImageCooldown message", func(t *testing.T) {
-				t.Parallel()
-
-				e := &CooldownError{Age: "1h", Delay: "2h", Remaining: "1h", err: nil}
-				assert.Equal(t, ErrImageCooldown.Error(), e.Error())
-			})
-		})
+		assert.Equal(t, ErrImageCooldown.Error(), deferral.Error())
+		require.ErrorIs(t, deferral, ErrImageCooldown)
+		require.NoError(t, deferral.Unwrap())
 	})
 
-	t.Run("Unwrap()", func(t *testing.T) {
+	t.Run("a deferral matches ErrImageCooldown through a wrap", func(t *testing.T) {
 		t.Parallel()
 
-		t.Run("returns the wrapped error when non-nil", func(t *testing.T) {
-			t.Parallel()
-
-			inner := errors.New("wrapped")
-			e := &CooldownError{err: inner}
-			assert.Equal(t, inner, e.Unwrap())
-		})
-
-		t.Run("returns nil when no wrapped error", func(t *testing.T) {
-			t.Parallel()
-
-			e := &CooldownError{}
-			require.NoError(t, e.Unwrap())
-		})
+		require.ErrorIs(t, fmt.Errorf("git cooldown: %w", deferral), ErrImageCooldown)
 	})
 
-	t.Run("Is()", func(t *testing.T) {
+	t.Run("a failed age lookup reads as its cause", func(t *testing.T) {
 		t.Parallel()
 
-		t.Run("matches when wrapped error is ErrImageCooldown", func(t *testing.T) {
-			t.Parallel()
-
-			e := &CooldownError{err: ErrImageCooldown}
-			assert.True(t, e.Is(ErrImageCooldown))
-		})
-
-		t.Run("does not match ErrImageCooldown with unrelated wrapped error", func(t *testing.T) {
-			t.Parallel()
-
-			e := &CooldownError{err: errors.New("some other error")}
-			assert.False(t, e.Is(ErrImageCooldown))
-		})
-
-		t.Run("does not match an unrelated target", func(t *testing.T) {
-			t.Parallel()
-
-			unrelated := errors.New("unrelated")
-			e := &CooldownError{err: errors.New("some other error")}
-			assert.False(t, e.Is(unrelated))
-		})
+		assert.Equal(t, cause.Error(), failedLookup.Error())
+		require.ErrorIs(t, failedLookup, cause)
+		require.NotErrorIs(t, failedLookup, ErrImageCooldown)
+		assert.Equal(t, cause, failedLookup.Unwrap())
 	})
 
-	t.Run("errors.Is sentinel extraction", func(t *testing.T) {
+	t.Run("neither matches an unrelated target", func(t *testing.T) {
 		t.Parallel()
 
-		t.Run("allows errors.Is(err, ErrImageCooldown) on *CooldownError", func(t *testing.T) {
-			t.Parallel()
+		unrelated := errors.New("unrelated")
+		require.NotErrorIs(t, deferral, unrelated)
+		require.NotErrorIs(t, failedLookup, unrelated)
+	})
 
-			err := &CooldownError{
-				Age:       "2 hours",
-				Delay:     "1 day",
-				Remaining: "22 hours",
-				err:       ErrImageCooldown,
-			}
-			assert.ErrorIs(t, err, ErrImageCooldown)
-		})
+	t.Run("errors.As extracts the fields", func(t *testing.T) {
+		t.Parallel()
 
-		t.Run("allows errors.As to extract *CooldownError with all fields", func(t *testing.T) {
-			t.Parallel()
-
-			err := &CooldownError{
-				Age:       "2 hours",
-				Delay:     "1 day",
-				Remaining: "22 hours",
-				err:       ErrImageCooldown,
-			}
-
-			var cooldownErr *CooldownError
-			require.ErrorAs(t, err, &cooldownErr)
-			assert.Equal(t, "2 hours", cooldownErr.Age)
-			assert.Equal(t, "1 day", cooldownErr.Delay)
-			assert.Equal(t, "22 hours", cooldownErr.Remaining)
-		})
+		var cooldownErr *CooldownError
+		require.ErrorAs(t, fmt.Errorf("wrapped: %w", deferral), &cooldownErr)
+		assert.Equal(t, "2 hours", cooldownErr.Age)
+		assert.Equal(t, "1 day", cooldownErr.Delay)
+		assert.Equal(t, "22 hours", cooldownErr.Remaining)
 	})
 }
 
@@ -153,6 +96,43 @@ func notFoundRegistry(t *testing.T) string {
 	server.RouteToHandler(http.MethodHead, httpstub.PathRegexp(".*"), notFound)
 
 	return server.Addr()
+}
+
+// createdRegistry starts a plain HTTP stub registry that serves the image
+// org/app:1.0 as a single-platform manifest whose config blob records the
+// given creation time. Every other path answers 404.
+//
+// Parameters:
+//   - t: Test that owns the registry.
+//   - created: Creation time the image config records.
+//
+// Returns:
+//   - string: Host and port of the registry.
+func createdRegistry(t *testing.T, created time.Time) string {
+	t.Helper()
+
+	const configDigest = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/":
+			w.WriteHeader(http.StatusOK)
+		case "/v2/org/app/manifests/1.0":
+			w.Header().Set("Content-Type", "application/vnd.docker.distribution.manifest.v2+json")
+			fmt.Fprintf(w, `{
+				"schemaVersion": 2,
+				"mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+				"config": {"mediaType": "application/vnd.docker.container.image.v1+json", "digest": %q, "size": 2}
+			}`, configDigest)
+		case "/v2/org/app/blobs/" + configDigest:
+			fmt.Fprintf(w, `{"created": %q}`, created.UTC().Format(time.RFC3339))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	return strings.TrimPrefix(server.URL, "http://")
 }
 
 // Test_isOutsideCooldown verifies that the cooldown gate lets a pull go ahead
@@ -292,8 +272,13 @@ func TestPullImageCooldownGate(t *testing.T) {
 
 			err := i.PullImage(t.Context(), c, warnAuto, updateConfig.Policy{CooldownDelay: 1 * time.Hour})
 
+			// A failed age lookup is not a deferral. The update counts it as a
+			// failed check.
 			var cooldownErr *CooldownError
 			require.ErrorAs(t, err, &cooldownErr)
+			require.NotErrorIs(t, err, ErrImageCooldown)
+			require.Error(t, cooldownErr.Cause)
+			assert.Empty(t, cooldownErr.Remaining)
 		})
 	})
 }
@@ -359,41 +344,18 @@ func TestCheckLocalImageCooldown_LogsContainer(t *testing.T) {
 func TestIsOutsideCooldown_RegistrySettings(t *testing.T) {
 	t.Parallel()
 
-	const configDigest = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-
-	created := time.Now().Add(-48 * time.Hour).UTC().Format(time.RFC3339)
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/v2/":
-			w.WriteHeader(http.StatusOK)
-		case "/v2/org/app/manifests/1.0":
-			w.Header().Set("Content-Type", "application/vnd.docker.distribution.manifest.v2+json")
-			fmt.Fprintf(w, `{
-				"schemaVersion": 2,
-				"mediaType": "application/vnd.docker.distribution.manifest.v2+json",
-				"config": {"mediaType": "application/vnd.docker.container.image.v1+json", "digest": %q, "size": 2}
-			}`, configDigest)
-		case "/v2/org/app/blobs/" + configDigest:
-			fmt.Fprintf(w, `{"created": %q}`, created)
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	t.Cleanup(server.Close)
-
-	container := modelfixture.Container(containerfixture.WithImageName(strings.TrimPrefix(server.URL, "http://") + "/org/app:1.0"))
+	c := modelfixture.Container(containerfixture.WithImageName(createdRegistry(t, time.Now().Add(-48*time.Hour)) + "/org/app:1.0"))
 	policy := updateConfig.Policy{CooldownDelay: time.Hour}
 
 	plain := NewClient(nil, newTestLogger(t), registryConfig.Registry{TLSSkip: true}, ratelimit.New())
 
-	outside, err := plain.isOutsideCooldown(t.Context(), container, policy)
+	outside, err := plain.isOutsideCooldown(t.Context(), c, policy)
 	require.NoError(t, err)
 	assert.True(t, outside, "an image older than the cooldown was deferred")
 
 	secure := NewClient(nil, newTestLogger(t), registryConfig.Registry{}, ratelimit.New())
 
-	outside, err = secure.isOutsideCooldown(t.Context(), container, policy)
+	outside, err = secure.isOutsideCooldown(t.Context(), c, policy)
 	require.Error(t, err, "an HTTPS request reached the plain HTTP registry")
 	assert.False(t, outside)
 }

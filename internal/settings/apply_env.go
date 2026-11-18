@@ -1,6 +1,7 @@
 package settings
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"slices"
@@ -14,20 +15,28 @@ import (
 	"github.com/nicholas-fedor/watchtower/internal/settings/flags/utils"
 )
 
-// ApplyEnvToFlags copies bound environment values onto flags that were not set on the CLI.
+var (
+	// errFlagNotRegistered indicates a FlagSpec name was not found on the flag set.
+	errFlagNotRegistered = errors.New("flag not registered")
+	// errUnsupportedFlagKind indicates a FlagSpec kind is not supported.
+	errUnsupportedFlagKind = errors.New("unsupported flag kind")
+)
+
+// applyEnvToFlags copies bound environment values onto flags that were not set on the CLI.
 //
-// Call after Cobra parse and before ProcessFlagAliases / SetupLogging so those
-// helpers still see env-sourced values via flag Gets. Load continues to resolve
-// through Viper with flag > env > default precedence. Static pflag defaults are
-// never env-baked at registration time.
+// It runs before the logging setup and the alias flags, so they see
+// env-sourced values through the flags. The flags stay unmarked as changed, so
+// the command line alone decides which settings count as explicitly set.
+// Static pflag defaults are never env-baked at registration time.
 //
 // Parameters:
 //   - flagSet: Parsed persistent flag set.
-//   - specs: Aggregated FlagSpec rows.
+//   - specs: Settings whose environment values to apply. A spec without a
+//     registered flag is skipped.
 //
 // Returns:
 //   - error: Non-nil when a flag cannot be set from env.
-func ApplyEnvToFlags(flagSet *pflag.FlagSet, specs []spec.FlagSpec) error {
+func applyEnvToFlags(flagSet *pflag.FlagSet, specs []spec.FlagSpec) error {
 	for _, flagSpec := range specs {
 		if flagSet.Lookup(flagSpec.Name) == nil {
 			continue
@@ -167,15 +176,15 @@ func formatEnvForFlag(flagSpec spec.FlagSpec, raw string) (string, error) {
 	case spec.KindString:
 		return raw, nil
 	case spec.KindInt:
-		// Allow bare integers only. pflag Set accepts decimal strings.
-		trimmed := strings.TrimSpace(raw)
-
-		_, err := strconv.Atoi(trimmed)
+		// Environment integers are decimal. pflag parses a value with its base
+		// prefix, so a leading zero would read as octal. The flag is set to
+		// the decimal value instead of the raw text.
+		value, err := strconv.Atoi(strings.TrimSpace(raw))
 		if err != nil {
 			return "", fmt.Errorf("parse int: %w", err)
 		}
 
-		return trimmed, nil
+		return strconv.Itoa(value), nil
 	case spec.KindDuration:
 		trimmed := strings.TrimSpace(raw)
 		if utils.IsPureNumeric(trimmed) {

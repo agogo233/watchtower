@@ -112,6 +112,20 @@ func WithImageName(name string) Update {
 	}
 }
 
+// WithImageID sets the ID of the mock image, which the container reports as
+// its image ID.
+//
+// Parameters:
+//   - id: Image ID to set (e.g., "sha256:abc123").
+//
+// Returns:
+//   - Update: Function to set the image ID in metadata.
+func WithImageID(id string) Update {
+	return func(_ *dockerContainer.InspectResponse, i *dockerImage.InspectResponse) {
+		i.ID = id
+	}
+}
+
 // WithImageCreated sets the creation time of the mock image.
 //
 // Parameters:
@@ -135,6 +149,20 @@ func WithImageCreated(created time.Time) Update {
 func WithRepoDigests(digests []string) Update {
 	return func(_ *dockerContainer.InspectResponse, i *dockerImage.InspectResponse) {
 		i.RepoDigests = digests
+	}
+}
+
+// WithRepoTags sets the RepoTags of the mock image, replacing the tag that
+// WithImageName adds. An image tagged under several names lists every tag.
+//
+// Parameters:
+//   - tags: List of repo tags (e.g., ["repo:latest", "repo-dev:latest"]).
+//
+// Returns:
+//   - Update: Function to set RepoTags on image metadata.
+func WithRepoTags(tags []string) Update {
+	return func(_ *dockerContainer.InspectResponse, i *dockerImage.InspectResponse) {
+		i.RepoTags = tags
 	}
 }
 

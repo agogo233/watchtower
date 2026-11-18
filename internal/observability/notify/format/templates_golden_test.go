@@ -11,13 +11,13 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
 
+	"github.com/nicholas-fedor/watchtower/internal/container"
 	"github.com/nicholas-fedor/watchtower/internal/container/provenance"
 	"github.com/nicholas-fedor/watchtower/internal/observability/logging"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/golden"
 	"github.com/nicholas-fedor/watchtower/internal/testutil/reportfixture"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
 	"github.com/nicholas-fedor/watchtower/internal/update/state"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // goldenHost is the hostname used in every golden notification fixture.
@@ -71,6 +71,8 @@ var legacyTemplateMessages = []string{
 	logging.ScopedToContainers,
 	logging.StartingAPIServer,
 	logging.APIServerEnabled,
+	logging.OrphanRecovered,
+	logging.OrphanStartFailed,
 	logging.RateLimitRetriesExhausted,
 	logging.ContainerUpdateFailed,
 	logging.UnresolvedDependsOn,
@@ -91,6 +93,9 @@ var legacyTemplateMessages = []string{
 	logging.UpdatePanicked,
 	logging.UpdateFailed,
 	logging.UpdateCheckFailed,
+	logging.ImagePullFailed,
+	logging.EphemeralSelfUpdateStarting,
+	logging.OrchestratorCleanupFailed,
 	logging.ConfigNotRecreatable,
 }
 
@@ -219,6 +224,14 @@ func goldenEntryData(message string) map[string]any {
 		return map[string]any{"container": "app", "id": "abcdef123456"}
 	case logging.ScopedToContainers:
 		return map[string]any{"scope": "production"}
+	case logging.OrphanRecovered:
+		return map[string]any{"container": "watchtower", "id": "f00f00f00f00"}
+	case logging.OrphanStartFailed:
+		return map[string]any{
+			"container": "watchtower",
+			"id":        "f00f00f00f00",
+			"error":     "failed to start container f00f00f00f00: context deadline exceeded",
+		}
 	case logging.SelfUnidentified:
 		return map[string]any{"error": "failed to detect current container ID: no container ID in cgroup file"}
 	case logging.SelfUninspected,
@@ -250,7 +263,27 @@ func goldenEntryData(message string) map[string]any {
 		return map[string]any{
 			"container": "app",
 			"image":     "org/app:latest",
-			"error":     "failed to pull image: org/app:latest: unauthorized: authentication required",
+			"error":     "failed to inspect image: org/app:latest: Error response from daemon: No such image: org/app:latest",
+		}
+	case logging.EphemeralSelfUpdateStarting:
+		return map[string]any{
+			"container":       "watchtower",
+			"orchestrator_id": "0dd0dd000000",
+		}
+	case logging.OrchestratorCleanupFailed:
+		return map[string]any{
+			"source_container": "watchtower",
+			"source_id":        "c0ffee000000",
+			"new_image":        "nickfedor/watchtower:latest",
+			"orchestrator_id":  "0dd0dd000000",
+			"error":            "Error response from daemon: removal of container 0dd0dd000000 is already in progress",
+		}
+	case logging.ImagePullFailed:
+		return map[string]any{
+			"container": "app",
+			"image":     "org/app:latest",
+			"engine":    "Docker",
+			"error":     `Get "https://registry.example.com/v2/org/app/manifests/latest": net/http: timeout awaiting response headers`,
 		}
 	case logging.InvalidPreUpdateTimeout:
 		return map[string]any{
@@ -326,12 +359,12 @@ func goldenFullReport() *state.Report {
 	nop := zerolog.Nop()
 	log := &nop
 	progress := state.Progress{}
-	failures := map[types.ContainerID]error{}
+	failures := map[container.ContainerID]error{}
 
 	updated, newImage := reportfixture.Container(0, state.UpdatedState)
 	progress.AddScanned(log, updated, newImage, updateParams.Params{})
 	progress.MarkForUpdate(log, updated.ID())
-	progress[updated.ID()].SetGitMetadata(provenance.ReportMeta{
+	progress.SetReportMeta(log, updated.ID(), provenance.ReportMeta{
 		GitRepo:         "https://github.com/org/app.git",
 		GitRef:          "v1.2.0",
 		Changelog:       "https://github.com/org/app/releases/tag/v1.2.0",

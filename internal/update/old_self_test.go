@@ -9,11 +9,11 @@ import (
 
 	dockerContainer "github.com/moby/moby/api/types/container"
 
-	mockContainerClient "github.com/nicholas-fedor/watchtower/internal/container/client/mocks"
+	"github.com/nicholas-fedor/watchtower/internal/container"
+	"github.com/nicholas-fedor/watchtower/internal/container/labels"
 	"github.com/nicholas-fedor/watchtower/internal/observability/events"
 	mockUpdate "github.com/nicholas-fedor/watchtower/internal/update/mocks"
 	updateParams "github.com/nicholas-fedor/watchtower/internal/update/params"
-	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
 // TestRunUpdatesWithNotifications_OldSelfDetected verifies that when the
@@ -37,8 +37,10 @@ func TestRunUpdatesWithNotifications_OldSelfDetected(t *testing.T) {
 		},
 	)
 
-	client := mockContainerClient.NewMockClient(t)
-	client.EXPECT().ListContainers(mock.Anything, mock.Anything).Return([]types.Container{oldSelf}, nil)
+	client := newMockClient(t)
+	client.EXPECT().ListContainers(mock.Anything, mock.Anything).Return([]*container.Container{oldSelf}, nil)
+	client.EXPECT().ListLabeledContainers(mock.Anything, labels.Watchtower).
+		Return([]*container.Container{oldSelf}, nil)
 	client.EXPECT().SetRestartPolicy(mock.Anything, oldSelf.ID(),
 		dockerContainer.RestartPolicy{Name: dockerContainer.RestartPolicyDisabled}).Return(nil).Once()
 
@@ -57,7 +59,7 @@ func TestRunUpdatesWithNotifications_OldSelfDetected(t *testing.T) {
 		Client:            client,
 		Notifier:          notifier,
 		EventBroadcaster:  broadcaster,
-		Update:            updateParams.Params{CurrentContainerID: types.ContainerID(oldID)},
+		Update:            updateParams.Params{CurrentContainerID: container.ContainerID(oldID)},
 		OnOldSelfDetected: func() { detected++ },
 	})
 
